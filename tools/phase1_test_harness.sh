@@ -15,12 +15,12 @@
 # Output: docs/_internal/runs/<arm_name>/{tool_call.json, bench.json, ttft.json,
 #         stress.json, ctx_probe.json, summary.md}
 #
-# Requires: server running on 192.168.1.10:8000 with api-key <REDACTADO>
+# Requires: server running on localhost:8000 with api-key <REDACTADO>
 
 set -euo pipefail
 
 ARM_NAME="${1:-unnamed}"
-HOST="${HOST:-192.168.1.10}"
+HOST="${HOST:-localhost}"
 PORT="${PORT:-8000}"
 API_KEY="${API_KEY:-<REDACTADO>}"
 MODEL="${MODEL:-qwen3.6-35b-a3b}"
