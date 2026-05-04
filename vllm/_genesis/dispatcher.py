@@ -1286,12 +1286,25 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "conflicts_with": ["P7"],
     },
     "P8": {
-        "title": "KV hybrid reporting (per-token capacity)",
+        "title": "KV hybrid reporting (per-token capacity) — RETIRED 2026-05-04",
         "env_flag": "GENESIS_LEGACY_P8",
-        "default_on": True,
-        "lifecycle": "legacy",
+        "default_on": False,
+        "lifecycle": "retired_2026-05-04",
+        "retired_reason": (
+            "upstream_native_via_get_max_concurrency_refactor — vllm "
+            "v0.20.2rc1.dev9 (commit 01d4d1ad3) refactored "
+            "_report_kv_cache_config to use "
+            "get_max_concurrency_for_kv_cache_config(vllm_config, "
+            "kv_cache_config) which natively handles hybrid layouts "
+            "(SWA / chunked-local groups with per-request block count "
+            "capped by window). The new formula `max_concurrency * "
+            "max_model_len` supersedes our P8 approach (excluding O(1) "
+            "Mamba groups from per-token divisor). Engine now reports "
+            "correct capacity natively without our patch. P8 anchors "
+            "no longer match (kv_cache_utils.py refactored)."
+        ),
         "category": "kv_cache",
-        "credit": "Pre-dispatcher legacy patch. Reports KV capacity per-token (not per-block) for hybrid models so scheduler doesn't over-admit.",
+        "credit": "Pre-dispatcher legacy patch. Reports KV capacity per-token (not per-block) for hybrid models so scheduler doesn't over-admit. RETIRED upstream natively fixes after vllm v0.20.2.",
     },
     "P12": {
         "title": "Qwen3 <tool_call> implicit reasoning end",
