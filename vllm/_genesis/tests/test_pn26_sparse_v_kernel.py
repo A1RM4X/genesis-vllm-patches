@@ -29,9 +29,20 @@ import pytest
 # Test infrastructure
 # ─────────────────────────────────────────────────────────────────
 
+def _has_vllm_triton_utils() -> bool:
+    """vllm.triton_utils is needed by the kernel build path. Hosts that have
+    torch+CUDA but only the genesis package symlinked (no full vLLM install)
+    don't have it — skip rather than fail."""
+    try:
+        import vllm.triton_utils  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 requires_cuda = pytest.mark.skipif(
-    not __import__("torch").cuda.is_available(),
-    reason="GPU required for PN26 sparse-V kernel tests",
+    not __import__("torch").cuda.is_available() or not _has_vllm_triton_utils(),
+    reason="GPU + vllm.triton_utils required for PN26 sparse-V kernel tests",
 )
 
 
