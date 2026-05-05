@@ -5068,12 +5068,23 @@ def main() -> int:
         from vllm._genesis.dispatcher import log_structured_boot_summary
         log_structured_boot_summary()
     except Exception as e:
-        log.debug("[Genesis] structured summary unavailable (%s); fallback to apply matrix", e)
+        # Audit fix 2026-05-05: surface the actual exception at WARN so
+        # operators don't silently fall back to the v7.13 apply matrix.
+        # Was log.debug — invisible at default INFO level. If the structured
+        # summary breaks (drift in PATCH_REGISTRY shape, missing field in
+        # gpu_profile, etc.) we want to KNOW, not hide it.
+        log.warning(
+            "[Genesis] structured boot summary unavailable (%s: %s) — "
+            "falling back to v7.13 apply matrix. This is an unexpected "
+            "regression; check dispatcher.dump_structured_boot_summary().",
+            type(e).__name__, e,
+        )
         try:
             from vllm._genesis.dispatcher import log_apply_matrix
             log_apply_matrix()
         except Exception as e2:
-            log.debug("[Genesis] Dispatcher v2 matrix dump also unavailable: %s", e2)
+            log.warning("[Genesis] v7.13 apply matrix fallback also unavailable: %s: %s",
+                        type(e2).__name__, e2)
 
     exit_code = 1 if stats.failed_count > 0 else 0
 
