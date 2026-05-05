@@ -54,8 +54,7 @@ docker run -d \
   -v /home/sander/Genesis_Project/vllm_engine/triton-cache-mtp-test:/root/.triton/cache \
   -v /home/sander/Genesis_Project/vllm_engine/compile-cache-prod-mirror-test:/root/.cache/vllm/torch_compile_cache \
   -v /home/sander/genesis-vllm-patches/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro \
-  -v /home/sander/genesis-vllm-patches/genesis_vllm_plugin:/plugin:ro \
-  -v /home/sander/genesis-vllm-patches/tools/external_probe:/external_probe:ro \
+  -v /home/sander/genesis-vllm-patches/tools/genesis_vllm_plugin:/plugin:ro \
   -v "/home/sander/genesis-vllm-patches/vllm/_genesis/configs/moe_tuning/E=256,N=512,device_name=NVIDIA_RTX_A5000,dtype=fp8_w8a8,block_shape=[128,128].json:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_RTX_A5000,dtype=fp8_w8a8,block_shape=[128,128].json:ro" \
   -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 -e VLLM_NO_USAGE_STATS=1 \
   -e PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.6" \
@@ -84,8 +83,6 @@ docker run -d \
 pip install --quiet --disable-pip-version-check pandas scipy xxhash; \
 cp -r /plugin /tmp/genesis_vllm_plugin; \
 pip install --quiet --disable-pip-version-check --no-deps -e /tmp/genesis_vllm_plugin 2>&1 | tail -3; \
-python3 /external_probe/patch_tolist_cudagraph.py || echo tolist bypass failed; \
-python3 /external_probe/patch_40074_iooo.py || echo PR40074 failed; \
 python3 -m vllm._genesis.patches.apply_all ; \
 exec vllm serve --model /models/Qwen3.6-35B-A3B-FP8 --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.90 --max-model-len 320000 \

@@ -130,6 +130,7 @@ def detect_versions(refresh: bool = False) -> VersionProfile:
         if out.returncode == 0 and out.stdout.strip():
             driver = out.stdout.strip().splitlines()[0].strip()
     except Exception:
+        # nvidia-smi missing on CPU-only / ROCm hosts — driver stays None
         pass
 
     # Python
@@ -138,6 +139,7 @@ def detect_versions(refresh: bool = False) -> VersionProfile:
         import sys
         py_v = ".".join(str(x) for x in sys.version_info[:3])
     except Exception:
+        # sys.version_info is always present; defensive guard for exotic CPython forks
         pass
 
     # Compute capabilities (per-GPU)

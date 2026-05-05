@@ -197,9 +197,22 @@ def _make_chunked_wrapper(
         chunk_offsets=None,
     ):
         # Hot-path: T <= MAX_T (always true for decode T=1, and most prefills)
-        # OR cu_seqlens is set (variable-length batches don't trigger Cliff 2).
-        # Direct positional return — no kwargs reconstruction overhead.
-        if cu_seqlens is not None or q.shape[1] <= _MAX_T:
+        # OR cu_seqlens indicates a true multi-seq batch.
+        #
+        # [Issue #18 fix v7.71] Single-seq prefill is the dominant path on
+        # vLLM serving — cu_seqlens is virtually always non-None there
+        # (varlen attention API marker). For B=1 the shape is `[2]` =
+        # `[0, T]`, semantically equivalent to dense B=1. The original
+        # gate over-rejected this case, preventing chunking from EVER
+        # engaging on real serving (442/442 invocations bypassed per
+        # noonghunna diagnostic on 60K Cliff 2 probe). Detect single-seq
+        # cu_seqlens and let it fall through to the chunked path.
+        _single_seq_cu = (
+            cu_seqlens is not None
+            and hasattr(cu_seqlens, "shape")
+            and cu_seqlens.shape == (2,)
+        )
+        if (cu_seqlens is not None and not _single_seq_cu) or q.shape[1] <= _MAX_T:
             return original_fwd(
                 q, k, v, g, beta, scale,
                 initial_state, output_final_state,
@@ -604,6 +617,7 @@ def apply() -> tuple[str, str]:
                 setattr(mod, _FN_NAME, wrapper)
                 rebound_count += 1
             except Exception:
+                # Frozen module / read-only namespace — text-patch is primary path
                 pass
 
     max_t = max(int(os.environ.get("GENESIS_FLA_FWD_H_MAX_T", "16384")), 64)

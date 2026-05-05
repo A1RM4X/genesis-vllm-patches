@@ -442,8 +442,14 @@ def _probe_model_class(hf_config: Any) -> str:
             candidates.append(_scan_mt(nested))
 
     # Order matters — most specific first.
+    # NOTE: 27B Lorbus is branded "Qwen3.6" but config.json reports
+    # model_type="qwen3_5" (3.6 is sub-version of 3.5 architecture).
+    # qwen3_6 markers below are forward-compat for hypothetical future
+    # checkpoints that adopt the qwen3_6 type.
     markers = (
         ("qwen3_next", "qwen3_next"),
+        ("qwen3_6_text", "qwen3_6"),
+        ("qwen3_6", "qwen3_6"),
         ("qwen3_5_text", "qwen3_5"),
         ("qwen3_5", "qwen3_5"),
         ("qwen3_moe", "qwen3_moe"),

@@ -34,6 +34,39 @@ _KNOWN_REGISTRY_ONLY = frozenset({
     # they ship as one wiring function. Registry tracks them separately
     # for `genesis explain` / docs disambiguation.
     "P69",
+    # PN40-classifier is a sub-component of PN40 sub-D — it is wired
+    # inside `apply_patch_N40_dflash_omnibus()` (the PN40 omnibus apply
+    # path). Registered separately so the dispatcher v2 validator does
+    # not warn when scheduler.py reports `PN40-classifier` as applied,
+    # but no standalone wiring function exists.
+    "PN40-classifier",
+    # P51 is a runtime layer-level TQ-active library guard living in
+    # kernels/dequant_buffer.py — no env toggle, no apply_patch_* needed.
+    # Registered for visibility in `genesis explain` and audit tooling.
+    "P51",
+    # P102 is a diagnostic-only spec-decode metadata module
+    # (vllm/_genesis/spec_meta.py). Activated by direct call from spec
+    # paths when GENESIS_ENABLE_P102=1, not via apply_all wiring.
+    # Registered for `genesis explain` visibility.
+    "P102",
+    # PN60 is a preflight DX validator wired into compat/doctor.py — runs
+    # BEFORE vLLM loads, not via apply_all. Registered for visibility +
+    # operator search-ability in `genesis explain PN60`.
+    "PN60",
+    # PN61/PN62 are now WIRED (apply_patch_N61_*, apply_patch_N62_*)
+    # — left commented here in case future refactor decouples them from
+    # apply_all. As of 2026-05-05 they have full wiring + opt-in env flag
+    # + class-rebind apply() with idempotency markers; cross-rig validation
+    # pending an actual qwen3_vl checkpoint reachable from a Genesis test rig.
+    # PN63 is a gpu_profile advisory rule (lives in gpu_profile.py
+    # PATCH_RECOMMENDATIONS). Suggest-only, not a runtime patch — so no
+    # apply_patch_* function exists by design.
+    "PN63",
+    # PN64 is a Marlin MoE per-SM tuning placeholder for SM 12.0. The
+    # actual config entry lives in kernels/marlin_tuning.py table; the
+    # registry entry is for `genesis explain` visibility. Real wiring
+    # only matters when SM 12.0 hardware is detected at boot.
+    "PN64",
 })
 
 _KNOWN_APPLY_ONLY: frozenset[str] = frozenset({

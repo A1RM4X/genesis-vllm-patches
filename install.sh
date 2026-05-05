@@ -212,7 +212,14 @@ detect_gpu() {
     *"rtx a5000"*) GPU_CLASS_HINT="rtx a5000" ;;
     *"rtx a6000"*) GPU_CLASS_HINT="rtx a6000" ;;
     *"a100"*) GPU_CLASS_HINT="a100" ;;
+    # Ada Lovelace consumer (RTX 40-series) — ORDER MATTERS: specific before general
+    *"rtx 4060 ti"*) GPU_CLASS_HINT="rtx 4060 ti" ;;
+    *"rtx 4060"*) GPU_CLASS_HINT="rtx 4060" ;;
+    *"rtx 4070 ti super"*) GPU_CLASS_HINT="rtx 4070 ti super" ;;
+    *"rtx 4070 ti"*) GPU_CLASS_HINT="rtx 4070 ti" ;;
+    *"rtx 4070 super"*) GPU_CLASS_HINT="rtx 4070 super" ;;
     *"rtx 4070"*) GPU_CLASS_HINT="rtx 4070" ;;
+    *"rtx 4080 super"*) GPU_CLASS_HINT="rtx 4080 super" ;;
     *"rtx 4080"*) GPU_CLASS_HINT="rtx 4080" ;;
     *"rtx 4090"*) GPU_CLASS_HINT="rtx 4090" ;;
     *"l40"*) GPU_CLASS_HINT="l40" ;;
@@ -220,6 +227,11 @@ detect_gpu() {
     *"h100"*) GPU_CLASS_HINT="h100" ;;
     *"h200"*) GPU_CLASS_HINT="h200" ;;
     *"h20"*) GPU_CLASS_HINT="h20" ;;
+    # Blackwell consumer (RTX 50-series, sm_120) — Issue #20 added per noonghunna RTX 5090 user
+    *"rtx 5060 ti"*) GPU_CLASS_HINT="rtx 5060 ti" ;;
+    *"rtx 5060"*) GPU_CLASS_HINT="rtx 5060" ;;
+    *"rtx 5070 ti"*) GPU_CLASS_HINT="rtx 5070 ti" ;;
+    *"rtx 5070"*) GPU_CLASS_HINT="rtx 5070" ;;
     *"rtx 5080"*) GPU_CLASS_HINT="rtx 5080" ;;
     *"rtx 5090"*) GPU_CLASS_HINT="rtx 5090" ;;
     *"rtx pro 6000 blackwell max-q"*) GPU_CLASS_HINT="rtx pro 6000 blackwell max-q" ;;

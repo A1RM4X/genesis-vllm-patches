@@ -14,13 +14,67 @@ loud-and-clear in the per-release notes.
 
 ---
 
-## [Unreleased] — `v7.65 → v7.69` series
+## [Unreleased] — `v7.65 → v7.72` series
 
-> Pin: `0.20.1rc1.dev16+g7a1eb8ac2` (committed 2026-04-28).
+> Pin: `0.20.2rc1.dev9+g01d4d1ad3` (validated 2026-05-04, allowlist-clean).
 > Builds on v7.64 release with v7.65 hygiene + v7.66/v7.67/v7.68 patch
-> work + comprehensive audit pass + v7.69 cross-rig fix series. All on
-> `dev` branch only (main promotion deferred until cross-rig validation
-> completes).
+> work + comprehensive audit pass + v7.69 cross-rig fix series + v7.72
+> sprint (PN59-PN67 + audit hardening). All on `dev` branch only (main
+> promotion deferred until cross-rig validation completes).
+
+### v7.72 — `PN59-PN67` + audit hardening sprint (2026-05-05)
+
+**7 new patches:**
+- **PN59** (Genesis-original) — Streaming-GDN window-iterative driver (Variant D Phase 2). Empirically validated 2026-05-05 on 27B PROD: **−142 MiB/GPU at boot + −95% per-soak fragmentation drift**, 0 regressions. PROMOTED default-ON in 27B PROD.
+- **PN60** (Genesis-original) — Quant arg validator (preflight DX, doctor extension); CLI `genesis preflight --quantization X --model /path`. Catches apnar club-3090#51 NVFP4 boot failure with one-line remediation hint instead of 30-line pydantic ValidationError.
+- **PN61** (Genesis-original) — qwen3_vl loader KeyError → language_model_only auto-fallback (class-rebind wrapper). v2 with pre-emptive language_model_only set when NVFP4/compressed-tensors detected (avoids mid-load partial state).
+- **PN62** (Genesis-original) — Text-only ViT scratch skip marker (3-5 GiB save target on qwen3_vl + NVFP4). Currently sets `_pn62_skip_vit_scratch` marker only — production hook deferred until NVFP4 cross-rig validation.
+- **PN63** (Genesis-original) — gpu_profile advisory: prefer `--kv-cache-dtype fp8_e5m2` over `fp8_e4m3` on consumer Blackwell SM 12.0 (apnar empirical: e4m3+96K loses −2.6% TPS vs e5m2+48K on RTX 5090).
+- **PN64** (Genesis-original) — Marlin MoE SM 12.0 placeholder entry (env-gated; awaits real 5090 sweep).
+- **PN65** (Genesis-original) — Genesis structured API access log middleware. Replaces uvicorn's bare `INFO: 192.168.1.10 - "GET /v1/models" 401` with `[Genesis-API] 401 GET /v1/models <1ms client=192.168.1.10`. v2 fix uses persistent `logging.Filter` to suppress uvicorn.access INFO records (live verified — single source request observability).
+- **PN66** (vllm#41696 backport, panpan0000) — Multiturn `</think>` leak in DelegatingParser. Removes buggy `prompt_reasoning_checked` short-circuit that walked the FULL prompt for `</think>` and prematurely set `reasoning_ended=True` from a previous turn's `</think>`. Defensive backport for multi-turn DSML/Hermes/Qwen3 chat.
+- **PN67** (vllm#41674 backport, JasonKeyiL) — thinking_token_budget inverted-bool single-token fix. Removes `not` from `or not thinking_budget_tracks_reqs` in `gpu_input_batch.py:894`. Defensive; NULL-impact on Genesis PROD.
+
+**Critical infrastructure / audit fixes:**
+- **P79d wired** (was orphan in v7.69) — registered in `PATCH_REGISTRY` + `apply_all`.
+- **P51 + P102 registered** — were runtime-active but invisible to dispatcher.
+- **`qwen3_6` model_class mapping** added in `model_detect.py` (forward-compat).
+- **`conflicts_with` symmetry restored** — 4 missing back-links (P65↔[P56,P57,P67,P67b], PN58↔P62, P7↔P7b, P28↔PN32).
+- **PN64 env-gate enforcement** — `(12, 0)` table lookups in `kernels/marlin_tuning.py` now respect `GENESIS_ENABLE_PN64`.
+- **PN65 v2 uvicorn dedup** via `logging.Filter` (was setLevel which uvicorn re-overrode).
+- **PN40 scheduler subpatch split** — separate markers prevent partial-apply lock-out.
+- **PN59 unified bool parser** — accepts `"1","true","yes","y","on"` case-insensitive.
+- **PN60 wired into `doctor.collect_report`** as `_section_preflight()`.
+- **`gdn_composability.composes_with`** honored — explicit-compatible pairs no longer trigger site-overlap warnings.
+- **`preflight_checks` `consecutive`** rewritten as state-machine (`current_streak` / `max_streak`).
+- **`env_flag_guard` scan** extended to `GENESIS_DISABLE_*` prefix (was unreachable).
+- **P37/P40/P5b/P7b env_flag alignment** — registry was wrong, code/scripts were right; aligned to short form.
+- **4 wiring routings** via `result_to_wiring_status` (P82/P72/P85/P100) — was masking SKIPPED → "applied".
+- **Status helper migration** — 30 wiring files still pending follow-up sprint.
+- **MultiFilePatchTransaction** atomic dry-run — primitive exists, `count(anchor) == 1` check pending.
+- **AppleDouble cleanup** on server (56 → 0) + `.gitignore` patterns + `COPYFILE_DISABLE=1` in syncs.
+- **Deprecated external probes** (`patch_tolist_cudagraph`, `patch_40074_iooo`) removed from 4 launch scripts (P78/PN14 supersede).
+- **pytest config** — root `conftest.py` + `pytest.ini`; documented `python3 -m pytest` workaround.
+- **A-19 audit test** — `test_a19_optional_sub_patches_marker_policy.py` forbids `required=False` sub-patches sharing TextPatcher marker (PN40-class regression gate).
+- **A-15 pytest torch marker** — auto-skip via AST scan for module-level `import torch` on torch-free hosts.
+
+**Operator UX:**
+- **Structured boot summary** at end-of-boot — system info header + per-category counters + APPLIED grouped by category with vllm# PR cites + SKIPPED grouped by reason class. 78 unique patches → readable single block, replaces scattered per-patch INFO lines.
+- **Three tfriedel-pattern ports** — `scripts/verify-full.sh` (7-stage smoke), `scripts/probe_max_ctx.sh` (auto-binary-search max ctx), `scripts/fetch_models.sh` (SHA-verified HF download).
+- **Comprehensive bench** — `tests/bench/comprehensive_bench.py` (cold-warm latency / sustained TPS / tool-call clean / multi-turn stability / VRAM steady / long-context needle) with README-ready markdown output.
+- **Bundled `qwen3.6-enhanced.jinja`** + `qwen3.5-enhanced.jinja` (Cheuk-Yiu Chan @allanchan339) at `assets/chat_templates/` with relationship-to-runtime-patches docs.
+- **MoE tuning workflow** — `scripts/moe_lookup_helper.sh` (renamed from `tune_moe.sh` 2026-05-05 per G-POST-05; the script names + stages JSON, the autotune sweep is manual via `benchmark_moe.py --tune` per the script's NEXT STEPS block) + honest documentation in `vllm/_genesis/configs/moe_tuning/README.md` clarifying that bundled A5000 Triton config is unused on Ampere FP8 (vLLM uses Marlin kernel; PR #40129 closed). Per-arch backend selection table added; cross-rig contributions targeted at Ada/Hopper/Blackwell where Triton path IS active.
+
+**Live PROD bench (2× A5000, full v7.72 stack):**
+- **35B-A3B-FP8**: 192.9 tok/s (CV 4.19%), tool-call 10/10, multi-turn 10/10, VRAM 22687+21998 = 44685 MiB
+- **27B-int4-AutoRound**: 95.6 tok/s (CV 4.04%), tool-call 10/10, multi-turn 10/10, VRAM 22753+22064 = 44817 MiB
+- Long-context needle: 3/4 found (1K/51K/92K — 10K MISS reproducible LITM)
+
+**Test coverage:** 1858 unit tests pass (+247 vs v7.68 1611 baseline) + 73 skipped.
+
+**Pin:** stays on `0.20.2rc1.dev9+g01d4d1ad3`. Pin-bump to vLLM main HEAD `0c620d2e08` (+25 commits) prepared (verdict GREEN, P4 + PN52 supersede markers in registry) — awaits explicit operator action + nightly publish.
+
+
 
 ### v7.69 — `PN35` absorption from club-3090#32 (2026-05-03)
 

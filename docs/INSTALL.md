@@ -297,7 +297,7 @@ Install the Genesis vLLM plugin (auto-loads via vLLM entry point):
 
 ```bash
 cd genesis-vllm-patches
-pip install --no-deps -e ./genesis_vllm_plugin
+pip install --no-deps -e ./tools/genesis_vllm_plugin
 ```
 
 ### 5. Apply external probes (recommended)

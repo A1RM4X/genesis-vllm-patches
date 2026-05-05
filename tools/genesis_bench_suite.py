@@ -1017,6 +1017,7 @@ def scrape_accept_rate(host: str, port: int, key: str) -> dict:
                     elif slot == "emitted":
                         emitted = val
                 except Exception:
+                    # Malformed metric line — skip, downstream handles None values
                     pass
     accept_rate = (
         round(accepted / drafted, 4)

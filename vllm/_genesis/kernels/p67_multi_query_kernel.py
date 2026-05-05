@@ -741,9 +741,38 @@ def _autoconfig(sm_major: int, sm_minor: int, head_dim: int) -> dict:
     Keep num_stages=3 for any TQ k8v4 / quant-dequant workload here.
 
     Override via env: GENESIS_P67_BLOCK_KV, GENESIS_P67_NUM_WARPS, GENESIS_P67_NUM_STAGES.
+
+    [Genesis 2026-05-04 SMEM-aware default — pattern from MidasMining vllm#41508]
+    BLOCK_KV default — arch-aware:
+      * SM<9 (Ampere/Hopper consumer): 32 (Ampere SMEM 99 KB hard cap)
+      * SM>=9 (Hopper datacenter / Blackwell): 64 (more SMEM headroom)
+    SMEM math (Ampere):
+      Q tile: BLOCK_M*BLOCK_D*4 = 16*128*4 = 8 KB
+      K tile: BLOCK_KV*BLOCK_D*4 = 32*128*4 = 16 KB (32 OK; 64 = 32 KB also OK
+              but combined with V, dequant scratch, accumulators → tight)
+      V tile: BLOCK_KV*BLOCK_D*4 = 16 KB (× 2 for stages=3 → 48 KB)
+      Total: ~50-60 KB on Ampere, headroom 30-40 KB. BLOCK_KV=64 → exceeds.
+    Empirical: feedback_triton36_flags_regress_split_m confirmed BLOCK_KV>32
+    regresses on small-BLOCK_M Ampere split-M. Stay with 32 default.
+    Future-proof: when migrating to Blackwell R6000 Pro (sm 12), bump default
+    to 64 (SMEM 228 KB) for ~15-20% throughput uplift on long-K paths.
+
+    [2026-05-05 Blackwell consumer (sm_120 RTX 5090) status — UNMEASURED]
+    The (BLOCK_KV=64, num_warps=8, num_stages=3) defaults that fire on
+    sm_major>=9 are EXTRAPOLATED from Hopper datacenter, NOT empirically
+    measured on consumer Blackwell (sm 12.0). First real 5090 datapoints
+    expected from noonghunna club-3090 discussion #51 (apnar's rig).
+    Until empirical sweep lands, treat sm_120 as "use defaults but
+    UNVERIFIED" — the datacenter-class config may underutilize the
+    smaller consumer L2 (88 MB on 5090 vs 60 MB on H100 vs 6 MB A5000).
+    Cross-reference: feedback_triton36_flags_regress_split_m (split-M
+    regression on small BLOCK_M Ampere → may also bite on sm_120).
     """
     import os as _os
-    block_kv = int(_os.environ.get("GENESIS_P67_BLOCK_KV", "32"))
+    # arch-aware default — Ampere keeps 32, Hopper+ gets 64 future-proof
+    # NOTE: sm 12.0 Blackwell consumer config UNMEASURED (see docstring).
+    _default_block_kv = "32" if sm_major < 9 else "64"
+    block_kv = int(_os.environ.get("GENESIS_P67_BLOCK_KV", _default_block_kv))
     num_warps = int(_os.environ.get("GENESIS_P67_NUM_WARPS", "8" if sm_major >= 8 else "4"))
     num_stages = int(_os.environ.get("GENESIS_P67_NUM_STAGES", "3" if sm_major >= 8 else "2"))
     return dict(BLOCK_KV=block_kv, num_warps=num_warps, num_stages=num_stages)

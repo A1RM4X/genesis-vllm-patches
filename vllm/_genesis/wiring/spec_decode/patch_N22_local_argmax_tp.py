@@ -161,7 +161,13 @@ def apply() -> tuple[str, str]:
             "def get_top_tokens(",
         ],
     )
+    # Audit G-POST-03 fix 2026-05-05 (genesis_post_fix_rescan_audit):
+    # SKIPPED was being masked as final "applied" — surface it honestly.
     r1, f1 = patcher_qwen3.apply()
+    if r1 == TextPatchResult.SKIPPED:
+        _r = f1.reason if f1 else "anchor drift / not eligible"
+        _d = f" ({f1.detail})" if (f1 and f1.detail) else ""
+        return "skipped", f"qwen3.py: {_r}{_d}"
     if r1 == TextPatchResult.FAILED:
         return "failed", f"qwen3.py: {f1.reason if f1 else 'unknown'}"
 
@@ -186,6 +192,13 @@ def apply() -> tuple[str, str]:
             ],
         )
         r2, f2 = patcher_dflash.apply()
+        if r2 == TextPatchResult.SKIPPED:
+            _r = f2.reason if f2 else "anchor drift / not eligible"
+            _d = f" ({f2.detail})" if (f2 and f2.detail) else ""
+            return "skipped", (
+                f"qwen3_dflash.py: {_r}{_d} (qwen3.py applied, but DFlash "
+                "subpatch skipped — re-apply needed for matching pair)"
+            )
         if r2 == TextPatchResult.FAILED:
             return "failed", f"qwen3_dflash.py: {f2.reason if f2 else 'unknown'}"
 

@@ -134,12 +134,14 @@ class TestPatch8Wiring:
         s2, _ = p8.apply()
         assert s1 == "applied" and s2 == "applied"
 
-        kv_content = open(kv_path).read()
+        with open(kv_path) as _f:
+            kv_content = _f.read()
         # Each marker inserted exactly once (marker version follows
         # GENESIS_P8_MARKER_KV constant, not a hardcoded literal).
         assert kv_content.count(GENESIS_P8_MARKER_KV) == 1
 
-        sched_content = open(sched_path).read()
+        with open(sched_path) as _f:
+            sched_content = _f.read()
         assert sched_content.count(GENESIS_P8_MARKER_SCHED) == 1
 
     def test_skip_when_upstream_merged_kv(self, fake_p8_files):

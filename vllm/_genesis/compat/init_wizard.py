@@ -68,6 +68,7 @@ def _ask_choice(prompt: str, options: list[str], default_idx: int = 0) -> int:
             if 0 <= idx < len(options):
                 return idx
         except ValueError:
+            # Non-numeric input — fall through to retry prompt below
             pass
         print(f"  Please enter a number 1-{len(options)}")
 

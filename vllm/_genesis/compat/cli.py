@@ -60,6 +60,7 @@ _SUBCOMMAND_MAP: dict[str, str] = {
     # Operator sanity check
     "self-test":       "vllm._genesis.compat.self_test",
     "verify":          "vllm._genesis.compat.verify",
+    "preflight":       "vllm._genesis.compat.preflight_checks",
     # Benchmarking
     "bench":           "vllm._genesis.compat.bench",
 }
@@ -87,6 +88,7 @@ _DESCRIPTIONS: dict[str, str] = {
     "update-channel":   "apt-style stable/beta/dev update channel",
     "self-test":        "structural sanity check (post-pull / pin bump)",
     "verify":           "post-install smoke test (--quick / --boot / --full)",
+    "preflight":        "preflight checks: PN60 quant validator + club#34/#43 rules",
     "bench":            "Genesis benchmark suite (decode TPOT, wall TPS, stress)",
 }
 

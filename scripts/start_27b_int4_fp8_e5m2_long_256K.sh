@@ -28,7 +28,7 @@ docker run -d \
   -v /home/sander/Genesis_Project/vllm_engine/triton-cache-int4-mtp:/root/.triton/cache \
   -v /home/sander/Genesis_Project/vllm_engine/compile-cache-int4-mtp:/root/.cache/vllm/torch_compile_cache \
   -v /home/sander/genesis-vllm-patches/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro \
-  -v /home/sander/genesis-vllm-patches/genesis_vllm_plugin:/plugin:ro \
+  -v /home/sander/genesis-vllm-patches/tools/genesis_vllm_plugin:/plugin:ro \
   -e VLLM_NO_USAGE_STATS=1 -e VLLM_LOGGING_LEVEL=WARNING \
   -e PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512" \
   -e VLLM_FLOAT32_MATMUL_PRECISION=high -e VLLM_SSM_CONV_STATE_LAYOUT=DS -e NCCL_P2P_DISABLE=1 -e NCCL_CUMEM_ENABLE=0 \
@@ -50,6 +50,16 @@ docker run -d \
   -e GENESIS_ENABLE_P94=1 \
   -e GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1 \
   -e GENESIS_ENABLE_PN17_FA2_LSE_CLAMP=1 \
+  -e GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=0 \
+  -e GENESIS_ENABLE_PN50_GDN_FUSED_PROJ=0 \
+  -e GENESIS_ENABLE_PN52_PROMPT_LOGPROBS_EVICTION=0 \
+  -e GENESIS_ENABLE_PN54_GDN_CONTIGUOUS_DEDUP=0 \
+  -e GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=0 \
+  -e GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=0 \
+  -e GENESIS_ENABLE_PN57_TQ_CENTROIDS_DISK_CACHE=0 \
+  -e GENESIS_ENABLE_PN58_SPEC_REASONING_BOUNDARY=0 \
+  -e GENESIS_ENABLE_PN59_STREAMING_GDN=0 \
+  -e GENESIS_ENABLE_P107_MTP_TRUNCATION_DETECTOR=0 \
   -e GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1 -e GENESIS_ENABLE_PN22_LOCAL_ARGMAX_TP=1 -e GENESIS_ENABLE_P103=1 \
   -e GENESIS_ENABLE_P82=0 -e GENESIS_ENABLE_P99=1 -e GENESIS_P82_THRESHOLD_SINGLE=0.3 \
   -e GENESIS_ENABLE_P67_TQ_MULTI_QUERY_KERNEL=1 -e GENESIS_ENABLE_P91=1 -e GENESIS_ENABLE_P87=1 -e GENESIS_ENABLE_P85=1 -e GENESIS_ENABLE_P83=1 -e GENESIS_ENABLE_P101=1 -e GENESIS_ENABLE_P100=1 \

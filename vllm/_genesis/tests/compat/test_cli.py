@@ -51,6 +51,7 @@ class TestSubcommandRouting:
         try:
             main(["--help"])
         except SystemExit:
+            # argparse calls sys.exit(0) after --help — expected, capture continues
             pass
         captured = capsys.readouterr()
         # All key subcommands referenced
@@ -171,6 +172,7 @@ class TestNoArgs:
         try:
             main([])
         except SystemExit:
+            # argparse exits when no subcommand provided — expected, output captured
             pass
         captured = capsys.readouterr()
         joined = captured.out + captured.err

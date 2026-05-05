@@ -352,6 +352,11 @@ def apply() -> tuple[str, str]:
             )
 
     result, failure = patcher.apply()
+    # Audit P1 fix 2026-05-05: surface SKIPPED as skipped (was masked as applied)
+    if result == TextPatchResult.SKIPPED:
+        _r = failure.reason if failure else "anchor drift / not eligible"
+        _d = f" ({failure.detail})" if (failure and failure.detail) else ""
+        return "skipped", f"{patcher.patch_name}: {_r}{_d}"
     if result == TextPatchResult.FAILED:
         return "failed", (
             f"{patcher.patch_name}: {failure.reason if failure else 'unknown'} "
@@ -364,6 +369,7 @@ def apply() -> tuple[str, str]:
         from vllm._genesis.kernels.p67_multi_query_kernel import diagnostic_info
         diag = f" Diag: {diagnostic_info()}"
     except Exception:
+        # Diagnostic helper is optional — apply already succeeded, log without diag
         pass
 
     return "applied", (
