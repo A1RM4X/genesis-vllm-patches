@@ -95,8 +95,20 @@ def _has_shift(shifts: torch.Tensor) -> bool:
     return v
 
 
-def _cfg(m: int) -> tuple[int, int, int, int, int, int]:
-    return _CFG[(m > 32) + (m > 128) + (m > 1024)]
+def _cfg(m: int, n: int) -> tuple[int, int, int, int, int, int]:
+    """Tile por bucket de M, con correccion cuando faltan CTAs.
+
+    Se probo elegir el tile puramente por conteo de CTAs y salio PEOR que la
+    tabla (mediana 0.93x, y hasta 0.35x a M=128): con BLOCK_M=16 el mma
+    m16n8k32 queda al minimo y B se re-lee 8 veces. El conteo de CTAs solo
+    manda cuando el tile de la tabla no llega ni a media ola, que es lo que
+    pasa con N=5120 a M=128 (40 CTAs para 82 SM): ahi bajar a BLOCK_M=64 los
+    duplica y da 1.41-1.45x.
+    """
+    c = _CFG[(m > 32) + (m > 128) + (m > 1024)]
+    if m > 32 and -(-m // c[0]) * -(-n // c[1]) < _CTA_MIN:
+        return _CFG_POCOS_CTA
+    return c
 
 
 @triton.jit
