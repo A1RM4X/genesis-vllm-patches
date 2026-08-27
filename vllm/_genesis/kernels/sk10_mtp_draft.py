@@ -45,20 +45,19 @@ BLOCK_SIZE: tuple[int, int] = (128, 128)
 
 _CFG: tuple[tuple[int, int, int, int, int, int], ...] = (
     # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages) por bucket de M.
-    # Medido en RTX 3090 (K=5120, N=8192), mediana de 5 corridas, contra el
-    # tile unico 128x128x128 que habia antes:
-    #   M=128   128x128x128  1.00x  (los tiles grandes pierden 0.4-0.5x aca)
-    #   M=512   256x128x64   1.29x
-    #   M=1664  256x128x128  1.06x
-    #   M=8000  256x128x128  1.21x
-    # BLOCK_M=256 amortiza el tile de B sobre el doble de filas. La ocupacion
-    # no es la palanca: TODAS las configuraciones quedan en 1 CTA/SM (8 de 48
-    # warps), asi que lo que manda es la intensidad aritmetica.
-    (16, 128, 128, 8, 8, 3),    # M <=  32   decode
-    (128, 128, 128, 8, 8, 3),   # M <= 128
+    # Medido en RTX 3090 con relojes fijos a 1500 MHz, CUDA events, salida
+    # prealocada y configs intercaladas round-robin (sin eso el ruido es +-25%
+    # y la busqueda devuelve resultados incoherentes).
+    (16, 128, 128, 8, 8, 3),    # M <=   32   decode
+    (128, 128, 128, 8, 8, 3),   # M <=  128
     (256, 128, 64, 8, 8, 4),    # M <= 1024
-    (256, 128, 128, 8, 8, 2),   # M  > 1024  prefill
+    (256, 128, 64, 8, 8, 4),    # M  > 1024   prefill
 )
+# Fraccion de ola por debajo de la cual conviene bajar BLOCK_M aunque se pierda
+# intensidad aritmetica.
+SM_COUNT: int = 82          # GA102 (RTX 3090)
+_CTA_MIN: int = 49          # ~0.6 olas
+_CFG_POCOS_CTA: tuple[int, int, int, int, int, int] = (64, 128, 128, 8, 4, 4)
 
 BLOCK_M: int = 128
 BLOCK_N: int = 128
@@ -95,9 +94,20 @@ def _has_shift(shifts: torch.Tensor) -> bool:
     return v
 
 
-def _cfg(m: int) -> tuple[int, int, int, int, int, int]:
-    """Selecciona tile por bucket de M sin ramificar (suma de predicados)."""
-    return _CFG[(m > 32) + (m > 128) + (m > 1024)]
+def _cfg(m: int, n: int) -> tuple[int, int, int, int, int, int]:
+    """Tile por bucket de M, con correccion cuando faltan CTAs.
+
+    Se probo elegir el tile puramente por conteo de CTAs y salio PEOR que la
+    tabla (mediana 0.93x, y hasta 0.35x a M=128): con BLOCK_M=16 el mma
+    m16n8k32 queda al minimo y B se re-lee 8 veces. El conteo de CTAs solo
+    manda cuando el tile de la tabla no llega ni a media ola, que es lo que
+    pasa con N=5120 a M=128 (40 CTAs para 82 SM): ahi bajar a BLOCK_M=64 los
+    duplica y da 1.41-1.45x.
+    """
+    c = _CFG[(m > 32) + (m > 128) + (m > 1024)]
+    if m > 32 and -(-m // c[0]) * -(-n // c[1]) < _CTA_MIN:
+        return _CFG_POCOS_CTA
+    return c
 
 
 @triton.jit
@@ -197,7 +207,7 @@ def mtp_draft_fused_gemm(
     res = _zero(a.device) if residual is None else residual
     rm, rn = (0, 0) if residual is None else (res.stride(0), res.stride(1))
     has_shift = _has_shift(shifts)
-    bm, bn, bk, gm, warps, stages = _cfg(M)
+    bm, bn, bk, gm, warps, stages = _cfg(M, N)
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     _sk10_mtp_draft_kernel[grid](
