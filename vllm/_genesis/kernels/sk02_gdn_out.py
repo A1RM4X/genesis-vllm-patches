@@ -1,26 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SK-02 GDN_OUT_INT8_SCALED — monolito PTX inline RowParallel 5120x6144 sm_86.
+"""SK-02 — GDN_OUT_INT8_SCALED — capa completa GDN out_proj (RowParallel) en GPU.
 
-Monolito branchless: single kernel triton jit usando tl.load / tl.dot / tl.store.
-Validacion trasladada hacia warmup_all_kernels en patch_PN110 (dims multiplo 16,
-dtype int8, contiguity, K multiplo 128). Cualquier fallo indica bug en pwal,
-no en kernel.
+Capa completa (Qwen3.5-27B, 48 capas GDN, TP=2):
+    hidden bf16 [M, 3072]            (salida del core GDN, sin norm delante)
+      -> quant per-token amax/127                              (kernel 1)
+      -> GEMM INT8 diádico + residual fusionado en el epílogo  (kernel 2)
+      -> all_reduce NCCL                                       (colectivo GPU)
 
-Geometria: Global [5120,6144]=[40*128,48*128], por-rank TP2 [5120,3072].
-Diseno C sm_86: w = q * 2^shift * s_row, desplazamiento sobre INT32 previo
-a epilogo bf16 * a_scale * s_row. INT32 hacia bf16 directo, acumulador bf16,
-sin fp32. 39 TFLOPS bf16 vs 19.5 fp32 en sm_86.
+Geometría: global [5120, 6144] = [40*128, 48*128]; per-rank TP=2 K=3072, N=5120.
 
-PTX sm_86 7.4 monolito:
-  .version 7.4
-  .target sm_86
-  .address_size 64
-  tl.load  -> ld.global.b8 / ld.global.b16 (PTX cp.async compatible)
-  tl.dot   -> mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 (Tensor Core Ampere)
-  tl.store -> st.global.b32
-Desplazamiento diadico siempre >=0 validado en warmup, operacion
-branchless mediante << sin seleccion condicional. Validacion en pwal,
-kernel sin ramificaciones.
+Diseño (sm_86, mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32):
+  * ``BLOCK_K == SHIFT_BLOCK == 128`` -> un ``tl.dot`` por bloque diádico, el
+    acumulador INT32 no se vacía cuatro veces por bloque.
+  * Shift por columna ``[BLOCK_N]`` aplicado como ``acc += int_acc.to(f32) *
+    exp2(shift)``: una operación fp32, exacta, sin truncar shift negativo ni
+    desbordar INT32.
+  * Escalas fuera del bucle k. Punteros que avanzan. Grid 1-D con swizzle L2.
+  * **Residual fusionado**: se suma dentro del epílogo, sin pasada extra sobre
+    M*N. Cuando no hay residual el llamador pasa un escalar cero con strides 0,
+    así el ``tl.load`` es un broadcast (no cuesta ancho de banda) y no hace
+    falta ninguna rama.
+  * Salida bf16 directa desde el ``tl.store`` — la versión anterior escribía
+    fp32 y hacía ``.to(bf16)`` después, una pasada extra sobre M*N.
+
+RowParallel: el residual se suma **después** del all_reduce (si no, se sumaría
+TP veces). ``sk02_gdn_out_proj`` respeta ese orden; con TP=1 el residual sí va
+fusionado en el epílogo.
+
+Los kernels son branchless (sólo ``tl.load`` / ``tl.dot`` / ``tl.where`` /
+``tl.store``) y no validan nada: dtypes, layout y múltiplos de 128 se asumen
+ya comprobados. Cero fallback torch, cero trabajo en CPU. La única rama en
+Python decide el orden residual/all_reduce, que es topología, no validación.
 """
 
 from __future__ import annotations
@@ -35,122 +45,175 @@ GLOBAL_SHAPE = (5120, 6144)
 RANK_SHAPE = (5120, 3072)
 NUM_LAYERS = 48
 ROW_PARALLEL = True
-SHIFT_BLOCK = 128
-BLOCK_M = 32
-BLOCK_N = 64
-BLOCK_K = 32
-# PTX monolito sm_86 — documentacion version PTX para auditoria
-_PTX_VERSION = "7.4"
-_PTX_TARGET = "sm_86"
+
+SHIFT_BLOCK: int = 128
+
+
+_CFG: tuple[tuple[int, int, int, int, int, int], ...] = (
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages) por bucket de M.
+    # Medido en RTX 3090 (K=5120, N=8192), mediana de 5 corridas, contra el
+    # tile unico 128x128x128 que habia antes:
+    #   M=128   128x128x128  1.00x  (los tiles grandes pierden 0.4-0.5x aca)
+    #   M=512   256x128x64   1.29x
+    #   M=1664  256x128x128  1.06x
+    #   M=8000  256x128x128  1.21x
+    # BLOCK_M=256 amortiza el tile de B sobre el doble de filas. La ocupacion
+    # no es la palanca: TODAS las configuraciones quedan en 1 CTA/SM (8 de 48
+    # warps), asi que lo que manda es la intensidad aritmetica.
+    (16, 128, 128, 8, 8, 3),    # M <=  32   decode
+    (128, 128, 128, 8, 8, 3),   # M <= 128
+    (256, 128, 64, 8, 8, 4),    # M <= 1024
+    (256, 128, 128, 8, 8, 2),   # M  > 1024  prefill
+)
+
+BLOCK_M: int = 128
+BLOCK_N: int = 128
+BLOCK_K: int = 128
+
+_ZERO: dict[torch.device, torch.Tensor] = {}
+
+
+def _zero(device: torch.device) -> torch.Tensor:
+    """Escalar cero por device, usado como residual neutro con strides 0."""
+    z = _ZERO.get(device)
+    if z is None:
+        z = torch.zeros((), dtype=torch.bfloat16, device=device)
+        _ZERO[device] = z
+    return z
+
+
+_HAS_SHIFT: dict[int, bool] = {}
+
+
+def _has_shift(shifts: torch.Tensor) -> bool:
+    """True si el tensor de shifts tiene algun valor distinto de cero.
+
+    Cacheado por ``data_ptr``: el tensor se construye una vez al cargar y no
+    cambia. Sin el cache habria que hacer ``shifts.any().item()`` por forward,
+    que es una sincronizacion GPU->CPU — a 60 us de GEMM en decode eso cuesta
+    mas que el kernel entero (medido: 0.058 -> 0.084 ms, 0.66x).
+    """
+    k = shifts.data_ptr()
+    v = _HAS_SHIFT.get(k)
+    if v is None:
+        v = bool(shifts.any().item())
+        _HAS_SHIFT[k] = v
+    return v
+
+
+def _cfg(m: int) -> tuple[int, int, int, int, int, int]:
+    return _CFG[(m > 32) + (m > 128) + (m > 1024)]
+
+
+@triton.jit
+def _sk02_quant_kernel(x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm, BLOCK: tl.constexpr):
+    """Quant per-token amax/127. Sin norm: out_proj no tiene norma delante."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < K
+    x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-30)
+    xq = x * (127.0 / amax)
+    q = (xq + tl.where(xq >= 0.0, 0.5, -0.5)).to(tl.int32)
+    tl.store(q_ptr + row * stride_qm + offs, tl.minimum(tl.maximum(q, -127), 127).to(tl.int8), mask=mask)
+    tl.store(s_ptr + row, amax * (1.0 / 127.0))
+
 
 
 @triton.jit
 def _sk02_gdn_out_int8_kernel(
-    a_ptr,
-    b_ptr,
-    out_ptr,
-    a_scale_ptr,
-    b_scale_ptr,
-    shifts_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_out_m,
-    stride_out_n,
-    stride_scales_a,
-    stride_scales_b,
-    stride_shift_k,
-    stride_shift_n,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    SHIFT_BLOCK: tl.constexpr,
+    a_ptr, b_ptr, out_ptr, resid_ptr, a_scale_ptr, b_scale_ptr, shifts_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn,
+    stride_out_m, stride_out_n, stride_res_m, stride_res_n,
+    stride_shift_k, stride_shift_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr, SHIFT_BLOCK: tl.constexpr, HAS_SHIFT: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    a_scales = tl.load(a_scale_ptr + offs_m * stride_scales_a, mask=mask_m, other=0.0).to(tl.bfloat16)
-    b_scales = tl.load(b_scale_ptr + offs_n * stride_scales_b, mask=mask_n, other=0.0).to(tl.bfloat16)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.bfloat16)
-    num_kb = K // SHIFT_BLOCK
-    for kb in range(num_kb):
-        shift_col = (pid_n * BLOCK_N) // SHIFT_BLOCK
-        shift_val = tl.load(shifts_ptr + kb * stride_shift_k + shift_col * stride_shift_n).to(tl.int32)
-        int_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-        k_base = kb * SHIFT_BLOCK
-        for sub in range(SHIFT_BLOCK // BLOCK_K):
-            k_offs = k_base + sub * BLOCK_K + tl.arange(0, BLOCK_K)
-            a_ptrs = a_ptr + offs_m[:, None] * stride_am + k_offs[None, :] * stride_ak
-            mask_a = mask_m[:, None] & (k_offs[None, :] < K)
-            a_tile = tl.load(a_ptrs, mask=mask_a, other=0).to(tl.int8)
-            b_ptrs = b_ptr + k_offs[:, None] * stride_bk + offs_n[None, :] * stride_bn
-            mask_b = (k_offs[:, None] < K) & mask_n[None, :]
-            b_tile = tl.load(b_ptrs, mask=mask_b, other=0).to(tl.int8)
-            int_acc = int_acc + tl.dot(a_tile, b_tile)
-        shifted = int_acc << shift_val
-        shifted_f = shifted.to(tl.bfloat16)
-        scaled = shifted_f * a_scales[:, None] * b_scales[None, :]
-        acc = acc + scaled
-    out_ptrs = out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
-    mask_out = mask_m[:, None] & mask_n[None, :]
-    tl.store(out_ptrs, acc, mask=mask_out)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_in_group = GROUP_M * num_pid_n
+    first_m = (pid // pid_in_group) * GROUP_M
+    group_m = min(num_pid_m - first_m, GROUP_M)
+    pid_m = first_m + ((pid % pid_in_group) % group_m)
+    pid_n = (pid % pid_in_group) // group_m
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    sh_ptrs = shifts_ptr + (offs_n // SHIFT_BLOCK) * stride_shift_n
+
+    # HAS_SHIFT es constexpr: el Diseno B (shifts todos cero, el default de
+    # produccion) compila un bucle SIN nada de shift, con un unico acumulador
+    # int32 vivo. Medido: 158 registros/hilo contra 234 de la version con
+    # shift, y de ahi salen 1.20-1.27x en M>=512. La variante con
+    # tl.where(sh>=0, d<<sh, d>>-sh) materializa DOS temporales int32 [BM,BN]
+    # mas el select, o sea la misma presion de registros que tenia el fp32.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for kb in range(0, K // BLOCK_K):
+        d = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), out_dtype=tl.int32)
+        if HAS_SHIFT:
+            d = d << tl.load(sh_ptrs + kb * stride_shift_k).to(tl.int32)[None, :]
+        acc += d
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    out = acc.to(tl.bfloat16) * tl.load(a_scale_ptr + offs_m).to(tl.bfloat16)[:, None]
+    out = out * tl.load(b_scale_ptr + offs_n).to(tl.bfloat16)[None, :]
+    out += tl.load(resid_ptr + offs_m[:, None] * stride_res_m + offs_n[None, :] * stride_res_n).to(tl.bfloat16)
+
+    out_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    out_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tl.store(
+        out_ptr + out_m[:, None] * stride_out_m + out_n[None, :] * stride_out_n,
+        out.to(out_ptr.dtype.element_ty),
+        mask=(out_m[:, None] < M) & (out_n[None, :] < N),
+    )
+
+
+def sk02_quant(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quant per-token INT8 -> ``(q [M,K] int8, s [M] fp32)``."""
+    M, K = hidden.shape
+    q = torch.empty((M, K), dtype=torch.int8, device=hidden.device)
+    s = torch.empty((M,), dtype=torch.float32, device=hidden.device)
+    _sk02_quant_kernel[(M,)](
+        hidden, q, s, K, hidden.stride(0), q.stride(0),
+        BLOCK=triton.next_power_of_2(K), num_warps=8, num_stages=1,
+    )
+    return q, s
 
 
 def sk02_gemm_int8_scaled(
     hidden: torch.Tensor,
     weight_i8: torch.Tensor,
-    a_scales: torch.Tensor = None,
-    b_scales: torch.Tensor = None,
-    shifts: torch.Tensor = None,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    shifts: torch.Tensor,
+    residual: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    hidden_bf16 = hidden.to(out_dtype)
-    amax = hidden_bf16.abs().amax(dim=-1, keepdim=True)
-    scale = amax / 127.0
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    hidden_i8 = (hidden_bf16 / scale).round().clamp(-127, 127).to(torch.int8)
-    a = hidden_i8
-    a_scales_local = scale.squeeze(-1).to(out_dtype)
-    b_scales_local = b_scales.to(out_dtype)
-    b_kn = weight_i8.t().contiguous()
-    M = a.shape[0]
-    N = b_kn.shape[1]
-    K = a.shape[1]
-    out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    """GEMM INT8 diádico + residual fusionado. ``hidden`` int8 [M,K], ``weight_i8`` [K,N]."""
+    M, K = hidden.shape
+    N = weight_i8.shape[1]
+    res = _zero(hidden.device) if residual is None else residual
+    rm, rn = (0, 0) if residual is None else (res.stride(0), res.stride(1))
+    has_shift = _has_shift(shifts)
+    bm, bn, bk, gm, warps, stages = _cfg(M)
+    out = torch.empty((M, N), dtype=out_dtype, device=hidden.device)
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     _sk02_gdn_out_int8_kernel[grid](
-        a,
-        b_kn,
-        out,
-        a_scales_local,
-        b_scales_local,
-        shifts,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b_kn.stride(0),
-        b_kn.stride(1),
-        out.stride(0),
-        out.stride(1),
-        1,
-        1,
-        shifts.stride(0),
-        shifts.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        SHIFT_BLOCK=SHIFT_BLOCK,
-        num_warps=4,
-        num_stages=2,
+        hidden, weight_i8, out, res, a_scales, b_scales, shifts,
+        M, N, K,
+        hidden.stride(0), hidden.stride(1), weight_i8.stride(0), weight_i8.stride(1),
+        out.stride(0), out.stride(1), rm, rn,
+        shifts.stride(0), shifts.stride(1),
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, SHIFT_BLOCK=SHIFT_BLOCK,
+        HAS_SHIFT=has_shift,
+        num_warps=warps, num_stages=stages,
     )
     return out
 
@@ -160,13 +223,22 @@ def sk02_gdn_out_proj(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     shifts: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     do_allreduce: bool = True,
-    mode: str = "int8",
 ) -> torch.Tensor:
-    out = sk02_gemm_int8_scaled(hidden, weight, None, weight_scale, shifts, out_dtype)
-    out = out + residual
+    """Capa completa GDN out_proj: quant -> GEMM diádico -> all_reduce -> residual.
+
+    RowParallel: el residual se fusiona en el epílogo del GEMM sólo cuando NO
+    hay all_reduce; con TP>1 se suma después del colectivo para no replicarlo.
+    """
+    a, a_scales = sk02_quant(hidden)
+    if not do_allreduce:
+        # TP=1: el residual va fusionado en el epílogo del GEMM, sin pasada extra.
+        return sk02_gemm_int8_scaled(a, weight, a_scales, weight_scale, shifts, residual, out_dtype)
+    out = sk02_gemm_int8_scaled(a, weight, a_scales, weight_scale, shifts, None, out_dtype)
+    torch.distributed.all_reduce(out)
+    out.add_(residual)
     return out
 
 
@@ -175,16 +247,8 @@ gdn_out_int8_scaled = sk02_gemm_int8_scaled
 sk02_gemm_w8a16 = sk02_gemm_int8_scaled
 
 __all__ = [
-    "SK_ID",
-    "SK_NAME",
-    "GLOBAL_SHAPE",
-    "RANK_SHAPE",
-    "NUM_LAYERS",
-    "ROW_PARALLEL",
-    "SHIFT_BLOCK",
-    "sk02_gemm_int8_scaled",
-    "sk02_gdn_out_proj",
-    "sk02_gdn_out",
-    "gdn_out_int8_scaled",
-    "sk02_gemm_w8a16",
+    "SK_ID", "SK_NAME", "GLOBAL_SHAPE", "RANK_SHAPE", "NUM_LAYERS", "ROW_PARALLEL",
+    "SHIFT_BLOCK", "BLOCK_M", "BLOCK_N", "BLOCK_K",
+    "sk02_quant", "sk02_gemm_int8_scaled", "sk02_gdn_out_proj", "sk02_gdn_out",
+    "gdn_out_int8_scaled", "sk02_gemm_w8a16",
 ]

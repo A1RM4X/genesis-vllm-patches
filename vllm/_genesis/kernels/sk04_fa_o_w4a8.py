@@ -1,16 +1,52 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SK-04 FA_O W4A8 — branchless RowParallel 5120x6144 W4A8 sm_86.
+"""SK-04 W4A8 — FA_O_W4A8 — capa completa Full-Attention o_proj (RowParallel) en INT4/INT8.
 
-Branchless: solo tl.load / tl.dot / tl.where / tl.store. Validacion movida a
-patch_PN110 warmup_all_kernels (dims%16, dtype int8/int4, contiguity,
-K%128==0, N%128==0). Cualquier error es bug del pwal, no del kernel.
+Capa completa: quant per-token -> GEMM W4A8 con residual fusionado en el
+epílogo -> all_reduce. Geometría per-rank TP=2: K=3072, N=5120.
 
-Geometria: Global [5120,6144]=[40*128,48*128], por-rank TP2 [5120,3072].
-W4A8: a [M,K] int8 per-token, b_packed [K,N//2] uint8 int4 packed
-(2 valores int4 por byte, low nibble = canal par, high nibble = canal impar),
-b_scale [N] bf16 per-channel, shifts [K/128,N/128] int8 diadico.
-Diseno C sm_86: w = q * 2^shift * s_row, shift sobre INT32, epilogo
-bf16 * a_scale * s_row. INT32→bf16 directo, acc bf16, 2x BW vs fp32.
+Convención W4A8 (única para toda la familia SK-*_w4a8)
+------------------------------------------------------
+``w_packed`` ``[K/2, N]`` int8: cada byte lleva dos pesos de 4 bits, el de
+``k=2i`` en el nibble bajo y el de ``k=2i+1`` en el alto, con zero-point 8.
+``w_scales`` ``[K/128, N]`` fp32: una escala por grupo de 128 filas (GPTQ).
+Activación INT8 per-token con su escala ``[M]`` fp32.
+
+Qué cambió respecto de la versión anterior
+------------------------------------------
+El desempaquetado leía **cada byte dos veces** —una para el nibble par y otra
+para el impar— y descartaba la mitad en cada lectura::
+
+    packed_k = cur_k // 2
+    is_even  = (cur_k % 2) == 0
+    packed   = tl.load(w_packed_ptrs, ...)      # el byte entero
+    w_q      = tl.where(is_even[:, None], packed & 15, (packed >> 4) & 15)
+
+Eso da exactamente el mismo tráfico de memoria que INT8: **el ahorro de ancho
+de banda de W4, que es el único motivo para hacer W4A8, desaparecía**. Ahora el
+byte se lee una vez, salen los dos nibbles juntos, la activación se lee contigua
+y se parte en pares/impares en registro con ``tl.split``, y el producto se cierra
+con dos ``tl.dot`` sobre las mitades::
+
+    packed = tl.load(w_ptrs)                    # una vez
+    w_lo, w_hi = (packed & 15) - 8, ((packed >> 4) & 15) - 8
+    a_even, a_odd = tl.split(tl.reshape(a, (BLOCK_M, BLOCK_K // 2, 2)))
+    int_acc = tl.dot(a_even, w_lo) + tl.dot(a_odd, w_hi)
+
+Además el acumulador pasó de bf16 (8 bits de mantisa, 96 parciales
+encadenados) a INT32 por grupo con acumulación fp32, y el epílogo de escala
+salió del bucle interno: antes se aplicaba una vez por cada ``BLOCK_K=32``.
+
+Diseño (sm_86, mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32):
+  * ``BLOCK_K == GROUP_SIZE == 128`` -> una escala de grupo por iteración.
+  * Tiles grandes, punteros que avanzan, grid 1-D con swizzle L2, num_stages 3-4.
+  * Residual fusionado en el epílogo (strides 0 sobre un escalar cero cuando
+    no hay residual: broadcast gratis, sin rama).
+
+RowParallel: con TP>1 el residual se suma después del all_reduce; con TP=1 va
+fusionado en el epílogo.
+
+
+Los kernels son branchless y no validan nada: se asume todo comprobado.
 """
 
 from __future__ import annotations
@@ -19,222 +55,268 @@ import torch
 import triton
 import triton.language as tl
 
-SK_ID: str = "SK-04"
-SK_NAME: str = "FA_O_W4A8"
-SHAPE_GLOBAL: tuple[int, int] = (5120, 6144)
-SHAPE_PER_RANK: tuple[int, int] = (5120, 3072)
-GLOBAL_SHAPE: tuple[int, int] = (5120, 6144)
-RANK_SHAPE: tuple[int, int] = (5120, 3072)
-NUM_LAYERS: int = 17
-ROW_PARALLEL: bool = True
-SHIFT_BLOCK: int = 128
+SK_ID = "SK-04-W4A8"
+SK_NAME = "FA_O_W4A8"
+GLOBAL_SHAPE = (5120, 6144)
+RANK_SHAPE = (5120, 3072)
+NUM_LAYERS = 17
+ROW_PARALLEL = True
+
 GROUP_SIZE: int = 128
-BLOCK_M: int = 32
-BLOCK_N: int = 64
-BLOCK_K: int = 32
-PACK_FACTOR: int = 2
+
+# Split-K de decode: reparte K entre CTAs cuando hay pocos bloques de N.
+SPLITK_MAX_M: int = 32
+SPLITK_BLOCK_N: int = 128
+SPLITK_BLOCK_K: int = 128
+SPLIT_K: int = 4
+# GA102 (RTX 3090) tiene 82 SM. El split-K sólo paga cuando N/BLOCK_N no llega
+# a llenar una ola: con N=17408 ya hay 136 CTAs y repartir K sólo agrega
+# atómicas y un buffer fp32 intermedio (medido: 0.081 -> 0.100 ms a M=1).
+SM_COUNT: int = 82
+
+# (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages) por bucket de M.
+# BLOCK_K == GROUP_SIZE == 128 -> una escala de grupo por iteración.
+_CFG: tuple[tuple[int, int, int, int, int, int], ...] = (
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages) por bucket de M.
+    # Barrido propio de W4A8 en RTX 3090 (K=5120, N=8192), mediana de 5 corridas.
+    # Su perfil NO es el de W8A8: aca el kernel esta ALU-bound desempaquetando
+    # nibbles, asi que gana con menos warps (4) y mas stages, no con tiles mas
+    # grandes. Ganancia sobre la config anterior:
+    #   M=32 1.18x   M=128 1.24x   M=512 1.26x   M=1664 1.20x   M=8000 1.23x
+    (16, 128, 128, 8, 8, 3),    # M <=   16  decode
+    (64, 128, 128, 8, 4, 4),    # M <=  128
+    (64, 128, 128, 8, 4, 4),    # M <= 1024
+    (128, 256, 64, 8, 8, 3),    # M  > 1024  prefill
+)
+
+BLOCK_M: int = 64
+BLOCK_N: int = 128
+BLOCK_K: int = 128
+
+_ZERO: dict[torch.device, torch.Tensor] = {}
+
+
+def _zero(device: torch.device) -> torch.Tensor:
+    """Escalar cero por device, usado como residual neutro con strides 0."""
+    z = _ZERO.get(device)
+    if z is None:
+        z = torch.zeros((), dtype=torch.bfloat16, device=device)
+        _ZERO[device] = z
+    return z
+
+
+def _cfg(m: int) -> tuple[int, int, int, int, int, int]:
+    return _CFG[(m > 16) + (m > 128) + (m > 1024)]
+
+
+@triton.jit
+def _sk04_fa_o_w4a8_quant_kernel(x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm, BLOCK: tl.constexpr):
+    """Quant per-token amax/127, una fila por programa."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < K
+    x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-30)
+    xq = x * (127.0 / amax)
+    q = (xq + tl.where(xq >= 0.0, 0.5, -0.5)).to(tl.int32)
+    tl.store(q_ptr + row * stride_qm + offs, tl.minimum(tl.maximum(q, -127), 127).to(tl.int8), mask=mask)
+    tl.store(s_ptr + row, amax * (1.0 / 127.0))
+
+
+@triton.jit
+def _sk04_fa_o_w4a8_splitk_kernel(
+    a_ptr, w_ptr, out_ptr, a_scale_ptr, w_scale_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_wk, stride_wn,
+    stride_out_m, stride_out_n,
+    stride_ws_g, stride_ws_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Variante split-K para decode: reparte K entre ``SPLIT_K`` CTAs.
+
+    El grid es (M/BLOCK_M, N/BLOCK_N, SPLIT_K). La dimension de M es
+    obligatoria: sin ella el kernel calculaba SOLO las primeras BLOCK_M=16
+    filas y las de arriba quedaban sin escribir. Medido antes del fix: a M=17
+    salian mal 3 de 17 filas, a M=32 salian mal 19 de 32.
+
+    En decode el GEMM es bandwidth-bound sobre el peso, pero con ``BLOCK_N=128``
+    una capa como ``down_proj`` (N=5120) sólo genera 40 CTAs para 82 SM: media
+    GPU parada. Repartiendo K en 4 se llega a 160 y el ancho de banda sube de
+    32% a 57% del techo de la 3090. Cada trozo aplica sus propias escalas de
+    grupo y de fila, así que la reducción entre trozos es una suma directa
+    (``tl.atomic_add`` sobre fp32).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_kh = tl.arange(0, BLOCK_K // 2)
+
+    groups = (K // BLOCK_K) // SPLIT_K
+    g0 = pid_k * groups
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + (g0 * BLOCK_K + offs_k)[None, :] * stride_ak
+    w_ptrs = w_ptr + (g0 * (BLOCK_K // 2) + offs_kh)[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for g in range(groups):
+        packed = tl.load(w_ptrs).to(tl.int32)
+        w_lo = ((packed & 15) - 8).to(tl.int8)
+        w_hi = (((packed >> 4) & 15) - 8).to(tl.int8)
+        a_even, a_odd = tl.split(tl.reshape(tl.load(a_ptrs), (BLOCK_M, BLOCK_K // 2, 2)))
+        int_acc = tl.dot(a_even, w_lo, out_dtype=tl.int32) + tl.dot(a_odd, w_hi, out_dtype=tl.int32)
+        w_scales = tl.load(w_scale_ptr + (g0 + g) * stride_ws_g + offs_n * stride_ws_n).to(tl.float32)
+        acc += int_acc.to(tl.float32) * w_scales[None, :]
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += (BLOCK_K // 2) * stride_wk
+
+    acc = acc * tl.load(a_scale_ptr + offs_m).to(tl.float32)[:, None]
+    out_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    out_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tl.atomic_add(
+        out_ptr + out_m[:, None] * stride_out_m + out_n[None, :] * stride_out_n,
+        acc,
+        mask=(out_m[:, None] < M) & (out_n[None, :] < N),
+    )
 
 
 @triton.jit
 def _sk04_fa_o_w4a8_kernel(
-    a_ptr,
-    b_packed_ptr,
-    out_ptr,
-    a_scale_ptr,
-    b_scale_ptr,
-    shifts_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_out_m,
-    stride_out_n,
-    stride_scale_a,
-    stride_scale_b,
-    stride_shift_k,
-    stride_shift_n,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    SHIFT_BLOCK: tl.constexpr,
+    a_ptr, w_ptr, out_ptr, resid_ptr, a_scale_ptr, w_scale_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_wk, stride_wn,
+    stride_out_m, stride_out_n, stride_res_m, stride_res_n,
+    stride_ws_g, stride_ws_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_n_half = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask_n_half = offs_n_half < (N // 2)
-    a_scales = tl.load(a_scale_ptr + offs_m * stride_scale_a, mask=mask_m, other=0.0).to(tl.bfloat16)
-    b_scales_even = tl.load(b_scale_ptr + offs_n_half * 2 * stride_scale_b, mask=(offs_n_half * 2 < N), other=1.0).to(tl.bfloat16)
-    b_scales_odd = tl.load(b_scale_ptr + (offs_n_half * 2 + 1) * stride_scale_b, mask=((offs_n_half * 2 + 1) < N), other=1.0).to(tl.bfloat16)
-    acc_even = tl.zeros((BLOCK_M, BLOCK_N // 2), dtype=tl.bfloat16)
-    acc_odd = tl.zeros((BLOCK_M, BLOCK_N // 2), dtype=tl.bfloat16)
-    num_kb = K // SHIFT_BLOCK
-    for kb in range(num_kb):
-        shift_col = (pid_n * BLOCK_N) // SHIFT_BLOCK
-        shift_val = tl.load(shifts_ptr + kb * stride_shift_k + shift_col * stride_shift_n).to(tl.int32)
-        int_acc_even = tl.zeros((BLOCK_M, BLOCK_N // 2), dtype=tl.int32)
-        int_acc_odd = tl.zeros((BLOCK_M, BLOCK_N // 2), dtype=tl.int32)
-        k_base = kb * SHIFT_BLOCK
-        for sub in range(SHIFT_BLOCK // BLOCK_K):
-            k_offs = k_base + sub * BLOCK_K + tl.arange(0, BLOCK_K)
-            a_ptrs = a_ptr + offs_m[:, None] * stride_am + k_offs[None, :] * stride_ak
-            mask_a = mask_m[:, None] & (k_offs[None, :] < K)
-            a_tile = tl.load(a_ptrs, mask=mask_a, other=0).to(tl.int8)
-            b_packed_ptrs = b_packed_ptr + k_offs[:, None] * stride_bk + offs_n_half[None, :] * stride_bn
-            mask_b_packed = (k_offs[:, None] < K) & mask_n_half[None, :]
-            b_packed_tile = tl.load(b_packed_ptrs, mask=mask_b_packed, other=0).to(tl.int32)
-            b_low = b_packed_tile & 0xF
-            b_high = (b_packed_tile >> 4) & 0xF
-            b_low = tl.where(b_low >= 8, b_low - 16, b_low)
-            b_high = tl.where(b_high >= 8, b_high - 16, b_high)
-            b_low_i8 = b_low.to(tl.int8)
-            b_high_i8 = b_high.to(tl.int8)
-            int_acc_even = int_acc_even + tl.dot(a_tile, b_low_i8)
-            int_acc_odd = int_acc_odd + tl.dot(a_tile, b_high_i8)
-        shifted_even = tl.where(shift_val >= 0, int_acc_even << shift_val, int_acc_even >> (-shift_val))
-        shifted_odd = tl.where(shift_val >= 0, int_acc_odd << shift_val, int_acc_odd >> (-shift_val))
-        shifted_even_f = shifted_even.to(tl.bfloat16)
-        shifted_odd_f = shifted_odd.to(tl.bfloat16)
-        scaled_even = shifted_even_f * a_scales[:, None] * b_scales_even[None, :]
-        scaled_odd = shifted_odd_f * a_scales[:, None] * b_scales_odd[None, :]
-        acc_even = acc_even + scaled_even
-        acc_odd = acc_odd + scaled_odd
-    out_ptrs_even = out_ptr + offs_m[:, None] * stride_out_m + (offs_n_half * 2)[None, :] * stride_out_n
-    out_ptrs_odd = out_ptr + offs_m[:, None] * stride_out_m + (offs_n_half * 2 + 1)[None, :] * stride_out_n
-    mask_out_even = mask_m[:, None] & ((offs_n_half * 2)[None, :] < N)
-    mask_out_odd = mask_m[:, None] & ((offs_n_half * 2 + 1)[None, :] < N)
-    tl.store(out_ptrs_even, acc_even, mask=mask_out_even)
-    tl.store(out_ptrs_odd, acc_odd, mask=mask_out_odd)
+    """GEMM W4A8: activación INT8 per-token, peso INT4 empacado con escala por grupo."""
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_in_group = GROUP_M * num_pid_n
+    first_m = (pid // pid_in_group) * GROUP_M
+    group_m = min(num_pid_m - first_m, GROUP_M)
+    pid_m = first_m + ((pid % pid_in_group) % group_m)
+    pid_n = (pid % pid_in_group) // group_m
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_kh = tl.arange(0, BLOCK_K // 2)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_kh[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for g in range(0, K // BLOCK_K):
+        # Una sola lectura del byte empacado: los dos nibbles salen a la vez.
+        packed = tl.load(w_ptrs).to(tl.int32)
+        w_lo = ((packed & 15) - 8).to(tl.int8)
+        w_hi = (((packed >> 4) & 15) - 8).to(tl.int8)
+        # La activación se lee contigua y se parte en pares/impares en registro.
+        a_even, a_odd = tl.split(tl.reshape(tl.load(a_ptrs), (BLOCK_M, BLOCK_K // 2, 2)))
+        int_acc = tl.dot(a_even, w_lo, out_dtype=tl.int32) + tl.dot(a_odd, w_hi, out_dtype=tl.int32)
+        w_scales = tl.load(w_scale_ptr + g * stride_ws_g + offs_n * stride_ws_n).to(tl.float32)
+        acc += int_acc.to(tl.float32) * w_scales[None, :]
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += (BLOCK_K // 2) * stride_wk
+
+    acc = acc * tl.load(a_scale_ptr + offs_m).to(tl.float32)[:, None]
+    acc += tl.load(resid_ptr + offs_m[:, None] * stride_res_m + offs_n[None, :] * stride_res_n).to(tl.float32)
+
+    out_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    out_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tl.store(
+        out_ptr + out_m[:, None] * stride_out_m + out_n[None, :] * stride_out_n,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=(out_m[:, None] < M) & (out_n[None, :] < N),
+    )
+
+
+def sk04_fa_o_w4a8_quant(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quant per-token INT8 -> ``(q [M,K] int8, s [M] fp32)``."""
+    M, K = hidden.shape
+    q = torch.empty((M, K), dtype=torch.int8, device=hidden.device)
+    s = torch.empty((M,), dtype=torch.float32, device=hidden.device)
+    _sk04_fa_o_w4a8_quant_kernel[(M,)](
+        hidden, q, s, K, hidden.stride(0), q.stride(0),
+        BLOCK=triton.next_power_of_2(K), num_warps=8, num_stages=1,
+    )
+    return q, s
 
 
 def sk04_fa_o_w4a8_gemm(
     a: torch.Tensor,
-    b_packed: torch.Tensor,
+    w_packed: torch.Tensor,
     a_scales: torch.Tensor,
-    b_scales: torch.Tensor,
-    shifts: torch.Tensor,
+    w_scales: torch.Tensor,
+    residual: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    M = a.shape[0]
-    N = b_packed.shape[1] * 2
-    K = a.shape[1]
-    if a_scales.dtype != out_dtype:
-        a_scales = a_scales.to(out_dtype)
-    if b_scales.dtype != out_dtype:
-        b_scales = b_scales.to(out_dtype)
+    """GEMM W4A8. ``a`` int8 [M,K], ``w_packed`` int8 [K/2,N], ``w_scales`` [K/128,N]."""
+    M, K = a.shape
+    N = w_packed.shape[1]
+    res = _zero(a.device) if residual is None else residual
+    rm, rn = (0, 0) if residual is None else (res.stride(0), res.stride(1))
+    # Decode: split-K para no dejar SMs ociosos cuando N/BLOCK_N < 2 olas.
+    if (
+        M <= SPLITK_MAX_M
+        and triton.cdiv(N, SPLITK_BLOCK_N) < SM_COUNT
+        and (K // SPLITK_BLOCK_K) % SPLIT_K == 0
+    ):
+        acc = (
+            torch.zeros((M, N), dtype=torch.float32, device=a.device)
+            if residual is None
+            else residual.to(torch.float32).expand(M, N).contiguous()
+        )
+        _sk04_fa_o_w4a8_splitk_kernel[(triton.cdiv(M, 16), triton.cdiv(N, SPLITK_BLOCK_N), SPLIT_K)](
+            a, w_packed, acc, a_scales, w_scales,
+            M, N, K,
+            a.stride(0), a.stride(1), w_packed.stride(0), w_packed.stride(1),
+            acc.stride(0), acc.stride(1),
+            w_scales.stride(0), w_scales.stride(1),
+            BLOCK_M=16, BLOCK_N=SPLITK_BLOCK_N, BLOCK_K=SPLITK_BLOCK_K, SPLIT_K=SPLIT_K,
+            num_warps=4, num_stages=3,
+        )
+        return acc.to(out_dtype)
+    bm, bn, bk, gm, warps, stages = _cfg(M)
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     _sk04_fa_o_w4a8_kernel[grid](
-        a,
-        b_packed,
-        out,
-        a_scales,
-        b_scales,
-        shifts,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b_packed.stride(0),
-        b_packed.stride(1),
-        out.stride(0),
-        out.stride(1),
-        1,
-        1,
-        shifts.stride(0),
-        shifts.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        SHIFT_BLOCK=SHIFT_BLOCK,
-        num_warps=4,
-        num_stages=2,
+        a, w_packed, out, res, a_scales, w_scales,
+        M, N, K,
+        a.stride(0), a.stride(1), w_packed.stride(0), w_packed.stride(1),
+        out.stride(0), out.stride(1), rm, rn,
+        w_scales.stride(0), w_scales.stride(1),
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+        num_warps=warps, num_stages=stages,
     )
     return out
 
 
 def sk04_fa_o_w4a8_proj(
-    hidden: torch.Tensor,
-    weight_packed: torch.Tensor,
-    weight_scale: torch.Tensor,
-    shifts: torch.Tensor,
-    residual: torch.Tensor,
+    attn_out: torch.Tensor,
+    w_packed: torch.Tensor,
+    w_scales: torch.Tensor,
+    residual: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    do_allreduce: bool = True,
 ) -> torch.Tensor:
-    hidden_bf16 = hidden.to(out_dtype) if hidden.dtype != out_dtype else hidden
-    amax = hidden_bf16.abs().amax(dim=-1, keepdim=True)
-    scale = amax / 127.0
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    hidden_i8 = (hidden_bf16 / scale).round().clamp(-127, 127).to(torch.int8)
-    a_scales = scale.squeeze(-1).to(out_dtype)
-    w_scale_bf16 = weight_scale.to(out_dtype) if weight_scale.dtype != out_dtype else weight_scale
-    M = hidden_i8.shape[0]
-    N = weight_packed.shape[1] * 2
-    K = hidden_i8.shape[1]
-    out = torch.empty((M, N), dtype=out_dtype, device=hidden.device)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    _sk04_fa_o_w4a8_kernel[grid](
-        hidden_i8,
-        weight_packed,
-        out,
-        a_scales,
-        w_scale_bf16,
-        shifts,
-        M,
-        N,
-        K,
-        hidden_i8.stride(0),
-        hidden_i8.stride(1),
-        weight_packed.stride(0),
-        weight_packed.stride(1),
-        out.stride(0),
-        out.stride(1),
-        1,
-        1,
-        shifts.stride(0),
-        shifts.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        SHIFT_BLOCK=SHIFT_BLOCK,
-        num_warps=4,
-        num_stages=2,
-    )
-    out = out + (residual.to(out_dtype) if residual.dtype != out_dtype else residual)
+    """Capa completa FA o_proj W4A8: quant -> GEMM -> all_reduce -> residual."""
+    a, a_scales = sk04_fa_o_w4a8_quant(attn_out)
+    if not do_allreduce:
+        return sk04_fa_o_w4a8_gemm(a, w_packed, a_scales, w_scales, residual, out_dtype)
+    out = sk04_fa_o_w4a8_gemm(a, w_packed, a_scales, w_scales, None, out_dtype)
+    torch.distributed.all_reduce(out)
+    out.add_(residual)
     return out
 
 
-fa_o_w4a8_gemm = sk04_fa_o_w4a8_gemm
-fa_o_w4a8_forward = sk04_fa_o_w4a8_proj
-sk04_fa_o_w4a8 = sk04_fa_o_w4a8_proj
-fa_o_forward_w4a8 = sk04_fa_o_w4a8_proj
-
 __all__ = [
-    "SK_ID",
-    "SK_NAME",
-    "SHAPE_GLOBAL",
-    "SHAPE_PER_RANK",
-    "GLOBAL_SHAPE",
-    "RANK_SHAPE",
-    "NUM_LAYERS",
-    "ROW_PARALLEL",
-    "SHIFT_BLOCK",
-    "GROUP_SIZE",
-    "PACK_FACTOR",
-    "BLOCK_M",
-    "BLOCK_N",
-    "BLOCK_K",
-    "_sk04_fa_o_w4a8_kernel",
-    "sk04_fa_o_w4a8_gemm",
-    "sk04_fa_o_w4a8_proj",
-    "sk04_fa_o_w4a8",
-    "fa_o_w4a8_gemm",
-    "fa_o_w4a8_forward",
+    "SK_ID", "SK_NAME", "GLOBAL_SHAPE", "RANK_SHAPE", "NUM_LAYERS", "ROW_PARALLEL",
+    "GROUP_SIZE", "BLOCK_M", "BLOCK_N", "BLOCK_K", "SPLIT_K", "SPLITK_MAX_M", "SM_COUNT",
+    "sk04_fa_o_w4a8_quant", "sk04_fa_o_w4a8_gemm", "sk04_fa_o_w4a8_proj",
 ]

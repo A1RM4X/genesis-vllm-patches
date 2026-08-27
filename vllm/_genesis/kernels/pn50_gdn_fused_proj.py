@@ -205,6 +205,17 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     if (head_qk & (head_qk - 1)) != 0 or (head_v & (head_v - 1)) != 0:
         return _fallback_pytorch(mixed_qkvz, mixed_ba, num_heads_qk,
                                  num_heads_v, head_qk, head_v)
+    # El kernel hace tl.arange(0, V_PER_GROUP * HEAD_V), así que lo que tiene
+    # que ser potencia de dos es el PRODUCTO, no sólo head_v. El guard de
+    # arriba lo daba por bueno con head_v=128 y V_PER_GROUP=3 (48 cabezas V /
+    # 16 QK, la geometría de Qwen3.8-27B): 3*128 = 384 y Triton aborta con
+    # "arange's range must be a power of 2" — durante profile_run, o sea que se
+    # lleva puesto el arranque del engine entero en vez de degradar a torch.
+    v_per_group = num_heads_v // num_heads_qk
+    vpg_span = v_per_group * head_v
+    if (vpg_span & (vpg_span - 1)) != 0:
+        return _fallback_pytorch(mixed_qkvz, mixed_ba, num_heads_qk,
+                                 num_heads_v, head_qk, head_v)
 
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v

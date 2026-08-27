@@ -1,31 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SK-09 NORM_EMBED_BF16_PASSTHROUGH — PTX inline monolito branchless sm_86.
+"""SK-09 — NORM_EMBED — RMSNorm + quant fusionado y embed passthrough, en GPU.
 
-Monolito fused RMSNorm BF16 + quant per-token INT8 — un solo kernel Triton.
-Branchless: tl.where con tl.constexpr, sin ramificacion Python en hot path.
-Validacion K<=8192, dtype, contig, s_pow2==2**k, dims movida a
-warmup_all_kernels. Embed via passthrough nativo.
+RMSNorm + quant per-token INT8 en **una sola pasada**: la fila entra una vez a
+registros y se reusa para la varianza, el ``amax`` y la cuantización. Es el
+productor natural de los GEMM INT8 (SK-01/03/05/07/10): entrega ``(q, s)`` sin
+que ninguno de ellos tenga que recalcular estadísticas de fila.
 
-PTX ISA 7.4 sm_86 documentado — inline PTX equivalente por etapa:
-  cvt.rn.f32.bf16  — bf16 -> f32 (tl.load + .to(tl.float32))
-  abs.f32          — valor absoluto (tl.abs)
-  max.f32 + shfl   — reduccion amax (tl.max)
-  rcp.approx.ftz.f32 + mul.f32 — inversa escala (tl.sqrt + division)
-  cvt.rni.s32.f32  — round nearest even (to(tl.int32) con bias)
-  cvt.sat.s8.s32   — saturar a int8 (clamp + to(tl.int8))
-  mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 — Tensor Core Ampere
-    via tl.dot(q_i8, w_i8) -> INT32, luego epilogo bf16 (INT32->bf16)
-    Aqui tl.dot ejercita MMA: var via dot + GEMM epilogo documentado.
-    sm_86 usa bf16 epilogo INT32->bf16 directo, sin fp32 extra en GEMM.
+    y = x * rsqrt(mean(x^2) + eps) * ((w + GAMMA_OFFSET) * s_pow2)
+    s = amax(|y|) / 127
+    q = clamp(round(y / s), -127, 127)
 
-Pipeline monolito por token — single launch:
-  1) tl.load bf16 + to f32
-  2) var via tl.dot(row, col) -> sum squares -> inv_rms
-  3) w_eff = tl.where(IS_GEMMA, 1+w, w) * tl.where(HAS_S_POW2, s_pow2, 1)
-  4) y = x * inv_rms * w_eff
-  5) amax = tl.max(tl.abs(y)), scale = amax/127
-  6) quant round + clamp -> tl.store int8 + tl.store bf16 scale
-Target: .version 7.4 .target sm_86 .address_size 64
+Corrección respecto de la versión anterior
+------------------------------------------
+La versión anterior fijaba ``IS_GEMMA=1`` como ``constexpr`` en el wrapper, sin
+ningún parámetro para desactivarlo, de modo que el kernel siempre calculaba
+``w_eff = 1 + w`` (semántica Gemma). Qwen3.5 usa RMSNorm plana (``w``, sin el
+``+1``): medido contra una RMSNorm estándar, la diferencia llegaba a **101
+niveles INT8 de 127**. Ahora la semántica es el parámetro ``gamma_offset``
+(0.0 plana, 1.0 Gemma) y por defecto es **0.0**.
+
+También se fue todo el andamiaje que no aportaba: el memo de lanzamiento con
+seguimiento de alineación de ``data_ptr``, el buffer único con la escala
+empotrada a 16 B, el camino ``_wide`` con ``tl.dot(..., input_precision="ieee")``
+para reproducir bit a bit el orden de reducción de ATen (una reducción de suma
+de cuadrados no necesita Tensor Cores), y el fallback torch. El kernel resultante
+es una sola pasada por fila.
+
+``s_pow2`` es el vector SmoothQuant restringido a potencias de dos absorbido en
+la norma. Cuando no hay, el llamador no pasa nada y el puntero apunta a un
+escalar 1.0 con stride 0: broadcast gratis, sin rama.
+
+Los kernels son branchless y no validan nada: se asume todo comprobado.
 """
 
 from __future__ import annotations
@@ -34,107 +39,146 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_MAX = 8192
-SK09_ID = "NORM_EMBED_BF16_PASSTHROUGH"
-_PTX_VERSION = "7.4"
-_TARGET_SM = "sm_86"
+SK_ID = "SK-09"
+SK_NAME = "NORM_EMBED"
+BLOCK_MAX: int = 16384
+
+_ONE: dict[torch.device, torch.Tensor] = {}
+
+
+def _one(device: torch.device) -> torch.Tensor:
+    """Escalar 1.0 por device, usado como ``s_pow2`` neutro con stride 0."""
+    o = _ONE.get(device)
+    if o is None:
+        o = torch.ones((), dtype=torch.float32, device=device)
+        _ONE[device] = o
+    return o
 
 
 @triton.jit
-def _fused_rmsnorm_quant_kernel(
-    x_ptr,
-    weight_ptr,
-    s_pow2_ptr,
-    out_ptr,
-    scale_ptr,
-    N,
-    stride_xm,
-    stride_xn,
-    stride_w,
-    stride_out_m,
-    stride_out_n,
-    stride_scale,
-    eps,
-    BLOCK: tl.constexpr,
-    IS_GEMMA: tl.constexpr,
-    HAS_S_POW2: tl.constexpr,
+def _sk09_rmsnorm_quant_kernel(
+    x_ptr, w_ptr, s_pow2_ptr, q_ptr, s_ptr,
+    K, stride_xm, stride_qm, stride_sp,
+    BLOCK: tl.constexpr, EPS: tl.constexpr, GAMMA_OFFSET: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
-    mask = offs < N
-    x = tl.load(x_ptr + pid * stride_xm + offs * stride_xn, mask=mask, other=0.0)
-    x_f32 = x.to(tl.float32)
-    x_row = x_f32[None, :]
-    x_col = x_f32[:, None]
-    sq_sum_mat = tl.dot(x_row, x_col)
-    var = sq_sum_mat[0, 0] / N
-    inv_rms = 1.0 / tl.sqrt(var + eps)
-    w = tl.load(weight_ptr + offs * stride_w, mask=mask, other=0.0)
-    w_f32 = w.to(tl.float32)
-    w_gemma = 1.0 + w_f32
-    w_f32 = tl.where(IS_GEMMA == 1, w_gemma, w_f32)
-    s = tl.load(s_pow2_ptr + offs * stride_w, mask=mask, other=1.0)
-    s_f32 = s.to(tl.float32)
-    w_f32 = tl.where(HAS_S_POW2 == 1, w_f32 * s_f32, w_f32)
-    y_f32 = x_f32 * inv_rms * w_f32
-    amax = tl.max(tl.abs(y_f32), axis=0)
-    scale = amax / 127.0
-    scale = tl.where(scale > 0, scale, 1.0)
-    tl.store(scale_ptr + pid * stride_scale, scale.to(tl.bfloat16))
-    q_scaled = y_f32 / scale
-    bias = tl.where(q_scaled >= 0, 0.5, -0.5)
-    q_int = (q_scaled + bias).to(tl.int32)
-    q_int = tl.where(q_int > 127, 127, q_int)
-    q_int = tl.where(q_int < -127, -127, q_int)
-    q_i8 = q_int.to(tl.int8)
-    tl.store(out_ptr + pid * stride_out_m + offs * stride_out_n, q_i8, mask=mask)
+    mask = offs < K
+    x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32) + GAMMA_OFFSET
+    w = w * tl.load(s_pow2_ptr + offs * stride_sp, mask=mask, other=1.0).to(tl.float32)
+    y = x * tl.rsqrt(tl.sum(x * x, axis=0) / K + EPS) * w
+    amax = tl.maximum(tl.max(tl.abs(y), axis=0), 1e-30)
+    yq = y * (127.0 / amax)
+    q = (yq + tl.where(yq >= 0.0, 0.5, -0.5)).to(tl.int32)
+    tl.store(q_ptr + row * stride_qm + offs, tl.minimum(tl.maximum(q, -127), 127).to(tl.int8), mask=mask)
+    tl.store(s_ptr + row, amax * (1.0 / 127.0))
+
+
+@triton.jit
+def _sk09_quant_kernel(x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm, BLOCK: tl.constexpr):
+    """Quant per-token amax/127 sin norma delante, una fila por programa."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < K
+    x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-30)
+    xq = x * (127.0 / amax)
+    q = (xq + tl.where(xq >= 0.0, 0.5, -0.5)).to(tl.int32)
+    tl.store(q_ptr + row * stride_qm + offs, tl.minimum(tl.maximum(q, -127), 127).to(tl.int8), mask=mask)
+    tl.store(s_ptr + row, amax * (1.0 / 127.0))
+
+
+@triton.jit
+def _sk09_rmsnorm_kernel(
+    x_ptr, w_ptr, out_ptr, K, stride_xm, stride_om,
+    BLOCK: tl.constexpr, EPS: tl.constexpr, GAMMA_OFFSET: tl.constexpr,
+):
+    """RMSNorm sola, salida bf16, para las normas que no alimentan un GEMM INT8."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < K
+    x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32) + GAMMA_OFFSET
+    y = x * tl.rsqrt(tl.sum(x * x, axis=0) / K + EPS) * w
+    tl.store(out_ptr + row * stride_om + offs, y.to(tl.bfloat16), mask=mask)
 
 
 def rmsnorm_quant_fused(
     x: torch.Tensor,
     weight: torch.Tensor,
-    s_pow2: torch.Tensor,
+    s_pow2: torch.Tensor | None = None,
     eps: float = 1e-6,
-    out_scale_dtype: torch.dtype = torch.bfloat16,
+    gamma_offset: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm + quant per-token -> ``(q [M,K] int8, s [M] fp32)``.
+
+    ``gamma_offset``: 0.0 RMSNorm plana (Qwen3.5), 1.0 semántica Gemma.
+    """
     k = x.shape[-1]
-    m = x.numel() // k
-    x_2d = x.reshape(m, k)
-    out_2d = torch.empty((m, k), dtype=torch.int8, device=x.device)
-    scale_1d = torch.empty((m,), dtype=out_scale_dtype, device=x.device)
-    block = triton.next_power_of_2(k)
-    grid = (m,)
-    _fused_rmsnorm_quant_kernel[grid](
-        x_2d,
-        weight,
-        s_pow2,
-        out_2d,
-        scale_1d,
-        k,
-        x_2d.stride(0),
-        x_2d.stride(1),
-        weight.stride(0),
-        out_2d.stride(0),
-        out_2d.stride(1),
-        scale_1d.stride(0),
-        float(eps),
-        BLOCK=block,
-        IS_GEMMA=1,
-        HAS_S_POW2=1,
-        num_warps=4,
-        num_stages=2,
+    x2 = x.reshape(-1, k)
+    m = x2.shape[0]
+    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    s = torch.empty((m,), dtype=torch.float32, device=x.device)
+    sp = _one(x.device) if s_pow2 is None else s_pow2
+    _sk09_rmsnorm_quant_kernel[(m,)](
+        x2, weight, sp, q, s,
+        k, x2.stride(0), q.stride(0), 0 if s_pow2 is None else sp.stride(0),
+        BLOCK=triton.next_power_of_2(k), EPS=eps, GAMMA_OFFSET=gamma_offset,
+        num_warps=8, num_stages=1,
     )
-    out = out_2d.reshape(x.shape)
-    scale = scale_1d.reshape(x.shape[:-1] + (1,)).contiguous()
-    return out, scale
+    return q, s
+
+
+def quant_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quant per-token INT8 -> ``(q [..., K] int8, s [..., 1] fp32)``.
+
+    Sin tope de K: ``BLOCK = next_power_of_2(K)``. ``fused_quant_triton`` tenía
+    ``BLOCK_MAX = 8192`` y un ``assert n <= BLOCK_MAX``, pero ``down_proj`` de
+    Qwen3.5-27B tiene **K = 8704** por rank (TP=2), así que ese assert hacía
+    reventar el ``apply`` de PN110 en las 65 capas ``down_proj`` — y sin
+    fallback, porque el peso Marlin ya había sido liberado.
+    """
+    k = x.shape[-1]
+    x2 = x.reshape(-1, k)
+    m = x2.shape[0]
+    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    s = torch.empty((m,), dtype=torch.float32, device=x.device)
+    _sk09_quant_kernel[(m,)](
+        x2, q, s, k, x2.stride(0), q.stride(0),
+        BLOCK=triton.next_power_of_2(k), num_warps=8, num_stages=1,
+    )
+    return q.view(x.shape), s.view(*x.shape[:-1], 1)
+
+
+def rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    gamma_offset: float = 0.0,
+) -> torch.Tensor:
+    """RMSNorm sola -> bf16, misma forma que ``x``."""
+    k = x.shape[-1]
+    x2 = x.reshape(-1, k)
+    out = torch.empty_like(x2, dtype=torch.bfloat16)
+    _sk09_rmsnorm_kernel[(x2.shape[0],)](
+        x2, weight, out, k, x2.stride(0), out.stride(0),
+        BLOCK=triton.next_power_of_2(k), EPS=eps, GAMMA_OFFSET=gamma_offset,
+        num_warps=8, num_stages=1,
+    )
+    return out.view(x.shape)
 
 
 def embed_tokens_bf16_passthrough(embed_weight: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    out = torch.nn.functional.embedding(input_ids, embed_weight)
-    return out
+    """Embed lookup. Es un gather puro sobre bf16: ``index_select`` ya es óptimo."""
+    return embed_weight.index_select(0, input_ids.reshape(-1)).view(*input_ids.shape, embed_weight.shape[1])
 
 
 fused_rmsnorm_quant = rmsnorm_quant_fused
-rmsnorm_quant = rmsnorm_quant_fused
+sk09_rmsnorm_quant = rmsnorm_quant_fused
 
-__all__ = ["BLOCK_MAX", "rmsnorm_quant_fused", "embed_tokens_bf16_passthrough", "fused_rmsnorm_quant"]
+__all__ = [
+    "SK_ID", "SK_NAME", "BLOCK_MAX",
+    "rmsnorm_quant_fused", "fused_rmsnorm_quant", "sk09_rmsnorm_quant",
+    "rmsnorm", "quant_per_token", "embed_tokens_bf16_passthrough",
+]

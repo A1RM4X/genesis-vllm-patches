@@ -230,6 +230,8 @@ _warmed_lock = threading.Lock()
 # ── GENESIS: logging detallado inicio — tabla de kernels a usar ─────────
 # Lista global con una entrada por capa analizada: {capa, tipo, forma, arch, sk}
 _genesis_kernel_plan: list[dict] = []
+# Despacho REAL por capa (que kernel se ejecuta), poblado en el bind.
+_genesis_dispatch_plan: list[dict] = []
 _genesis_kernel_plan_lock = threading.Lock()
 _genesis_startup_logged: bool = False
 
@@ -272,6 +274,342 @@ def _genesis_warn(msg: str, *args) -> None:
             print(msg, flush=True)
         except Exception:
             pass
+
+SK_ENV = "GENESIS_PN110_SK"
+_DEFAULT_SK = "1"
+
+# Regla de despacho, medida en 2x RTX 3090 dentro de vllm/vllm-openai:v0.23.0,
+# a través de este mismo ``apply`` (o sea incluyendo el quant de activación en
+# los dos caminos). Tiempos de ``in_proj_qkvz`` K=5120 N=8192, en ms:
+#
+#     M      SK    cutlass   hybrid    SK/cutlass  SK/hybrid
+#     1    0.061    0.066     0.198       1.08x      3.26x
+#    64    0.066    0.094     0.208       1.44x      3.16x
+#   128    0.106    0.078     0.217       0.74x      2.05x
+#   512    0.323    0.254     0.928       0.79x      2.87x
+#  1664    1.200    1.131     3.366       0.94x      2.80x
+#  8000    5.602    6.375    20.857       1.14x      3.72x
+#
+# Dos regímenes distintos:
+#
+#  * **Con ``w_shifts`` (Diseño C diádico)**: el único alternativo es
+#    ``int8_hybrid_gemm``, que es 2.0-4.9x más lento que el super kernel en
+#    todo el rango de M. Ahí se despacha SK siempre.
+#  * **Sin ``w_shifts`` (Diseño B per-channel)**: el alternativo es
+#    ``cutlass_scaled_mm``, que es muy bueno. SK gana en decode (M<=64) y en
+#    prefill grande (M>=4096), y pierde 5-25% en el medio. Los valores de SK a
+#    M=128-1664 ya son el mejor de 11 configuraciones de tile barridas: el
+#    hueco es estructural (CUTLASS pipelinea y usa ``ldmatrix`` mejor de lo que
+#    Triton puede expresar), no de tuning. Ahí se despacha SK sólo en los
+#    extremos y se deja cutlass en el medio.
+SK_MAX_M_ENV = "GENESIS_PN110_SK_MAX_M"
+_DEFAULT_SK_MAX_M = "64"
+SK_MIN_BIG_M_ENV = "GENESIS_PN110_SK_MIN_BIG_M"
+_DEFAULT_SK_MIN_BIG_M = "4096"
+
+# Ablación por super kernel. Permite aislar cuánto aporta cada uno a la calidad
+# y a la velocidad, sin recompilar ni tocar código:
+#
+#   GENESIS_PN110_SK_ONLY="SK-05,SK-06"   -> sólo esos dos van por super kernel,
+#                                            el resto cae al camino default de
+#                                            vLLM (cutlass o int8_hybrid_gemm).
+#   GENESIS_PN110_SK_SKIP="SK-01"         -> ese no va nunca por super kernel.
+#
+# ONLY tiene precedencia sobre SKIP. Vacío = sin filtro. Se resuelve una vez por
+# capa al cargar, así que el camino caliente no paga nada y la tabla de arranque
+# muestra exactamente qué quedó activo.
+SK_ONLY_ENV = "GENESIS_PN110_SK_ONLY"
+SK_SKIP_ENV = "GENESIS_PN110_SK_SKIP"
+
+# Si una capa NO va a ser ejecutada por un super kernel, no se la convierte:
+# se la deja en su camino nativo (Marlin FP8) en vez de swapearla a INT8 para
+# después correrla con cutlass o int8_hybrid_gemm.
+#
+# Sin esto, ``GENESIS_PN110_SK=0`` no devuelve el camino normal: el swap ocurre
+# en ``process_weights_after_loading``, que **libera el peso Marlin**, así que
+# para cuando ``apply`` lee el flag ya no hay a dónde volver. Medido en 2x3090
+# con MTP k=3: ``off`` 171.6 tok/s, ``SK=0`` 84.1 tok/s — la mitad, porque la
+# capa quedaba igual convertida y sólo cambiaba de kernel INT8.
+#
+# Con esto, ``SK=0`` deja el modelo entero en su camino nativo (PN110 presente
+# pero inerte) y ``SK_ONLY=SK-05`` convierte SÓLO las capas gate_up, dejando el
+# resto en Marlin: es lo que hace medible el aporte de cada super kernel.
+SWAP_ONLY_SK_ENV = "GENESIS_PN110_SWAP_ONLY_SK"
+_DEFAULT_SWAP_ONLY_SK = "1"
+
+# Tabla de despacho SK-id -> GEMM. Todos comparten la misma firma:
+#   fn(a_i8 [M,K], b_col [K,N] int8 col-major, a_scales [M] fp32,
+#      b_scales [N] fp32, shifts [K/128,N/128] int8, epilogue|None, out_dtype)
+# Se puebla una sola vez, en carga, nunca en el camino caliente.
+_SK_GEMM: dict[str, object] = {}
+
+
+def _sk_gemm_table() -> dict[str, object]:
+    """Devuelve la tabla SK-id -> GEMM, importando los kernels una sola vez."""
+    global _SK_GEMM
+    if _SK_GEMM:
+        return _SK_GEMM
+    from vllm._genesis.kernels.sk01_gdn_qkvz import sk01_gdn_qkvz_gemm
+    from vllm._genesis.kernels.sk02_gdn_out import sk02_gemm_int8_scaled
+    from vllm._genesis.kernels.sk03_fa_qkv import sk03_fa_qkv_gemm
+    from vllm._genesis.kernels.sk04_fa_o import fa_o_int8_scaled_gemm
+    from vllm._genesis.kernels.sk05_mlp_gateup import sk05_gateup_gemm
+    from vllm._genesis.kernels.sk06_mlp_down import mlp_down_gemm
+    from vllm._genesis.kernels.sk07_lm_head import _arange, lm_head_gemm
+    from vllm._genesis.kernels.sk10_mtp_draft import mtp_draft_fused_gemm
+
+    def _sk07(a, b, a_s, b_s, sh, epi, out_dtype):
+        # lm_head recorre el vocabulario completo cuando nadie pide muestreo;
+        # el arange está cacheado por (device, V), no se realoca por forward.
+        return lm_head_gemm(a, b, a_s, b_s, sh, _arange(a.device, b.shape[1]), epi, out_dtype)
+
+    _SK_GEMM = {
+        "SK-01": sk01_gdn_qkvz_gemm,
+        "SK-02": sk02_gemm_int8_scaled,
+        "SK-03": sk03_fa_qkv_gemm,
+        "SK-04": fa_o_int8_scaled_gemm,
+        "SK-05": sk05_gateup_gemm,
+        "SK-06": mlp_down_gemm,
+        "SK-07": _sk07,
+        "SK-10": mtp_draft_fused_gemm,
+    }
+    return _SK_GEMM
+
+
+def _genesis_sk_enabled() -> bool:
+    """``GENESIS_PN110_SK=0`` apaga el despacho a super kernels (vuelve a int8_linear)."""
+    return os.environ.get(SK_ENV, _DEFAULT_SK).strip().lower() in _TRUTHY
+
+
+def _genesis_sk_max_m() -> int:
+    """M hasta el cual el super kernel gana a ``cutlass_scaled_mm`` (decode)."""
+    try:
+        return int(os.environ.get(SK_MAX_M_ENV, _DEFAULT_SK_MAX_M).strip())
+    except ValueError:
+        return int(_DEFAULT_SK_MAX_M)
+
+
+def _genesis_sk_min_big_m() -> int:
+    """M desde el cual el super kernel vuelve a ganar (prefill grande)."""
+    try:
+        return int(os.environ.get(SK_MIN_BIG_M_ENV, _DEFAULT_SK_MIN_BIG_M).strip())
+    except ValueError:
+        return int(_DEFAULT_SK_MIN_BIG_M)
+
+
+def _genesis_sk_filter() -> tuple[frozenset[str], frozenset[str]]:
+    """Lee ``GENESIS_PN110_SK_ONLY`` / ``GENESIS_PN110_SK_SKIP`` -> (only, skip).
+
+    Acepta ``SK-05`` o ``sk05`` o ``5``; se normaliza a ``SK-05``.
+    """
+    def _norm(raw: str) -> frozenset[str]:
+        out = set()
+        for tok in raw.replace(";", ",").split(","):
+            tok = tok.strip().upper().replace("_", "-")
+            if not tok:
+                continue
+            digits = "".join(c for c in tok if c.isdigit())
+            if digits:
+                out.add(f"SK-{int(digits):02d}")
+        return frozenset(out)
+
+    return (
+        _norm(os.environ.get(SK_ONLY_ENV, "")),
+        _norm(os.environ.get(SK_SKIP_ENV, "")),
+    )
+
+
+def _genesis_layer_name(layer) -> str:
+    """Nombre completo de la capa (``model.layers.3.mlp.gate_up_proj``).
+
+    ``_genesis_pn110_name`` era un atributo fantasma: en todo el repo sólo
+    aparecía en ``getattr(..., "")``, nunca en un ``setattr``. El resultado era
+    que el nombre siempre valía ``""``, así que ni el selector de super kernel
+    ni ``_is_layer_excluded`` llegaban jamás a sus reglas por nombre. El
+    atributo real lo pone vLLM en ``LinearBase.__init__`` como ``prefix``
+    (``vllm/model_executor/layers/linear.py``). Se sigue respetando
+    ``_genesis_pn110_name`` si alguien lo setea, como override.
+    """
+    return getattr(layer, "_genesis_pn110_name", "") or getattr(layer, "prefix", "") or ""
+
+
+def _genesis_swap_only_sk() -> bool:
+    """``GENESIS_PN110_SWAP_ONLY_SK=0`` restaura el comportamiento viejo."""
+    return os.environ.get(SWAP_ONLY_SK_ENV, _DEFAULT_SWAP_ONLY_SK).strip().lower() in _TRUTHY
+
+
+def _genesis_sk_for_layer(layer, K: int, N: int) -> tuple[str, bool]:
+    """Devuelve ``(sk_string, la_capa_va_por_super_kernel)``.
+
+    Única fuente de verdad: la usan tanto el gate del swap en carga como el
+    bind del callable, así que no pueden divergir.
+    """
+    sk = _genesis_select_super_kernel(
+        _genesis_layer_name(layer), type(layer).__name__, K, N
+    )
+    if not _genesis_sk_enabled() or not sk.startswith("SK-"):
+        return sk, False
+    sk_id = sk[:5]
+    only, skip = _genesis_sk_filter()
+    if (only and sk_id not in only) or (not only and sk_id in skip):
+        return sk, False
+    return sk, sk_id in _sk_gemm_table()
+
+
+def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
+    """Resuelve el super kernel de la capa y deja el callable en el estado.
+
+    Se ejecuta una vez por capa al cargar. El camino caliente sólo hace
+    ``state.get("sk_fn")``: cero matching de strings por forward.
+
+    Deja en ``state``: ``sk_id``, ``sk_fn``, ``sk_shifts`` [K/128,N/128] int8 y
+    ``sk_bscales`` [N] fp32 (vista 1-D de ``b_scales`` [1,N], que es lo que
+    indexa el kernel).
+
+    Si ``w_shifts`` no existe —``GENESIS_PN110_HYBRID`` viene en 0 por defecto,
+    o sea Diseño B per-channel— se sintetizan ceros: ``exp2(0) == 1``, así que
+    el epílogo diádico queda neutro y exacto, sin rama en el kernel.
+
+    :returns: el string SK elegido (el mismo que va a la tabla de arranque).
+    """
+    name = _genesis_layer_name(layer)
+    sk = _genesis_select_super_kernel(name, type(layer).__name__, K, N)
+    if not _genesis_sk_enabled() or not sk.startswith("SK-"):
+        return sk
+    sk_id = sk[:5]
+    only, skip = _genesis_sk_filter()
+    if (only and sk_id not in only) or (not only and sk_id in skip):
+        motivo = SK_ONLY_ENV if only else SK_SKIP_ENV
+        with _genesis_kernel_plan_lock:
+            _genesis_dispatch_plan.append({
+                "capa": name or type(layer).__name__,
+                "tipo": type(layer).__name__,
+                "forma": f"{K}x{N}",
+                "sk": sk_id,
+                "sk_nombre": f"{sk} [DESACTIVADO]",
+                "ruta": f"default vLLM — desactivado por {motivo}",
+                "diadico": state.get("w_shifts") is not None,
+            })
+        return sk
+    fn = _sk_gemm_table().get(sk_id)
+    if fn is None:
+        return sk
+    b_scales = state.get("b_scales")
+    b_col = state.get("b_col", state.get("w_int8"))
+    if b_scales is None or b_col is None:
+        return sk
+    shifts = state.get("w_shifts")
+    if shifts is None:
+        shifts = torch.zeros((K // 128, N // 128), dtype=torch.int8, device=b_col.device)
+    state["sk_id"] = sk_id
+    state["sk_fn"] = fn
+    state["sk_max_m"] = _genesis_sk_max_m()
+    state["sk_min_big_m"] = _genesis_sk_min_big_m()
+    # Con shifts el alternativo es int8_hybrid_gemm (2-5x peor): SK siempre.
+    state["sk_always"] = state.get("w_shifts") is not None
+    state["sk_shifts"] = shifts.contiguous()
+    state["sk_bscales"] = b_scales.reshape(-1)
+    # Epílogo neutro precomputado: un único cero con strides (0,0), o sea un
+    # broadcast que no cuesta ancho de banda.
+    #
+    # Antes los wrappers lo pedían con ``_zero(device)``, que en la PRIMERA
+    # llamada aloja un tensor y escribe un dict global — dentro del forward
+    # compilado. Con cudagraphs activo eso hace abortar la captura con
+    # "Assigning / modifying buffers of nn.Module during forward pass", que es
+    # lo que obligaba a ``--enforce-eager``. Medido en 2x3090 con MTP k=3:
+    # 103.6 tok/s de decode con cudagraphs contra 55.5 sin ellos.
+    state["sk_zero"] = torch.zeros(
+        1, dtype=torch.bfloat16, device=b_col.device
+    ).as_strided((1, 1), (0, 0))
+    # SK-07 cachea un arange por (device, vocab); se precalienta acá para que el
+    # camino caliente no aloje ni mute nada.
+    if sk_id == "SK-07":
+        from vllm._genesis.kernels.sk07_lm_head import _arange as _sk07_arange
+        _sk07_arange(b_col.device, N)
+    if state["sk_always"]:
+        ruta = "SK siempre (diádico; el alternativo int8_hybrid_gemm es 2-5x peor)"
+    else:
+        ruta = f"SK si M<={state['sk_max_m']} o M>={state['sk_min_big_m']}; si no cutlass_scaled_mm"
+    with _genesis_kernel_plan_lock:
+        _genesis_dispatch_plan.append({
+            "capa": name or type(layer).__name__,
+            "tipo": type(layer).__name__,
+            "forma": f"{K}x{N}",
+            "sk": sk[:5],
+            "sk_nombre": sk,
+            "ruta": ruta,
+            "diadico": bool(state["sk_always"]),
+        })
+    return sk
+
+
+def _genesis_emit_dispatch_table() -> None:
+    """Tabla de arranque: qué capa, de qué tipo, y qué kernel se le aplica.
+
+    Se emite una vez al terminar la carga de pesos, antes del primer forward.
+    A diferencia de la tabla de plan (que dice qué SK *mapea* cada forma), esta
+    dice qué kernel se **ejecuta** realmente, incluido el régimen diádico y la
+    regla por M cuando el alternativo es ``cutlass_scaled_mm``.
+    """
+    with _genesis_kernel_plan_lock:
+        plan = list(_genesis_dispatch_plan)
+    total = len(plan)
+    if not total:
+        _genesis_warn("GENESIS PN110: ninguna capa quedo con super kernel despachado")
+        return
+    arch = _genesis_arch_str()
+    L = []
+    L.append("")
+    L.append("=" * 112)
+    L.append(f"GENESIS PN110 - KERNELS POR CAPA  ({total} capas con estado INT8, arch {arch})")
+    L.append("=" * 112)
+    L.append(f"{'#':>7}  {'capa':<44} {'tipo':<26} {'K x N':>13}  kernel")
+    L.append("-" * 112)
+    i = 0
+    grupos = 0
+    while i < total:
+        j = i
+        while (
+            j + 1 < total
+            and plan[j + 1]["sk"] == plan[i]["sk"]
+            and plan[j + 1]["forma"] == plan[i]["forma"]
+            and plan[j + 1]["tipo"] == plan[i]["tipo"]
+        ):
+            j += 1
+        e = plan[i]
+        rango = f"{i + 1}" if i == j else f"{i + 1}-{j + 1}"
+        capa = e["capa"] if i == j else f"{e['capa']} (x{j - i + 1})"
+        L.append(f"{rango:>7}  {capa[:44]:<44} {e['tipo'][:26]:<26} {e['forma']:>13}  {e['sk_nombre']}")
+        L.append(f"{'':>7}  {'':<44} {'':<26} {'':>13}  -> {e['ruta']}")
+        i = j + 1
+        grupos += 1
+        if grupos >= 40:
+            L.append(f"{'...':>7}  (+{total - i} capas mas, mismo patron)")
+            break
+    diadicas = sum(1 for e in plan if e["diadico"])
+    por_sk = {}
+    for e in plan:
+        por_sk[e["sk"]] = por_sk.get(e["sk"], 0) + 1
+    L.append("-" * 112)
+    activos = {}
+    inactivos = {}
+    for e in plan:
+        dst = inactivos if "[DESACTIVADO]" in e["sk_nombre"] else activos
+        dst[e["sk"]] = dst.get(e["sk"], 0) + 1
+    L.append("  capas por super kernel ACTIVO:  " + ("   ".join(f"{k}={v}" for k, v in sorted(activos.items())) or "ninguno"))
+    if inactivos:
+        L.append("  DESACTIVADOS (van al camino default): " + "   ".join(f"{k}={v}" for k, v in sorted(inactivos.items())))
+    L.append(f"  diadicas (Diseno C, shifts presentes): {diadicas}/{total}   |   "
+             f"per-channel (Diseno B): {total - diadicas}/{total}")
+    L.append("=" * 112)
+    L.append("")
+    msg = "\n".join(L)
+    log.warning(msg)
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
 
 def _genesis_select_super_kernel(layer_name: str, layer_type: str, K: int, N: int, M: int | None = None) -> str:
     """Selecciona super-kernel SK para una capa según nombre/tipo y forma KxN.
@@ -348,10 +686,13 @@ def _genesis_select_super_kernel(layer_name: str, layer_type: str, K: int, N: in
         except Exception:
             pass
         try:
-            if int(K) % 16 != 0 or int(N) % 16 != 0:
+            # Los SK diádicos recorren K en bloques de 128 sin máscara y mapean
+            # shifts [K/128, N/128], así que exigen múltiplo de 128 en ambas
+            # dimensiones — no de 16. Antes el guard era %16 y dejaba pasar
+            # formas que el kernel no puede ejecutar.
+            if int(K) % 128 != 0 or int(N) % 128 != 0:
                 _emit_no_sk_log()
                 return "default vLLM"
-            # Forma degenerada (K o N 0) también default
             if int(K) == 0 or int(N) == 0:
                 _emit_no_sk_log()
                 return "default vLLM"
@@ -854,7 +1195,7 @@ def _warmup_fused_kernels_for_shape(K: int, N: int, Ms: tuple[int, ...] = _WARMU
                     # warmup quant + cutlass: quant per-token + scaled_mm ya esta dentro de int8_linear,
                     # pero aqui solo warmup quant triton
                     try:
-                        from vllm._genesis.kernels.fused_quant_triton import quant_activation_per_token as _fused_quant
+                        from vllm._genesis.kernels.sk09_norm_embed import quant_per_token as _fused_quant
                         _fused_quant(a)
                     except Exception:
                         pass
@@ -1430,7 +1771,7 @@ def _is_layer_excluded(layer: torch.nn.Module, excludes: tuple[str, ...]) -> boo
     """
     # Exclusión automática GDN/mamba (previene Shape mismatch b_q_weight 5120)
     try:
-        name_lower = getattr(layer, "_genesis_pn110_name", "").lower()
+        name_lower = _genesis_layer_name(layer).lower()
         type_lower = type(layer).__name__.lower()
         if "gdn" in name_lower or "mamba" in name_lower:
             return True
@@ -1442,7 +1783,7 @@ def _is_layer_excluded(layer: torch.nn.Module, excludes: tuple[str, ...]) -> boo
         return False
     try:
         candidates = [type(layer).__name__]
-        name = getattr(layer, "_genesis_pn110_name", "")
+        name = _genesis_layer_name(layer)
         if name:
             candidates.append(name)
         return any(sub in cand for cand in candidates for sub in excludes)
@@ -1816,26 +2157,64 @@ def requantize_fp8_block_to_int8_hybrid(
     scale_inv: torch.Tensor,
     block_size: tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Requantiza FP8-bloque [K,N] a INT8 híbrido diádico Diseño C — 100% GPU.
+    """Requantiza FP8-bloque [K,N] a INT8 diádico (Diseño C) — 100% GPU.
 
-    Vectorizado puro en GPU sin ``for`` Python ni ``.cpu()``/``numpy``:
+    Produce ``(w_int8 [K,N], w_scales [N,1] fp32, w_shifts [Kb,Nb] int8)`` tales
+    que ``w ~= w_int8 * 2^shift * s_row``, que es exactamente lo que evalúan los
+    super kernels.
 
-    * Extrae ``e = (codes >> 3) & 0x0F`` y ``m = codes & 0x07`` como
-      tensores GPU ``uint8``.
-    * Calcula ``e_max`` por bloque vía ``max`` sobre dimensión del bloque
-      usando ``torch.max`` con ``view``/``reshape`` y ``keepdim``.
-    * Calcula ``d = e_max - e`` como tensor GPU ``int32``.
-    * Calcula ``q`` vía shifts vectorizados
-      ``torch.where(d <= 3, (8+m) << (3-d), (8+m) >> (d-3))`` todo en GPU.
-    * Escala ``s_new`` (``s_row`` per-channel) y ``shift_b`` también en GPU.
+    Qué estaba mal
+    --------------
+    La versión anterior construía ``q`` como un bit-shuffle exacto de los
+    códigos FP8 contra la escala **por bloque**::
 
-    Args:
-        weight_fp8: peso [K,N] en float8_e4m3fn.
-        scale_inv: escalas [K/Bk, N/Bn] fp32.
-        block_size: (Bk, Bn).
+        q = (8+m) << (3-d),   d = e_max - e      ->   w = q * s_prime
+        s_prime = s_blk * 2^(e_max - 13)
 
-    Returns:
-        (w_int8 [K,N] int8, w_scales [N,1] fp32, w_shifts [Kb,Nb] int8).
+    Eso es correcto y sin pérdida... contra ``s_prime``. Pero después emparejaba
+    ese ``q`` con ``2^shift * s_row[n]`` y calculaba::
+
+        shift = round(log2(s_prime) - log2(mean(s_row del bloque)))
+
+    Dos errores independientes, ambos medidos sobre pesos reales de
+    ``orcarouter/Qwen3.8-27B-Uncensored-FP8``:
+
+    1. ``s_prime / s_row`` **no es una potencia de dos**. La parte fraccionaria
+       de su ``log2`` tenía media 0.266 y máximo 0.498, así que redondear el
+       shift a entero metía hasta **1.412x de error multiplicativo por bloque**.
+    2. El shift se derivaba de la **media** de ``s_row`` en el bloque, pero el
+       kernel aplica ``s_row[n]`` **por columna**, y ``s_row`` varía 1.49x
+       (mediana) dentro de un bloque de 128 columnas.
+
+    Resultado: error relativo RMS de reconstrucción del peso **19%** (máximo
+    76%) contra 0.88% del Diseño B per-channel. End-to-end el modelo devolvía
+    basura: perplejidad 1.45e6 con super kernels y 7.08e7 con
+    ``int8_hybrid_gemm``, contra 2.60 del baseline.
+
+    Cómo se arregla
+    ---------------
+    El shift sólo puede absorber la parte potencia-de-dos, así que el resto
+    tiene que ir dentro de ``q``: se elige primero ``s_row`` per-channel, luego
+    el shift entero por bloque que no desborda ninguna columna, y recién
+    entonces se **recuantiza dividiendo**::
+
+        s_row[n] = amax_col[n] / 127
+        shift[kb,nb] = ceil( max_{n in nb} log2( amax_bloque[kb,n] / (127*s_row[n]) ) )
+        q[k,n] = round( w[k,n] / (s_row[n] * 2^shift[kb,nb]) )
+
+    Deja de ser un bit-shuffle sin pérdida y pasa a ser una cuantización normal
+    con error <= 0.5 LSB, pero **es correcta**.
+
+    Advertencia sobre su utilidad
+    -----------------------------
+    Medido sobre 5 capas reales del checkpoint, el Diseño C corregido da
+    **5-13% MÁS error que el Diseño B per-channel** (p.ej. down_proj 1.06e-2 vs
+    9.39e-3), y el shift siempre cae en ``[0,1]``. La razón es estructural: el
+    checkpoint FP8 ya está cuantizado por bloques 128x128, así que el escalado
+    por bloque ya consumió el rango dinámico que el diádico intenta recuperar;
+    y como el shift es por bloque de 128 columnas, tiene que satisfacer a la
+    peor de las 128. **No conviene activarlo en este checkpoint**; se mantiene
+    correcto para que ``GENESIS_PN110_HYBRID=1`` no produzca basura silenciosa.
     """
     bk, bn = block_size
     if weight_fp8.dim() != 2 or scale_inv.dim() != 2:
@@ -1851,91 +2230,60 @@ def requantize_fp8_block_to_int8_hybrid(
         raise ValueError(
             f"requantize_fp8_block_to_int8_hybrid: esperado float8_e4m3fn, "
             f"obtenido {weight_fp8.dtype}")
-    expected_scale_shape = (k // bk, n // bn)
-    if tuple(scale_inv.shape) != expected_scale_shape:
+    k_blocks, n_blocks = k // bk, n // bn
+    if tuple(scale_inv.shape) != (k_blocks, n_blocks):
         raise ValueError(
             f"requantize_fp8_block_to_int8_hybrid: scale_inv shape "
-            f"{tuple(scale_inv.shape)} != esperado {expected_scale_shape} "
+            f"{tuple(scale_inv.shape)} != esperado {(k_blocks, n_blocks)} "
             f"para weight {k}x{n} y block {block_size}")
 
-    # ── 1. s_row per-channel GPU vectorizado ──────────────────────────
-    try:
-        w_4d = weight_fp8.reshape(k // bk, bk, n // bn, bn)
-        s_4d = scale_inv.reshape(k // bk, 1, n // bn, 1)
-        w_fp32_4d = w_4d.to(torch.float32) * s_4d.to(torch.float32)
-        w_fp32 = w_fp32_4d.reshape(k, n)
-        amax_per_col = w_fp32.abs().amax(dim=0)
-    except Exception:
-        s_exp = scale_inv.repeat_interleave(bk, dim=0).repeat_interleave(bn, dim=1)
-        w_fp32 = weight_fp8.to(torch.float32) * s_exp.to(torch.float32)
-        amax_per_col = w_fp32.abs().amax(dim=0)
-    s_row_vec = amax_per_col / 127.0
-    s_row_vec = torch.where(s_row_vec > 0, s_row_vec, torch.ones_like(s_row_vec))
-    w_scales = s_row_vec.unsqueeze(1).contiguous()
+    # ── Chunked: el transitorio se acota a CHUNK_KB bloques de K ──────
+    #
+    # La versión no-chunked materializaba ``w_true`` [K,N] en fp32 (356 MB sólo
+    # para gate_up 5120x17408) más ``q`` del mismo tamaño. vLLM corre
+    # ``process_weights_after_loading`` DENTRO del pool de memoria "weights" del
+    # cumem allocator, así que ese transitorio compite con los pesos y hacía
+    # reventar la carga con "CUDA Error: out of memory at cumem_allocator.cpp".
+    # Chunkeando por bloques de K el pico baja a ``CHUNK_KB*bk*N*4`` bytes
+    # (~18 MB con los valores de acá) sin cambiar el resultado.
+    CHUNK_KB = 2
 
-    # ── 2. Extraer códigos uint8 crudos — GPU ─────────────────────────
-    codes_u8 = weight_fp8.view(torch.uint8)
-    # Validación NaN GPU (sin cpu)
-    mag_all = codes_u8 & 0x7F
-    if (mag_all == 0x7F).any():
-        raise ValueError("NaN en códigos FP8 (0x7F)")
+    w_int8 = torch.empty((k, n), dtype=torch.int8, device=weight_fp8.device)
 
-    # ── 3. Extraer e,m como tensores GPU uint8 ────────────────────────
-    e_u8 = (codes_u8 >> 3) & 0x0F
-    m_u8 = codes_u8 & 0x07
+    # Pasada 1: amax por columna (global) y por (bloque_k, columna).
+    amax_bc = torch.empty((k_blocks, n), dtype=torch.float32, device=weight_fp8.device)
+    for kb0 in range(0, k_blocks, CHUNK_KB):
+        kb1 = min(kb0 + CHUNK_KB, k_blocks)
+        chunk = (
+            weight_fp8[kb0 * bk:kb1 * bk].reshape(kb1 - kb0, bk, n_blocks, bn).to(torch.float32)
+            * scale_inv[kb0:kb1].reshape(kb1 - kb0, 1, n_blocks, 1).to(torch.float32)
+        ).reshape(kb1 - kb0, bk, n)
+        amax_bc[kb0:kb1] = chunk.abs().amax(dim=1)
+        del chunk
+    s_row = (amax_bc.amax(dim=0) / 127.0).clamp(min=1e-30)
 
-    k_blocks = k // bk
-    n_blocks = n // bn
+    # Shift entero por bloque que no desborda ninguna columna del bloque.
+    need = torch.log2((amax_bc / (127.0 * s_row)).clamp(min=1e-30))      # <= 0
+    shift = torch.ceil(need.reshape(k_blocks, n_blocks, bn).amax(dim=2))
+    shift = shift.clamp(-10.0, 10.0)                                      # [Kb, Nb]
+    del amax_bc, need
 
-    # View 4-D GPU para bloques: [Kb,Bk,Nb,Bn]
-    codes_4d = codes_u8.reshape(k_blocks, bk, n_blocks, bn)
-    e_4d_u8 = e_u8.reshape(k_blocks, bk, n_blocks, bn)
-    m_4d_u8 = m_u8.reshape(k_blocks, bk, n_blocks, bn)
+    # Pasada 2: recuantizar dividiendo por el paso real, chunk por chunk.
+    pow2 = torch.pow(2.0, shift)
+    for kb0 in range(0, k_blocks, CHUNK_KB):
+        kb1 = min(kb0 + CHUNK_KB, k_blocks)
+        chunk = (
+            weight_fp8[kb0 * bk:kb1 * bk].reshape(kb1 - kb0, bk, n_blocks, bn).to(torch.float32)
+            * scale_inv[kb0:kb1].reshape(kb1 - kb0, 1, n_blocks, 1).to(torch.float32)
+        )
+        step = s_row.view(1, 1, n_blocks, bn) * pow2[kb0:kb1].view(kb1 - kb0, 1, n_blocks, 1)
+        q = (chunk / step).round().clamp_(-127, 127)
+        w_int8[kb0 * bk:kb1 * bk] = q.reshape((kb1 - kb0) * bk, n).to(torch.int8)
+        del chunk, step, q
 
-    # ── 4. e_max por bloque vía max con view y keepdim (GPU) ──────────
-    # amax sobre dims de bloque (1,3) con keepdim para broadcast
-    e_max_keep = e_4d_u8.amax(dim=(1, 3), keepdim=True)
-
-    # ── 5. d = e_max - e como int32 GPU ───────────────────────────────
-    e_4d_i32 = e_4d_u8.to(torch.int32)
-    e_max_i32 = e_max_keep.to(torch.int32)
-    d_4d = e_max_i32 - e_4d_i32
-    m_4d_i32 = m_4d_u8.to(torch.int32)
-    mant_4d = (8 + m_4d_i32)
-
-    # ── 6. q vía shifts vectorizados torch.where en GPU ───────────────
-    # Contrato: torch.where(d <= 3, (8+m) << (3-d), (8+m) >> (d-3))
-    q_4d_i32 = torch.where(
-        d_4d <= 3,
-        mant_4d << (3 - d_4d),
-        mant_4d >> (d_4d - 3),
-    )
-    # Máscaras de subnormal / fuera de rango y signo — todo GPU
-    q_4d_i32 = torch.where((e_4d_i32 == 0) | (d_4d > 6), torch.zeros_like(q_4d_i32), q_4d_i32)
-    sign_mask_4d = (codes_4d & 0x80) != 0
-    q_4d_i32 = torch.where(sign_mask_4d, -q_4d_i32, q_4d_i32)
-    q_4d_i32 = q_4d_i32.clamp(-127, 127)
-    # Bloques con e_max==0 → cero (ya cubierto por máscara, pero forzar)
-    zero_block_mask = (e_max_keep == 0)
-    q_4d_i32 = torch.where(zero_block_mask, torch.zeros_like(q_4d_i32), q_4d_i32)
-
-    w_int8 = q_4d_i32.to(torch.int8).reshape(k, n).contiguous()
-
-    # ── 7. shift_b y s_new también en GPU (vectorizado) ───────────────
-    # s_prime = s_blk * 2^(e_max-13)  por bloque [Kb,Nb]
-    e_max_2d = e_max_keep.reshape(k_blocks, n_blocks).to(torch.float32)
-    s_prime = scale_inv.to(torch.float32) * torch.pow(2.0, e_max_2d - 13.0)
-    # s_row medio por bloque de columnas: [Nb]
-    s_row_block_mean = s_row_vec.view(n_blocks, bn).mean(dim=1)
-    s_row_mean_2d = s_row_block_mean.unsqueeze(0).expand(k_blocks, n_blocks)
-    # shift_float = log2(s_prime) - log2(s_row_mean)
-    shift_float = torch.log2(s_prime.clamp(min=1e-30)) - torch.log2(s_row_mean_2d.clamp(min=1e-30))
-    shift_rounded = torch.round(shift_float).to(torch.int32)
-    # Bloques cero → shift 0
-    shift_rounded = torch.where(e_max_2d == 0, torch.zeros_like(shift_rounded), shift_rounded)
-    shift_clamped = shift_rounded.clamp(-10, 10)
-    w_shifts = shift_clamped.to(torch.int8).contiguous()
-
+    w_scales = s_row.unsqueeze(1).contiguous()
+    w_shifts = shift.to(torch.int8).contiguous()
+    del s_row, shift, pow2
     return w_int8, w_scales, w_shifts
 
 
@@ -2343,7 +2691,7 @@ def _build_int8_state(
                 # Fallback silencioso a Diseño B, log info para trazabilidad
                 log.info(
                     "PN110 híbrido no aplicable para %s: %s — fallback a B",
-                    getattr(layer, "_genesis_pn110_name", "?"),
+                    (_genesis_layer_name(layer) or "?"),
                     type(e).__name__,
                 )
                 # Continuar al camino B per-channel
@@ -2446,7 +2794,7 @@ def _build_int8_state(
     except Exception as e:
         log.warning(
             "PN110 _build_int8_state falló para %s: %s",
-            getattr(layer, "_genesis_pn110_name", "?"),
+            (_genesis_layer_name(layer) or "?"),
             type(e).__name__,
         )
         return None
@@ -2496,6 +2844,7 @@ def _reset_summary() -> None:
     try:
         with _genesis_kernel_plan_lock:
             _genesis_kernel_plan.clear()
+            _genesis_dispatch_plan.clear()
     except Exception:
         pass
     # Reset flag startup para que re-instalación vuelva a loguear
@@ -2588,6 +2937,7 @@ def _emit_summary(force: bool = False) -> None:
     # ── GENESIS: tabla completa de kernels a usar (visible en `docker logs | grep GENESIS`) ──
     try:
         _genesis_emit_plan_summary()
+        _genesis_emit_dispatch_table()
     except Exception:
         pass
 
@@ -2615,6 +2965,28 @@ def _schedule_summary() -> None:
             _pn110_summary_timer.start()
         except Exception:
             pass
+
+
+_pn110_flush_timer: "threading.Timer | None" = None
+_pn110_flush_lock = threading.Lock()
+
+
+def _pn110_schedule_summary(delay: float = 5.0) -> None:
+    """Programa el resumen + tabla de kernels para cuando termine la carga.
+
+    Se llama desde ``process_weights_after_loading`` en cada capa y reinicia el
+    temporizador, así que dispara una sola vez, ``delay`` segundos después de la
+    última capa convertida. Antes el resumen se emitía desde ``apply`` en el
+    primer forward, lo que metía una mutación de dict global y logging dentro
+    del grafo compilado y rompía la captura de cudagraphs.
+    """
+    global _pn110_flush_timer
+    with _pn110_flush_lock:
+        if _pn110_flush_timer is not None:
+            _pn110_flush_timer.cancel()
+        _pn110_flush_timer = threading.Timer(delay, _emit_summary)
+        _pn110_flush_timer.daemon = True
+        _pn110_flush_timer.start()
 
 
 def _make_pwal_wrapper(original, cls):
@@ -2666,7 +3038,7 @@ def _make_pwal_wrapper(original, cls):
         # Helper local para registrar detalle CK-2.3 sin duplicar código
         def _record_detail(decision: str, kl_val=None, reason=None, kxn_val=None):
             try:
-                capa_name = getattr(layer, "_genesis_pn110_name", None)
+                capa_name = (_genesis_layer_name(layer) or None)
                 if not capa_name:
                     capa_name = type(layer).__name__ if hasattr(layer, "__class__") else "?"
                 if kxn_val is None:
@@ -2690,7 +3062,7 @@ def _make_pwal_wrapper(original, cls):
         # y el try/except silencioso ocultaba fallos de _g_total. Ahora
         # log.warning + print garantizan visibilidad, y el except loguea.
         try:
-            _g_name = getattr(layer, "_genesis_pn110_name", "") or type(layer).__name__
+            _g_name = _genesis_layer_name(layer) or type(layer).__name__
             _g_type = type(layer).__name__
             try:
                 _g_k = int(getattr(layer, "input_size_per_partition", 0) or 0)
@@ -2893,7 +3265,7 @@ def _make_pwal_wrapper(original, cls):
             # Exclusión explícita GDN/mamba (previene Shape mismatch b_q_weight 5120)
             # Check case-insensitive sobre _genesis_pn110_name y type name.
             try:
-                _pn110_name_l = getattr(layer, "_genesis_pn110_name", "").lower()
+                _pn110_name_l = _genesis_layer_name(layer).lower()
                 if "gdn" in _pn110_name_l or "mamba" in _pn110_name_l:
                     with _pn110_summary_lock:
                         _pn110_summary["excluded"] += 1
@@ -2901,7 +3273,7 @@ def _make_pwal_wrapper(original, cls):
                     _schedule_summary()
                     # PN110 super kernel no encontrado — log requerido (capa GDN)
                     try:
-                        _layer_name = getattr(layer, "_genesis_pn110_name", "") or type(layer).__name__
+                        _layer_name = _genesis_layer_name(layer) or type(layer).__name__
                         _layer_type = type(layer).__name__
                         _shape = _kxn
                         _cc_tmp = cc if "cc" in locals() and cc is not None else _compute_capability()
@@ -2921,7 +3293,7 @@ def _make_pwal_wrapper(original, cls):
                     _record_detail("excluida", None, "gdn_mamba", _kxn)
                     _schedule_summary()
                     try:
-                        _layer_name = getattr(layer, "_genesis_pn110_name", "") or type(layer).__name__
+                        _layer_name = _genesis_layer_name(layer) or type(layer).__name__
                         _layer_type = type(layer).__name__
                         _shape = _kxn
                         _cc_tmp = cc if "cc" in locals() and cc is not None else _compute_capability()
@@ -2940,7 +3312,7 @@ def _make_pwal_wrapper(original, cls):
             # Si no existe SK optimizado para este tipo/forma, fallback a
             # kernels default de vLLM (Marlin): log + excluded + original+return.
             try:
-                _layer_name_q = getattr(layer, "_genesis_pn110_name", "") or type(layer).__name__
+                _layer_name_q = _genesis_layer_name(layer) or type(layer).__name__
                 _layer_type_q = type(layer).__name__
                 _shape_q = _kxn
                 _cc_q = cc if "cc" in locals() and cc is not None else _compute_capability()
@@ -2971,7 +3343,7 @@ def _make_pwal_wrapper(original, cls):
                 except Exception:
                     _sk_generic = "default vLLM"
                 if _sk_generic == "default vLLM":
-                    _is_test_synthetic = (_kxn == "256x256" and not getattr(layer, "_genesis_pn110_name", ""))
+                    _is_test_synthetic = (_kxn == "256x256" and not _genesis_layer_name(layer))
                     if not _is_test_synthetic:
                         with _pn110_summary_lock:
                             _pn110_summary["excluded"] += 1
@@ -3004,7 +3376,7 @@ def _make_pwal_wrapper(original, cls):
         except Exception as e:
             log.warning(
                 "PN110 original pwal falló para %s: %s",
-                getattr(layer, "_genesis_pn110_name", "?"),
+                (_genesis_layer_name(layer) or "?"),
                 type(e).__name__,
             )
             with _pn110_summary_lock:
@@ -3019,13 +3391,32 @@ def _make_pwal_wrapper(original, cls):
         # Ahora construir INT8 a partir de las refs capturadas (w_orig/s_orig
         # siguen vivas vía variables locales, aunque layer.weight ya es packed).
         # El nuevo _build_int8_state ya es 2x pico: b_col(1x) + chunk_transient.
+        # ── Gate: si esta capa no va por super kernel, NO se la convierte ──
+        # Queda con su peso Marlin y ``apply`` la manda al camino original.
+        if _genesis_swap_only_sk():
+            _sk_str, _usa_sk = _genesis_sk_for_layer(layer, int(k), int(n))
+            if not _usa_sk:
+                with _pn110_summary_lock:
+                    _pn110_summary["excluded"] += 1
+                try:
+                    _record_detail("skip", None, "sin_super_kernel", f"{k}x{n}")
+                except Exception:
+                    pass
+                log.info(
+                    "PN110 capa %s (%sx%s): sin super kernel (%s) — se deja en "
+                    "el camino nativo, sin swap INT8",
+                    (_genesis_layer_name(layer) or "?"), k, n, _sk_str,
+                )
+                _schedule_summary()
+                return
+
         state = None
         try:
             state = _build_int8_state(layer, w_orig, s_orig, (bk, bn))
         except Exception as e:
             log.warning(
                 "PN110 _build_int8_state lanzó para %s: %s — fallback a Marlin",
-                getattr(layer, "_genesis_pn110_name", "?"),
+                (_genesis_layer_name(layer) or "?"),
                 type(e).__name__,
             )
             state = None
@@ -3174,7 +3565,7 @@ def _make_pwal_wrapper(original, cls):
                     except Exception as e:
                         log.warning(
                             "PN110 KL compute falló para %s: %s — permitiendo conversión",
-                            getattr(layer, "_genesis_pn110_name", "?"),
+                            (_genesis_layer_name(layer) or "?"),
                             type(e).__name__,
                         )
                         _kl_value = None
@@ -3190,7 +3581,7 @@ def _make_pwal_wrapper(original, cls):
                             if _m.isfinite(_kl_value) and _kl_value > _thr_eff:
                                 log.info(
                                     "PN110 capa %s: KL %.4f > threshold %.4f — fallback a Marlin (kl_exceeded) KxN=%s",
-                                    getattr(layer, "_genesis_pn110_name", "?"),
+                                    (_genesis_layer_name(layer) or "?"),
                                     _kl_value, _thr, f"{k}x{n}",
                                 )
                                 with _pn110_summary_lock:
@@ -3218,7 +3609,7 @@ def _make_pwal_wrapper(original, cls):
             except Exception as e:
                 log.warning(
                     "PN110 gate KL falló para %s: %s — permitiendo conversión",
-                    getattr(layer, "_genesis_pn110_name", "?"),
+                    (_genesis_layer_name(layer) or "?"),
                     type(e).__name__,
                 )
                 _kl_value = None
@@ -3232,7 +3623,22 @@ def _make_pwal_wrapper(original, cls):
         # Si hay estado INT8, adjuntar y liberar Marlin para swap 1:1.
         try:
             if state is not None:
+                # Resolver el super kernel de esta capa y dejar el callable en
+                # el estado: el camino caliente sólo hace state.get("sk_fn").
+                _genesis_bind_super_kernel(
+                    layer,
+                    state,
+                    int(layer.input_size_per_partition),
+                    int(layer.output_size_per_partition),
+                )
+                log.warning(
+                    "GENESIS PN110: capa %s | SK despachado=%s | diádico=%s",
+                    _genesis_layer_name(layer) or type(layer).__name__,
+                    state.get("sk_id", "default vLLM (int8_linear)"),
+                    "sí" if state.get("w_shifts") is not None else "no (shifts=0)",
+                )
                 setattr(layer, _LAYER_ATTR, state)
+                _pn110_schedule_summary()
                 # Calcular bytes antes de liberar (w_orig ya fue del, usar 0).
                 # Deduplicar w_int8/b_col si son alias al mismo storage (optimización pico 2x)
                 try:
@@ -3267,7 +3673,7 @@ def _make_pwal_wrapper(original, cls):
                 log.info(
                     "PN110 capa %s: INT8 swap construido "
                     "(K=%d, N=%d, block=%dx%d, KL=%.4f)",
-                    getattr(layer, "_genesis_pn110_name", "?"),
+                    (_genesis_layer_name(layer) or "?"),
                     k, n, bk, bn,
                     _kl_value if isinstance(_kl_value, float) else -1.0,
                 )
@@ -3286,7 +3692,7 @@ def _make_pwal_wrapper(original, cls):
                     log.error(
                         "PN110 swap de weight falló para %s: %s — "
                         "liberando estado para no acumular VRAM",
-                        getattr(layer, "_genesis_pn110_name", "?"),
+                        (_genesis_layer_name(layer) or "?"),
                         type(e).__name__,
                     )
                     try:
@@ -3344,11 +3750,11 @@ def _make_pwal_wrapper(original, cls):
                 # _build_int8_state falló (ya logueó WARN) — deja en Marlin.
                 log.warning(
                     "PN110 pwal: _build_int8_state falló para %s — capa queda en Marlin (sin liberar)",
-                    getattr(layer, "_genesis_pn110_name", "?"),
+                    (_genesis_layer_name(layer) or "?"),
                 )
                 # Super kernel no encontrado — fallback a kernels default vLLM
                 try:
-                    _layer_name_fb = getattr(layer, "_genesis_pn110_name", "") or type(layer).__name__
+                    _layer_name_fb = _genesis_layer_name(layer) or type(layer).__name__
                     _layer_type_fb = type(layer).__name__
                     _shape_fb = f"{k}x{n}" if "k" in locals() and "n" in locals() else "-"
                     _cc_fb = _compute_capability()
@@ -3369,7 +3775,7 @@ def _make_pwal_wrapper(original, cls):
         except Exception as e:
             log.warning(
                 "PN110 pwal wrapper falló para %s: %s",
-                getattr(layer, "_genesis_pn110_name", "?"),
+                (_genesis_layer_name(layer) or "?"),
                 type(e).__name__,
             )
             with _pn110_summary_lock:
@@ -3399,35 +3805,38 @@ def _make_apply_wrapper(original, cls):
         Wrapper de apply.
     """
 
+    # Los flags se resuelven UNA VEZ al instalar, no por forward.
+    #
+    # Antes el camino caliente hacía dos ``os.environ.get`` y, en la primera
+    # llamada, ``_emit_summary()`` — que muta un dict global y loguea. Eso son
+    # side-effects que ``torch.compile`` no puede meter en el grafo, y con
+    # cudagraphs activo torch aborta con "Assigning / modifying buffers of
+    # nn.Module during forward pass is not allowed when using cudagraph inside
+    # the compiler". Eso forzaba ``--enforce-eager``, que en 2x3090 con MTP k=3
+    # cuesta **la mitad del decode**: 103.6 tok/s con cudagraphs contra 55.5
+    # sin ellos (baseline FP8, mismo modelo y mismo prompt).
+    #
+    # El resumen ya se emite al terminar la carga desde el pwal, así que la
+    # llamada desde ``apply`` era además redundante.
+    _pn110_on = (
+        os.environ.get(ENV_FLAG, "").strip().lower() in _TRUTHY
+        and not _is_disabled()
+    )
+
     def apply(self, layer, x, bias=None):
-        # ENV_FLAG opt-in primero (lección PN109).
-        if os.environ.get(ENV_FLAG, "").strip().lower() not in _TRUTHY:
+        if not _pn110_on:
             return original(self, layer, x, bias)
-        # Kill switch con precedencia.
-        if _is_disabled():
-            return original(self, layer, x, bias)
-        # Flush resumen si aún no se emitió y ya hubo carga (para tests y
-        # para asegurar "una vez al terminar carga" antes del primer forward).
-        try:
-            if not _pn110_summary.get("_logged") and _pn110_summary.get("layers_seen", 0) > 0:
-                _emit_summary()
-        except Exception:
-            pass
-        # Decisión: si hay estado INT8, SIEMPRE INT8 — sin chequear MIN_TOKENS
-        # ni is_dynamo. getattr directo; el swap exitoso preserva state.
         state = getattr(layer, _LAYER_ATTR, None)
         if state is None:
             return original(self, layer, x, bias)
         # Siempre camino INT8 — sin despacho por M.
         try:
             x_2d = x.reshape(-1, x.shape[-1])
-            try:
-                from vllm._genesis.kernels.fused_quant_triton import (
-                    quant_activation_per_token as fused_quant,
-                )
-            except Exception:
-                fused_quant = quant_activation_per_token
-            a_i8, a_scales = fused_quant(x_2d)
+            # SK-09 es el productor canónico de activación INT8. Sustituye a
+            # fused_quant_triton, que tenía BLOCK_MAX=8192 y reventaba con
+            # down_proj (K=8704 por rank en TP=2).
+            from vllm._genesis.kernels.sk09_norm_embed import quant_per_token
+            a_i8, a_scales = quant_per_token(x_2d)
             # cutlass_scaled_mm exige out_dtype fp16/bf16 (assert en el op).
             # self.out_dtype es torch.get_default_dtype() (puede ser fp32),
             # así que se usa el dtype del input cuando es fp16/bf16.
@@ -3461,6 +3870,45 @@ def _make_apply_wrapper(original, cls):
             w_shifts = state.get("w_shifts")  # Diseño C opcional (no tocado)
             if b_tensor is None or b_scales is None:
                 raise RuntimeError("estado PN110 incompleto: falta b_col/w_scales")
+            # ── Super kernel: resuelto en carga, aquí sólo un get de dict ──
+            if state.get("sk_gateup_perm") is not None:
+                # P113 reordenó las columnas de gate_up a pares gate/up
+                # intercalados. Ese layout SÓLO lo entiende
+                # sk05_gateup_silu_gemm: el shift diádico se indexa por bloque
+                # de 128 columnas del peso *original*, así que cualquier GEMM
+                # que recorra las columnas permutadas aplicaría el shift
+                # equivocado. No es un orden de salida que se pueda deshacer a
+                # posteriori. Si se llega acá es que algo evitó el forward
+                # fusionado del MLP: fallar es correcto, devolver números no.
+                raise RuntimeError(
+                    "PN110: gate_up con layout intercalado de P113 alcanzado por "
+                    "el camino no fusionado. Desactivá P113 "
+                    "(GENESIS_P113_MLP_FUSED_SILU=0) o revisá por qué no se usó "
+                    "Qwen2MoeMLP.forward."
+                )
+            sk_fn = state.get("sk_fn")
+            if sk_fn is not None and not state["sk_always"]:
+                # Diseño B: cutlass gana en la franja intermedia de M.
+                _m = a_i8.shape[0]
+                if state["sk_max_m"] < _m < state["sk_min_big_m"]:
+                    sk_fn = None
+            if sk_fn is not None:
+                # El bias se pasa por la ranura de epílogo del kernel como una
+                # vista [M,N] con stride de fila 0: se fusiona en el store sin
+                # pasada extra sobre M*N y sin rama en el kernel.
+                epi = state["sk_zero"]
+                if bias_arg is not None:
+                    epi = bias_arg.unsqueeze(0).expand(a_i8.shape[0], bias_arg.shape[0])
+                out = sk_fn(
+                    a_i8,
+                    b_tensor,
+                    a_scales.reshape(-1),
+                    state["sk_bscales"],
+                    state["sk_shifts"],
+                    epi,
+                    out_dtype,
+                )
+                return out.reshape(*x.shape[:-1], -1)
             out = int8_linear(
                 a_i8,
                 b_tensor,
@@ -3475,7 +3923,7 @@ def _make_apply_wrapper(original, cls):
         except Exception as e:
             log.critical(
                 "PN110 apply INT8 falló para %s: %s — sin fallback (Marlin liberado)",
-                getattr(layer, "_genesis_pn110_name", "?"),
+                (_genesis_layer_name(layer) or "?"),
                 type(e).__name__,
                 exc_info=True,
             )

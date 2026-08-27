@@ -276,6 +276,17 @@ def apply_patch_110_mtp_gptq() -> PatchResult:
     return _skipped("P110", reason)
 
 
+@register_patch("P113 MLP gate_up+SiLU fusionado en un GEMM (SK-05, columnas intercaladas)")
+def apply_patch_113_mlp_fused_silu() -> PatchResult:
+    if not _APPLY_MODE:
+        return _applied("P113", "dry-run: wiring ready (pass apply=True to execute)")
+    from vllm._genesis.wiring.models import patch_P113_mlp_fused_silu
+    status, reason = patch_P113_mlp_fused_silu.apply()
+    if status == "applied":
+        return _applied("P113", reason)
+    return _skipped("P113", reason)
+
+
 @register_patch("P112 Qwen3 MTP Quant Disk Cache (fingerprinted INT8 atomic storage)")
 def apply_patch_112_mtp_disk_quant_cache() -> PatchResult:
     if not _APPLY_MODE:
