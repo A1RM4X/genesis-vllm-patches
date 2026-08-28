@@ -53,10 +53,24 @@ def _collect_kernel_files() -> list[pathlib.Path]:
     Returns
     -------
     list[pathlib.Path]
-        Sorted unique paths for ``sk*.py``, ``fused_quant*.py``,
+        Sorted unique paths for ``sk[0-9]*.py``, ``fused_quant*.py``,
         ``int8_hybrid*.py`` under ``_KERNEL_DIR``.
+
+    Notes
+    -----
+    El patron es ``sk[0-9]*.py``, no ``sk*.py``: lo que estas reglas describen
+    son los SUPER KERNELS numerados (SK-01..SK-11 y sus variantes ``_w4a8``),
+    que son los que tienen que ser monoliticos, usar las instrucciones rapidas
+    de Ampere y respetar la lista de dtypes.
+
+    Con ``sk*.py`` se colaban tambien los auxiliares del mismo directorio cuyo
+    nombre arranca igual por casualidad — ``sk_ops.py`` (registra los GEMM como
+    custom ops de torch para que dynamo no trace dentro del lanzamiento de
+    Triton) y ``sk_decode_w8a16.py`` (prueba de decodificacion int8->fp16 con
+    asm inline, sin cablear) — y se les exigian reglas de super kernel que no
+    les corresponden.
     """
-    patterns = ["sk*.py", "fused_quant*.py", "int8_hybrid*.py"]
+    patterns = ["sk[0-9]*.py", "fused_quant*.py", "int8_hybrid*.py"]
     found: set[pathlib.Path] = set()
     for pat in patterns:
         for p in _KERNEL_DIR.glob(pat):

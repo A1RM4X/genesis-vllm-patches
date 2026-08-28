@@ -343,6 +343,88 @@ _DEFAULT_SWAP_ONLY_SK = "1"
 # Se puebla una sola vez, en carga, nunca en el camino caliente.
 _SK_GEMM: dict[str, object] = {}
 
+_SK_GEMM_OP = None
+
+
+def _sk_gemm_op(*args, **kwargs):
+    """Custom op de torch que envuelve el GEMM del super kernel.
+
+    Importado PEREZOSAMENTE: ``sk_ops`` arrastra los modulos de kernels y con
+    ellos ``triton``, y este modulo de wiring tiene que poder importarse sin
+    GPU. Con el import a nivel de modulo, el self-test del registro lo
+    reportaba roto ("No module named 'triton'") en el contenedor de tests, que
+    es CPU puro.
+    """
+    global _SK_GEMM_OP
+    if _SK_GEMM_OP is None:
+        from vllm._genesis.kernels.sk_ops import sk_gemm_op
+        _SK_GEMM_OP = sk_gemm_op
+    return _SK_GEMM_OP(*args, **kwargs)
+
+
+def _liberar_segmentos_cumem() -> int:
+    """Devuelve al driver los segmentos ya libres del pool ``weights`` de cumem.
+
+    El problema: ``process_weights_after_loading`` corre dentro de
+    ``CuMemAllocator.use_memory_pool(tag="weights")``. Ahi la memoria liberada
+    **no se devuelve** hasta salir del contexto; vLLM solo la suelta al final,
+    en ``device_allocator/cumem.py:363``, recorriendo el snapshot del pool y
+    soltando las asignaciones con ``allocated_size == 0``.
+
+    Para PN110 eso llega tarde. Convertir fp8 -> int8 **no ahorra un solo byte**
+    (ambos son 1 byte por elemento), asi que mientras dura la carga conviven los
+    ~12 GB de pesos fp8 originales ya liberados y los ~12 GB de int8 nuevos: 24
+    GB sobre los 23.56 de una 3090. Medido en el log de arranque:
+
+        PN110 resumen carga: convertidas=256 ... bytes_int8=12173333504
+        ... memory allocation failed with OOM ... (free: 203 MiB)
+
+    Esta funcion corre esa misma logica de limpieza **durante** la carga, cada N
+    capas, para que los fp8 liberados vuelvan al driver en vez de quedar
+    mapeados hasta el final.
+
+    No se puede usar ``torch.cuda.empty_cache()``: dentro de un asignador
+    pluggable lanza (pytorch#145168), y el ``except`` que lo envolvia se lo
+    tragaba, con lo cual la limpieza que el codigo creia hacer cada 8 capas
+    nunca ocurria.
+
+    NO USAR DURANTE LA CARGA — PROBADO Y ROTO (2026-08-27)
+    ------------------------------------------------------
+    Llamarla cada 16 capas hace que la carga muera con ``CUDA error: an illegal
+    memory access was encountered`` tras convertir 16 capas (contra 256 sin
+    ella). Motivo: ``allocated_size == 0`` significa que el bloque no tiene
+    tensores vivos, pero el asignador *caching* de PyTorch lo sigue teniendo en
+    su cache y lo va a repartir. Soltar el handle por debajo deja punteros
+    colgados. vLLM lo hace solo AL SALIR del contexto, cuando ya no queda nadie
+    pidiendo memoria — y esa distincion es justamente el punto.
+
+    Se conserva documentada para no volver a intentarlo.
+
+    :returns: cantidad de segmentos liberados (0 si no aplica o si algo falla).
+    """
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator, unmap_and_release
+    except Exception:
+        return 0
+    try:
+        inst = CuMemAllocator.get_instance()
+    except Exception:
+        return 0
+    datos = getattr(inst, "allocator_and_pools", None)
+    if not datos:
+        return 0
+    n = 0
+    for _tag, data in list(datos.items()):
+        try:
+            for asignacion in data[0].snapshot():
+                if asignacion.get("allocated_size") == 0:
+                    handle = inst._python_free_callback(asignacion["address"])
+                    unmap_and_release(handle)
+                    n += 1
+        except Exception:
+            continue
+    return n
+
 
 def _sk_gemm_table() -> dict[str, object]:
     """Devuelve la tabla SK-id -> GEMM, importando los kernels una sola vez."""
@@ -503,6 +585,36 @@ def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
         shifts = torch.zeros((K // 128, N // 128), dtype=torch.int8, device=b_col.device)
     state["sk_id"] = sk_id
     state["sk_fn"] = fn
+    # id entero para el custom op. El callable directo NO se puede llamar desde
+    # ``apply`` (ver sk_ops.py): apply corre dentro de la region trazada y el
+    # lanzamiento de Triton dispara guards sobre un simbolo sin backing.
+    from vllm._genesis.kernels.sk_ops import SK_POR_ID, registrar as _reg_sk_ops
+    _reg_sk_ops()
+    state["sk_op_id"] = SK_POR_ID.get(sk_id, 0)
+    # P113: si esta activo, la permutacion de gate_up se hace ACA, en la carga.
+    # Antes se hacia perezosamente en el primer forward, y eso mutaba el estado
+    # del modulo (state["b_col"], state["sk_perm_w"]) DENTRO del forward, ademas
+    # de asignar ~89 MB y llamar a torch.cuda.empty_cache() ahi mismo. Eso es lo
+    # que aborta la captura de cudagraphs con "Assigning / modifying buffers of
+    # nn.Module during forward pass", y quedarse sin cudagraphs cuesta la mitad
+    # del decode. Andaba de casualidad: vLLM corre forwards de calentamiento en
+    # eager antes de capturar, asi que la mutacion caia ahi. Si una capa no se
+    # ejercitara en el warmup, o cambiara el orden, rompia.
+    if sk_id == "SK-05" and os.environ.get("GENESIS_P113_MLP_FUSED_SILU", "0").strip().lower() in _TRUTHY:
+        from vllm._genesis.kernels.sk05_mlp_gateup import sk05_permute_gateup
+
+        w_perm, bs_perm = sk05_permute_gateup(b_col, state["sk_bscales"])
+        n2 = w_perm.shape[1] // 2
+        perm = torch.empty(w_perm.shape[1], dtype=torch.long, device=w_perm.device)
+        _idx = torch.arange(n2, dtype=torch.long, device=w_perm.device)
+        perm[0::2] = _idx
+        perm[1::2] = _idx + n2
+        state["sk_perm_w"] = w_perm
+        state["sk_perm_bs"] = bs_perm
+        state["sk_gateup_perm"] = perm
+        state["b_col"] = w_perm
+        state["w_int8"] = w_perm
+        state["sk_bscales"] = bs_perm
     state["sk_max_m"] = _genesis_sk_max_m()
     state["sk_min_big_m"] = _genesis_sk_min_big_m()
     # Con shifts el alternativo es int8_hybrid_gemm (2-5x peor): SK siempre.
@@ -1229,15 +1341,31 @@ def _warmup_all_generic() -> None:
         pass
 
 def _warmup_for_layer(K: int, N: int) -> None:
-    """Warmup especifico para capa recien convertida (K,N reales del modelo).
+    """DEPRECADO — no llamar durante la carga del modelo. Ver abajo.
 
-    Llamado desde _make_pwal_wrapper tras construir state exitoso, para
-    precompilar Ms requeridos para esa forma exacta antes del primer decode.
+    Antes se llamaba desde ``_make_pwal_wrapper`` por CADA capa convertida, es
+    decir dentro de ``load_model()``, que corre dentro del pool ``weights`` del
+    asignador cumem. Dos problemas, ambos medidos:
+
+    1. **No aportaba nada.** Triton compila por ``tl.constexpr`` — el tile que
+       elige ``_cfg`` —, no por el valor de K y N, que son argumentos de runtime.
+       Precompilar la forma exacta de cada capa genera el MISMO binario que ya
+       dejó ``warmup_all_kernels()``. El ``torch.compile`` por capa encima de eso
+       era gasto puro en el arranque.
+
+    2. **Rompia el arranque por VRAM.** Por capa y por cada M asignaba ``b_col``
+       [K,N] int8 y ``tmp`` [N,K] int8 (~89 MB cada uno para 5120x17408), mas
+       activaciones y salidas. Dentro del pool de cumem la memoria liberada NO
+       se devuelve hasta salir del contexto, y el ``torch.cuda.empty_cache()``
+       que intentaba limpiarla lanza dentro de un asignador pluggable
+       (pytorch#145168) y quedaba tragado por el ``except``. Con ~260 capas eso
+       acumulaba hasta reventar en ``cuMemMap`` (cumem_allocator.cpp:163) al
+       salir del pool, con un traceback que apuntaba enganosamente a
+       ``unmap_and_release`` porque ``error_code`` es un global pegajoso.
+
+    Se conserva la funcion para warmup manual fuera de la carga.
     """
-    try:
-        _warmup_fused_kernels_for_shape(K, N)
-    except Exception:
-        pass
+    _warmup_fused_kernels_for_shape(K, N)
 
 def _discover_and_warmup_existing_layers() -> None:
     """Si al arrancar ya hay capas vivas (modelo cargado antes de install), warmup sus K/N.
@@ -1989,89 +2117,57 @@ def requantize_fp8_block_to_int8_chunked(
     chunk_rows = min(chunk_rows, k)
 
     device = weight_fp8.device
-    # Pasada 1: acumular amax por columna.
-    amax_per_col = torch.zeros(n, dtype=torch.float32, device=device)
+
+    # Presupuesto de transitorio FIJO en bytes, independiente de N.
+    # Antes chunk_rows era 2048 fijo, asi que el transitorio escalaba con N:
+    # 2048 x 17408 x 4 = 143 MB por temporal fp32, y la expresion encadenaba
+    # ~5 de esos (to(fp32), *escala, /escala_col, round, clamp). Ahora el chunk
+    # se elige para que el scratch entre en _REQUANT_SCRATCH_BYTES.
+    chunk_rows = max(bk, ((_REQUANT_SCRATCH_BYTES // 4) // n // bk) * bk)
+    chunk_rows = min(chunk_rows, k)
+
+    # UN scratch fp32 [chunk_rows, n] reusado por todos los chunks y por todas
+    # las capas del modelo. Es lo que vuelve viable correr esto dentro del pool
+    # `weights` de cumem: alli la memoria liberada NO se devuelve hasta salir
+    # del contexto (ver el comentario de vLLM en device_allocator/cumem.py sobre
+    # "online quantization"), asi que cada temporal por capa quedaba mapeado
+    # para siempre. Con un unico buffer el pool ve UNA asignacion en total.
+    scratch = _requant_scratch(chunk_rows * n, device)
+
     n_blocks_n = n // bn
-    # Iterar por chunks de filas.
+    amax_per_col = torch.zeros(n, dtype=torch.float32, device=device)
+
+    # Pasada 1: amax por columna. Todo in-place sobre el scratch.
     for r in range(0, k, chunk_rows):
         r_end = min(r + chunk_rows, k)
         chunk_k = r_end - r
-        # chunk_k debe ser múltiplo de bk (por alineación y porque k%bk==0)
-        # Si el último chunk no es múltiplo (cuando k no múltiplo de chunk_rows
-        # pero sí de bk), ajustamos: chunk_k ya es múltiplo porque r es
-        # múltiplo de bk y k múltiplo de bk -> r_end múltiplo de bk o resto
-        # también múltiplo. En casos borde, si no lo es, caemos a path
-        # genérico con repeat_interleave.
-        w_chunk = weight_fp8[r:r_end]
-        r_blk_start = r // bk
-        r_blk_end = r_end // bk
-        # Caso alineado: chunk_k % bk == 0
-        if chunk_k % bk == 0 and (r_blk_end - r_blk_start) * bk == chunk_k:
-            # Reshape a [num_blk_k, Bk, N/Bn, Bn]
-            w_4d = w_chunk.reshape(chunk_k // bk, bk, n_blocks_n, bn)
-            s_slice = scale_inv[r_blk_start:r_blk_end].reshape(
-                chunk_k // bk, 1, n_blocks_n, 1)
-            w_fp32_4d = w_4d.to(torch.float32) * s_slice.to(torch.float32)
-            w_fp32 = w_fp32_4d.reshape(chunk_k, n)
-        else:
-            # Path genérico: expandir escala con repeat_interleave y truncar.
-            s_slice = scale_inv[r_blk_start:r_blk_end]
-            # Expandir a [chunk_k, N] via repeat
-            s_expanded = s_slice.repeat_interleave(bk, dim=0).repeat_interleave(
-                bn, dim=1)
-            # Truncar/pad a chunk_k (si chunk corta bloque parcial)
-            if s_expanded.shape[0] > chunk_k:
-                s_expanded = s_expanded[:chunk_k]
-            elif s_expanded.shape[0] < chunk_k:
-                # Pad repetiendo última fila (no debería ocurrir si k%bk==0)
-                pad = chunk_k - s_expanded.shape[0]
-                s_expanded = torch.cat(
-                    [s_expanded, s_expanded[-1:].repeat(pad, 1)], dim=0)
-            w_fp32 = w_chunk.to(torch.float32) * s_expanded.to(torch.float32)
-        # Acumular amax por columna para este chunk.
-        col_amax = w_fp32.abs().amax(dim=0)
-        amax_per_col = torch.maximum(amax_per_col, col_amax)
+        buf = scratch[:chunk_k * n].view(chunk_k, n)
+        buf.copy_(weight_fp8[r:r_end])          # fp8 -> fp32 sin temporal
+        buf.view(chunk_k // bk, bk, n_blocks_n, bn).mul_(
+            scale_inv[r // bk:r_end // bk].view(chunk_k // bk, 1, n_blocks_n, 1))
+        torch.maximum(amax_per_col, buf.abs_().amax(dim=0), out=amax_per_col)
 
-    # Escalas per-channel [N,1] fp32.
     scales_per_channel = amax_per_col / 127.0
     scales_per_channel = torch.where(
         scales_per_channel > 0, scales_per_channel,
         torch.ones_like(scales_per_channel))
     scales_col = scales_per_channel.unsqueeze(1).contiguous()  # [N,1]
 
-    # Pasada 2: cuantizar por chunks en buffer int8 prealocado.
+    # Pasada 2: cuantizar. El .copy_() final convierte fp32 -> int8 escribiendo
+    # directo en el destino, sin materializar un chunk int8 intermedio. Los
+    # valores ya son enteros por el round_(), asi que el truncamiento de copy_
+    # es exacto.
     w_int8 = torch.empty((k, n), dtype=torch.int8, device=device)
-    # Para reuso de escalas en la división: [N] vector.
-    scale_vec = scales_per_channel  # [N]
     for r in range(0, k, chunk_rows):
         r_end = min(r + chunk_rows, k)
         chunk_k = r_end - r
-        w_chunk = weight_fp8[r:r_end]
-        r_blk_start = r // bk
-        r_blk_end = r_end // bk
-        if chunk_k % bk == 0 and (r_blk_end - r_blk_start) * bk == chunk_k:
-            w_4d = w_chunk.reshape(chunk_k // bk, bk, n_blocks_n, bn)
-            s_slice = scale_inv[r_blk_start:r_blk_end].reshape(
-                chunk_k // bk, 1, n_blocks_n, 1)
-            w_fp32_4d = w_4d.to(torch.float32) * s_slice.to(torch.float32)
-            w_fp32 = w_fp32_4d.reshape(chunk_k, n)
-        else:
-            s_slice = scale_inv[r_blk_start:r_blk_end]
-            s_expanded = s_slice.repeat_interleave(bk, dim=0).repeat_interleave(
-                bn, dim=1)
-            if s_expanded.shape[0] > chunk_k:
-                s_expanded = s_expanded[:chunk_k]
-            elif s_expanded.shape[0] < chunk_k:
-                pad = chunk_k - s_expanded.shape[0]
-                s_expanded = torch.cat(
-                    [s_expanded, s_expanded[-1:].repeat(pad, 1)], dim=0)
-            w_fp32 = w_chunk.to(torch.float32) * s_expanded.to(torch.float32)
-        # Quant per-channel: dividir por escala de columna.
-        w_i8_chunk = (w_fp32 / scale_vec.unsqueeze(0)).round().clamp(
-            -127, 127).to(torch.int8)
-        w_int8[r:r_end] = w_i8_chunk
+        buf = scratch[:chunk_k * n].view(chunk_k, n)
+        buf.copy_(weight_fp8[r:r_end])
+        buf.view(chunk_k // bk, bk, n_blocks_n, bn).mul_(
+            scale_inv[r // bk:r_end // bk].view(chunk_k // bk, 1, n_blocks_n, 1))
+        buf.div_(scales_per_channel).round_().clamp_(-127.0, 127.0)
+        w_int8[r:r_end].copy_(buf)
 
-    w_int8 = w_int8.contiguous()
     return w_int8, scales_col
 
 
@@ -2150,6 +2246,28 @@ def requantize_bf16_to_int8_chunked(
         w_i8_chunk = (w_chunk / scale_vec.unsqueeze(0)).round().clamp(-127, 127).to(torch.int8)
         w_int8[r:r_end] = w_i8_chunk
     return w_int8.contiguous(), scales_col
+
+
+# Techo del transitorio de la requantizacion, en bytes. 32 MB alcanza para un
+# chunk holgado hasta N=17408 y mantiene el pico acotado dentro del pool de
+# cumem, donde nada se devuelve hasta salir del contexto.
+_REQUANT_SCRATCH_BYTES: int = 32 * 1024 * 1024
+
+_REQUANT_SCRATCH: dict[torch.device, torch.Tensor] = {}
+
+
+def _requant_scratch(numel: int, device: torch.device) -> torch.Tensor:
+    """Buffer fp32 plano reusado por toda la requantizacion del modelo.
+
+    Se agranda si hace falta y nunca se achica: el objetivo es que el asignador
+    vea UNA sola asignacion para las ~260 capas en vez de temporales por capa
+    que dentro del pool ``weights`` de cumem quedarian mapeados hasta el final.
+    """
+    buf = _REQUANT_SCRATCH.get(device)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(numel, dtype=torch.float32, device=device)
+        _REQUANT_SCRATCH[device] = buf
+    return buf
 
 
 def requantize_fp8_block_to_int8_hybrid(
@@ -2648,11 +2766,27 @@ def _build_int8_state(
         # ── Diseño C híbrido diádico (§4) — camino preferido si GENESIS_PN110_HYBRID=1 ──
         if _is_hybrid_enabled():
             try:
-                # Vistas [K,N] para el híbrido (requantize espera [K,N])
-                w_fp8_T_h = w_fp8_orig.t().contiguous()
-                s_T_h = scale_inv_orig.t().contiguous()
-                w_int8_h, w_scales_h, w_shifts_h = requantize_fp8_block_to_int8_hybrid(
-                    w_fp8_T_h, s_T_h, (bk, bn))
+                # Conversion IN-PLACE: el INT8 se escribe sobre los mismos
+                # bytes del FP8 y ``b_col_h`` es una VISTA de ese storage.
+                #
+                # Antes aca habia cuatro copias completas del peso vivas a la
+                # vez: el original [N,K], su transpuesta fp8 contigua, el int8
+                # que salia del requantizador, y la copia a column-major. Dentro
+                # del pool ``weights`` de cumem lo liberado NO se devuelve hasta
+                # salir del contexto, asi que con 12.17 GB de pesos por rank
+                # quedaban retenidos ~24 GB sobre los 23.56 de una 3090 y el
+                # arranque moria en cumem_allocator.cpp:163.
+                #
+                # Las cuatro sobran porque el layout ya coincide:
+                #     empty_strided((K,N),(1,K)) == [N,K] contiguo transpuesto
+                # y FP8/INT8 miden 1 byte, asi que ``w.view(torch.int8).t()`` ES
+                # el b_col [K,N] column-major que esperan los super kernels.
+                # Medido: 0.03 MB extra sobre un peso de 36.7 MB, mismo
+                # data_ptr, y el MISMO error que el camino viejo (7.7e-3).
+                from vllm._genesis.kernels.requant_inplace import (
+                    requantizar_fp8_a_int8_inplace)
+                b_col_h, w_scales_h, w_shifts_h = requantizar_fp8_a_int8_inplace(
+                    w_fp8_orig, scale_inv_orig, (bk, bn))
                 # Documenta overflow: verifica shift_b en [-10,10] aprox.
                 # Si se sale, fallback a B (pérdida ≤1 bit no compensa riesgo INT32).
                 _sh_min = int(w_shifts_h.min().item()) if w_shifts_h.numel() else 0
@@ -2660,13 +2794,7 @@ def _build_int8_state(
                 if _sh_min < -10 or _sh_max > 10:
                     raise ValueError(
                         f"shift_b fuera de [-10,10] (min {_sh_min} max {_sh_max})")
-                # Construir b_col column-major aliased a w_int8_h
-                try:
-                    b_col_h = torch.empty_strided((K, N), (1, K), dtype=torch.int8, device=device)
-                except Exception:
-                    b_col_h = torch.empty((N, K), dtype=torch.int8, device=device).t()
-                # Copia elemento a elemento (respeta strides distintos)
-                b_col_h.copy_(w_int8_h)
+                # b_col_h ya salio de la conversion in-place: no se copia nada.
                 bias = getattr(layer, "bias", None)
                 bias_ref_ok = bias is not None and bias.numel() > 0
                 # P1: b_scales pre-transpuesto [1,N] fp32
@@ -3369,47 +3497,59 @@ def _make_pwal_wrapper(original, cls):
                 pass
             return
 
-        # Capa elegible: repack Marlin primero (orden robusto). Si el repack
-        # falla, la capa queda en su estado original y no se intenta el swap.
-        try:
-            original(self, layer)
-        except Exception as e:
-            log.warning(
-                "PN110 original pwal falló para %s: %s",
-                (_genesis_layer_name(layer) or "?"),
-                type(e).__name__,
-            )
+        # ── El gate va ANTES del repack Marlin, no despues ──────────────────
+        #
+        # Antes el orden era: repack Marlin -> decidir si la capa se convierte ->
+        # construir INT8 -> liberar el peso Marlin. Para las ~513 capas que SI se
+        # convierten, ese repack se calculaba y se tiraba.
+        #
+        # Tirarlo no alcanza: ``process_weights_after_loading`` corre dentro del
+        # pool ``weights`` del asignador cumem, donde **la memoria liberada no se
+        # devuelve** hasta salir del contexto (lo dice el propio vLLM en
+        # device_allocator/cumem.py, hablando justamente de "online
+        # quantization"). Asi que los 513 repacks quedaban mapeados hasta el final
+        # de la carga, compitiendo con los pesos INT8 nuevos, y el arranque moria
+        # con ``CUDA Error: out of memory at cumem_allocator.cpp:163`` (que es un
+        # cuMemMap, no un unmap: error_code es un global pegajoso y el traceback
+        # apunta enganosamente a unmap_and_release).
+        #
+        # Bajar --gpu-memory-utilization NO lo arregla: ese flag acota el
+        # presupuesto de KV cache, y este OOM pasa cargando pesos. Medido: falla
+        # igual a 0.72 y a 0.62.
+        #
+        # Ahora: se decide primero. La capa que se convierte NO paga el repack;
+        # la que no, lo paga igual que antes. El fallback se conserva: si
+        # _build_int8_state falla, recien ahi se hace el repack.
+        _usa_sk = True
+        _sk_str = ""
+        if _genesis_swap_only_sk():
+            _sk_str, _usa_sk = _genesis_sk_for_layer(layer, int(k), int(n))
+        if not _usa_sk:
             with _pn110_summary_lock:
-                _pn110_summary["fallback"] += 1
+                _pn110_summary["excluded"] += 1
             try:
-                _record_detail("fallback", None, "pwal_exception", f"{k}x{n}")
+                _record_detail("skip", None, "sin_super_kernel", f"{k}x{n}")
             except Exception:
                 pass
+            log.info(
+                "PN110 capa %s (%sx%s): sin super kernel (%s) — se deja en "
+                "el camino nativo, sin swap INT8",
+                (_genesis_layer_name(layer) or "?"), k, n, _sk_str,
+            )
+            try:
+                original(self, layer)
+            except Exception as e:
+                log.warning(
+                    "PN110 original pwal falló para %s: %s",
+                    (_genesis_layer_name(layer) or "?"), type(e).__name__,
+                )
+                with _pn110_summary_lock:
+                    _pn110_summary["fallback"] += 1
             _schedule_summary()
             return
 
-        # Ahora construir INT8 a partir de las refs capturadas (w_orig/s_orig
-        # siguen vivas vía variables locales, aunque layer.weight ya es packed).
-        # El nuevo _build_int8_state ya es 2x pico: b_col(1x) + chunk_transient.
-        # ── Gate: si esta capa no va por super kernel, NO se la convierte ──
-        # Queda con su peso Marlin y ``apply`` la manda al camino original.
-        if _genesis_swap_only_sk():
-            _sk_str, _usa_sk = _genesis_sk_for_layer(layer, int(k), int(n))
-            if not _usa_sk:
-                with _pn110_summary_lock:
-                    _pn110_summary["excluded"] += 1
-                try:
-                    _record_detail("skip", None, "sin_super_kernel", f"{k}x{n}")
-                except Exception:
-                    pass
-                log.info(
-                    "PN110 capa %s (%sx%s): sin super kernel (%s) — se deja en "
-                    "el camino nativo, sin swap INT8",
-                    (_genesis_layer_name(layer) or "?"), k, n, _sk_str,
-                )
-                _schedule_summary()
-                return
-
+        # Construir INT8 desde las refs capturadas ANTES del repack. w_orig y
+        # s_orig siguen vivas via variables locales.
         state = None
         try:
             state = _build_int8_state(layer, w_orig, s_orig, (bk, bn))
@@ -3420,6 +3560,14 @@ def _make_pwal_wrapper(original, cls):
                 type(e).__name__,
             )
             state = None
+            # Recien aca se paga el repack: la capa necesita Marlin para andar.
+            try:
+                original(self, layer)
+            except Exception as e2:
+                log.warning(
+                    "PN110 fallback a Marlin tambien falló para %s: %s",
+                    (_genesis_layer_name(layer) or "?"), type(e2).__name__,
+                )
         # ── CK-2.3 Gate KL: filtro adicional antes del swap ─────────────────
         # No toca swap 1:1, chunked 512, GDN, cache: solo añade exclusión si
         # KL > threshold. Mantiene w_orig/s_orig vivos hasta aquí.
@@ -3732,19 +3880,13 @@ def _make_pwal_wrapper(original, cls):
                     except Exception:
                         pass
                 # empty_cache cada 16 capas convertidas
-                try:
-                    if _pn110_summary["converted"] % 16 == 0:
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                # ── Precarga super-kernel: warmup para KxN exacta de esta capa ──
-                # Tras swap exitoso, pre-compilar Triton + torch.compile para Ms
-                # requeridos (1,8,32,128,512,1664,8000) y dejar en cache antes
-                # del primer forward. Deduplicada por KxN, no lanza.
-                try:
-                    _warmup_for_layer(k, n)
-                except Exception:
-                    pass
+                # NO llamar a _liberar_segmentos_cumem() aca: PROBADO Y ROTO.
+                # Ver la nota en esa funcion. El empty_cache() que habia antes
+                # tampoco hacia nada (lanza dentro de un asignador pluggable,
+                # pytorch#145168, y el except se lo tragaba), pero al menos era
+                # inocuo.
+                pass
+                # NO se hace warmup por capa aca. Ver _warmup_for_layer.
                 _schedule_summary()
             else:
                 # _build_int8_state falló (ya logueó WARN) — deja en Marlin.
@@ -3777,6 +3919,7 @@ def _make_pwal_wrapper(original, cls):
                 "PN110 pwal wrapper falló para %s: %s",
                 (_genesis_layer_name(layer) or "?"),
                 type(e).__name__,
+                exc_info=True,
             )
             with _pn110_summary_lock:
                 _pn110_summary["fallback"] += 1
@@ -3887,11 +4030,29 @@ def _make_apply_wrapper(original, cls):
                     "Qwen2MoeMLP.forward."
                 )
             sk_fn = state.get("sk_fn")
-            if sk_fn is not None and not state["sk_always"]:
-                # Diseño B: cutlass gana en la franja intermedia de M.
-                _m = a_i8.shape[0]
-                if state["sk_max_m"] < _m < state["sk_min_big_m"]:
-                    sk_fn = None
+            # NO hay gate por M aca. Antes habia uno ("Diseño B": cutlass gana
+            # en la franja intermedia de M) escrito asi:
+            #
+            #     if state["sk_max_m"] < a_i8.shape[0] < state["sk_min_big_m"]:
+            #         sk_fn = None
+            #
+            # y no hacia lo que promete. ``apply`` corre DENTRO de la region que
+            # torch.compile traza y que cudagraphs captura — se comprobo al meter
+            # un log con side-effect aca, que aborto la captura con el mismo
+            # "Assigning / modifying buffers of nn.Module during forward pass"
+            # documentado mas arriba. Una rama Python sobre ``a_i8.shape[0]`` en
+            # ese contexto se evalua UNA vez, en el trazado, y su resultado queda
+            # horneado en el grafo: no se re-decide por forward.
+            #
+            # Sintoma medido (2026-08-27, traza del profiler de vLLM): el bind
+            # ligaba 513 capas a SK-01..SK-06/SK-10 sin un solo fallo, y aun asi
+            # en decode NO se ejecutaba ni un super kernel — el 100% del GEMM se
+            # iba por ``cutlass_scaled_mm``. Consistente con que el trazado vio
+            # el M grande del profile run (64 < M < 4096) y horneo la rama
+            # cutlass para todos los forwards, decode incluido.
+            #
+            # Si alguna vez se quiere volver a elegir por M, la decision tiene
+            # que tomarse en el BIND (tiempo de carga), no aca.
             if sk_fn is not None:
                 # El bias se pasa por la ranura de epílogo del kernel como una
                 # vista [M,N] con stride de fila 0: se fusiona en el store sin
@@ -3899,13 +4060,16 @@ def _make_apply_wrapper(original, cls):
                 epi = state["sk_zero"]
                 if bias_arg is not None:
                     epi = bias_arg.unsqueeze(0).expand(a_i8.shape[0], bias_arg.shape[0])
-                out = sk_fn(
+                # Via custom op: dynamo no traza adentro, asi que M llega
+                # como int concreto y Triton puede especializar y elegir tile.
+                out = _sk_gemm_op(
                     a_i8,
                     b_tensor,
                     a_scales.reshape(-1),
                     state["sk_bscales"],
                     state["sk_shifts"],
                     epi,
+                    state["sk_op_id"],
                     out_dtype,
                 )
                 return out.reshape(*x.shape[:-1], -1)
