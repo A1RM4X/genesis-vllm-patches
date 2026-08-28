@@ -394,7 +394,7 @@ def transformar(fuente: str, kernel: str, bloque: str, orig=None,
         idx = (entradas or {}).get(entry)
         if idx is None:
             continue
-        src = src.replace(nom + ".horneado", "_QVAR%d.horneado" % idx)
+        src = src.replace(nom + ".horneado", "_POR_Q%d[0].horneado" % idx)
         src = re.sub(r"\b" + re.escape(nom) + r"\(", "_lanzar_quant%d(" % idx, src)
         stats["redirigidos"] = stats.get("redirigidos", 0) + 1
     return _limpiar_docs(src), stats
@@ -606,6 +606,34 @@ def _tabla_sk08(mod, kern, B=5, semilla=0):
     return t, (B * HV,), ["o_ptr", "state_ptr"]
 
 
+BLOQUES_QUANT = (2048, 4096, 8192, 16384)
+"""BLOCK posibles del quant. Es ``next_power_of_2(K)`` y es ``tl.constexpr``,
+asi que queda horneado en el cubin: hace falta una variante por valor. Cubren
+los K reales del modelo: 1280->2048, 3072->4096, 5120 y 7168->8192,
+8704->16384. Con una sola variante el guard de `horneado` frena el arranque
+(pasó: "horneado con param[6]=8192 y llego 4096"), que es lo correcto pero
+inservible."""
+
+
+def compilar_quant_todas(mod, kern, K, eps, gamma=0.0, con_sp=False):
+    """Una variante por BLOCK, deduplicadas por sus valores horneados."""
+    vs = []
+    vistos = set()
+    for blk in BLOQUES_QUANT:
+        try:
+            v = compilar_quant(mod, kern, blk, eps, gamma, con_sp)
+        except Exception:
+            continue
+        clave = tuple(sorted(v["horneado"].items()))
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        vs.append(v)
+    if not vs:
+        raise RuntimeError("quant: no compilo ninguna variante")
+    return vs
+
+
 def compilar_quant(mod, kern, K, eps, gamma=0.0, con_sp=False):
     """Compila el kernel de quant/rmsnorm y le aplica E1/E2.
 
@@ -664,24 +692,25 @@ def _params(ptx):
     return ptx[ini:ptx.index(")", par)]
 
 
-def bloque_quant(mod_nombre, kernel, v, n=0) -> str:
-    """Emite el PTX del quant, su descriptor, el custom op y el respaldo Triton.
+def bloque_quant(mod_nombre, kernel, vs, n=0) -> str:
+    """Emite las variantes PTX del quant, el custom op y el despacho.
 
-    El lanzamiento va DETRAS de ``direct_register_custom_op`` y no se llama
-    directo. Razon, medida contra el server: estos kernels corren dentro del
-    forward que vLLM compila con ``fullgraph=True``, y un lanzamiento crudo por
-    ctypes no es trazable por dynamo. Sin el custom op el arranque muere en
-    ``profile_run``, primero con "Dynamo does not know how to enter a `lock`
-    context manager" y, sacado el lock, con "Skip inlining
-    torch.compiler.disable()'d function", porque fullgraph no admite cortes de
-    grafo. El custom op lo vuelve opaco sin romper el grafo: es lo mismo que
-    hace sk_ops.py con los GEMM, y por eso los GEMM si pasaban.
+    ``vs`` es una LISTA: ``BLOCK`` es ``tl.constexpr`` y queda horneado, asi que
+    hace falta una variante por valor posible. La eleccion en runtime compara
+    los valores horneados contra los args recibidos, igual que ``_lanzar`` con
+    los tiles del GEMM. Con una sola variante el arranque moria en el guard
+    ("horneado con param[6]=8192 y llego 4096"): el guard hacia bien su trabajo,
+    faltaba el resto de las variantes.
+
+    El lanzamiento va detras de ``direct_register_custom_op``: estos kernels
+    corren dentro del forward que vLLM compila con ``fullgraph=True`` y un
+    lanzamiento crudo por ctypes no es trazable por dynamo.
     """
-    nombres, ce = v["nombres"], v["ce"]
+    v0 = vs[0]
+    nombres, ce = v0["nombres"], v0["ce"]
     salidas = [x for x in nombres
                if x in ("q_ptr", "s_ptr", "out_ptr", "o_ptr", "state_ptr")]
-
-    tipos = v.get("tipos", {})
+    tipos = v0.get("tipos", {})
 
     def anota(nm):
         t = tipos.get(nm, "")
@@ -694,44 +723,58 @@ def bloque_quant(mod_nombre, kernel, v, n=0) -> str:
     firma = ", ".join(anota(x) for x in nombres)
     paso = ", ".join(nombres)
     op = "genesis_%s_q%d" % (mod_nombre.replace(".", "_"), n)
-    d = {"n": n, "ptx": v["ptx"], "mod": mod_nombre, "entry": v["entry"],
-         "warps": v["warps"], "shared": v["shared"], "abi": v["orden"],
-         "horn": v["horneado"], "div16": v["div16"], "e1": v["e1"],
-         "e2": v["e2"], "firma": firma, "paso": paso, "op": op,
-         "sal": salidas, "ce": ce, "nombres": nombres, "kernel": kernel}
-    return (
-        '\n\n# --- quant: PTX embebido (E1=%(e1)d lop3, E2=%(e2)d mul) ---\n\n'
-        '_QPTX%(n)d = r"""%(ptx)s"""\n\n'
-        '_QVAR%(n)d = _Nativo(\n    "%(mod)s/%(entry)s",\n'
-        '    _QPTX%(n)d, "%(entry)s",\n'
-        '    warps=%(warps)d, shared=%(shared)d,\n    abi=%(abi)r,\n'
-        '    horneado=%(horn)r,\n    div16=%(div16)r,\n)\n\n\n'
-        'def _q%(n)d_impl(grid: list[int], %(firma)s) -> None:\n'
-        '    """Cuerpo del custom op: lanza el PTX embebido."""\n'
-        '    _QVAR%(n)d(tuple(grid), %(paso)s)\n\n\n'
-        'def _q%(n)d_fake(grid: list[int], %(firma)s) -> None:\n'
+
+    out = ['\n\n# --- quant %s: %d variante(s) de PTX embebido ---\n\n'
+           % (v0["entry"], len(vs))]
+    for k, v in enumerate(vs):
+        out.append('_QPTX%d_%d = r"""%s"""\n\n' % (n, k, v["ptx"]))
+        out.append('_QVAR%d_%d = _Nativo(\n    "%s/%s/blk%s",\n'
+                   '    _QPTX%d_%d, "%s",\n    warps=%d, shared=%d,\n'
+                   '    abi=%r,\n    horneado=%r,\n    div16=%r,\n)\n'
+                   '# E1=%d lop3, E2=%d mul\n\n'
+                   % (n, k, mod_nombre, v["entry"],
+                      v["horneado"].get(nombres.index("BLOCK"), "?")
+                      if "BLOCK" in nombres else "-",
+                      n, k, v["entry"], v["warps"], v["shared"],
+                      v["orden"], v["horneado"], v["div16"],
+                      v["e1"], v["e2"]))
+    out.append("_POR_Q%d = [%s]\n\n\n"
+               % (n, ", ".join("_QVAR%d_%d" % (n, k) for k in range(len(vs)))))
+    out.append(
+        'def _q%d_impl(grid: list[int], %s) -> None:\n'
+        '    """Cuerpo del custom op: elige la variante y lanza el PTX."""\n'
+        '    args = (%s)\n'
+        '    for _v in _POR_Q%d:\n'
+        '        if all(args[_p] == _x for _p, _x in _v.horneado.items()):\n'
+        '            return _v(tuple(grid), *args)\n'
+        '    raise ValueError(\n'
+        '        "%s: no hay PTX embebido para estos constexpr; "\n'
+        '        "horneados disponibles: %%r" %% [_v.horneado for _v in _POR_Q%d])\n\n\n'
+        % (n, firma, paso, n, op, n))
+    out.append(
+        'def _q%d_fake(grid: list[int], %s) -> None:\n'
         '    """Meta impl: no toca la GPU; las salidas se mutan in-place."""\n'
-        '    return None\n\n\n'
+        '    return None\n\n\n' % (n, firma))
+    out.append(
         '# Registro AL IMPORTAR, no en el primer uso: direct_register_custom_op\n'
         '# llama a torch._library.infer_schema, que dynamo se niega a trazar\n'
-        '# ("Attempted to call function marked as skipped"). Si el registro\n'
-        '# cae dentro del forward compilado, el arranque muere en profile_run.\n'
-        '# El hasattr evita el choque cuando el modulo se importa dos veces\n'
-        '# con nombres distintos, como hace el gate de tools/monolitizar.py.\n'
-        'if not hasattr(torch.ops.vllm, "%(op)s"):\n'
+        '# ("Attempted to call function marked as skipped"). El hasattr evita el\n'
+        '# choque cuando el modulo se importa dos veces con nombres distintos,\n'
+        '# como hace el gate de tools/monolitizar.py.\n'
+        'if not hasattr(torch.ops.vllm, "%s"):\n'
         '    from vllm.utils.torch_utils import direct_register_custom_op\n'
         '    direct_register_custom_op(\n'
-        '        op_name="%(op)s",\n        op_func=_q%(n)d_impl,\n'
-        '        mutates_args=%(sal)r,\n        fake_impl=_q%(n)d_fake,\n    )\n\n\n'
-        'def _lanzar_quant%(n)d(grid, *args):\n'
+        '        op_name="%s",\n        op_func=_q%d_impl,\n'
+        '        mutates_args=%r,\n        fake_impl=_q%d_fake,\n    )\n\n\n'
+        % (op, op, n, salidas, n))
+    out.append(
+        'def _lanzar_quant%d(grid, *args):\n'
         '    """Lanza el PTX embebido. Es el UNICO camino ejecutable.\n\n'
         '    No hay fallback a Triton ni kill-switch: el kernel Triton de este\n'
-        '    archivo es privado y solo lo llaman los tests. Si el cubin no\n'
-        '    aplica a estos inputs, `_Nativo` levanta ValueError en vez de\n'
-        '    degradar en silencio a otro camino.\n    """\n'
+        '    archivo es privado y solo lo llaman los tests.\n    """\n'
         '    g = [grid] if isinstance(grid, int) else list(grid)\n'
-        '    return torch.ops.vllm.%(op)s(g, *args)\n'
-        % d)
+        '    return torch.ops.vllm.%s(g, *args)\n' % (n, op))
+    return "".join(out)
 
 
 def gate_sk08(orig, nuevo, kern, v, n=0):
@@ -865,14 +908,15 @@ def main():
 
     variantes = compilar_todas(orig, kern, a.K, a.N) if kern else {}
     quants = [q for q in a.quant.split(",") if q]
-    qvs = [(q, compilar_quant(orig, getattr(orig, q), a.K, a.eps)) for q in quants]
-    entradas = {qv["entry"]: n for n, (_qn, qv) in enumerate(qvs)}
+    qvs = [(q, compilar_quant_todas(orig, getattr(orig, q), a.K, a.eps))
+           for q in quants]
+    entradas = {vs[0]["entry"]: n for n, (_qn, vs) in enumerate(qvs)}
     src, stats = transformar(fuente, a.kernel, "", orig, quants, entradas)
     src = insertar_plomeria(cabecera_imports(src))
     if variantes:
         src += bloque_ptx(a.mod, variantes)
-    for n, (qn, qv) in enumerate(qvs):
-        src += bloque_quant(a.mod, qn, qv, n)
+    for n, (qn, vs) in enumerate(qvs):
+        src += bloque_quant(a.mod, qn, vs, n)
 
     destino = a.dry or ruta
     # .py obligatorio: spec_from_file_location no carga otra extension
@@ -890,12 +934,21 @@ def main():
         return 1
     nuevo = cargar(tmp, a.mod + "_nuevo")
     ok, tot, fallos = gate(orig, nuevo, kern, a.K, a.N) if kern else (0, 0, [])
-    for n, (qn, qv) in enumerate(qvs):
+    for n, (qn, vs) in enumerate(qvs):
         kq = getattr(orig, qn)
         if "_sk08_" in qn:
-            oq, tq, fq = gate_sk08(orig, nuevo, kq, qv, n)
+            oq, tq, fq = gate_sk08(orig, nuevo, kq, vs[0], n)
         else:
-            oq, tq, fq = gate_quant(orig, nuevo, kq, a.K, a.eps, qv, n)
+            # Se ejercita CADA variante con el K que le corresponde: compilar
+            # una y probar otra fue justo lo que dejo pasar el fallo anterior.
+            oq = tq = 0
+            fq = []
+            for v in vs:
+                blk = v["horneado"].get(v["nombres"].index("BLOCK"))
+                o2, t2, f2 = gate_quant(orig, nuevo, kq, blk or a.K, a.eps, v, n)
+                oq += o2
+                tq += t2
+                fq += f2
         ok += oq
         tot += tq
         fallos += fq
