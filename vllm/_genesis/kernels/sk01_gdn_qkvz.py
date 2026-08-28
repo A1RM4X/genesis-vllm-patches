@@ -213,14 +213,6 @@ class _Nativo:
             raise RuntimeError("cuLaunchKernel(%s): %d" % (self.caso, res))
 
 
-def habilitado() -> bool:
-    """Kill-switch: ``GENESIS_PTQ_NATIVO=0`` desactiva el camino PTX.
-
-    Definido ACA, no importado: este modulo no comparte plomeria con nadie.
-    """
-    return os.environ.get("GENESIS_PTQ_NATIVO", "1").strip().lower() \
-        not in ("0", "false", "no", "off")
-
 
 
 SK01_N_GLOBAL: int = 16384
@@ -24938,10 +24930,10 @@ def _q0_fake(grid: list[int], x_ptr: torch.Tensor, w_ptr: torch.Tensor, q_ptr: t
 
 # Registro AL IMPORTAR, no en el primer uso: direct_register_custom_op
 # llama a torch._library.infer_schema, que dynamo se niega a trazar
-# ("Attempted to call function marked as skipped"). Si el registro cae
-# dentro del forward compilado, el arranque muere en profile_run.
-# El hasattr evita el choque cuando el modulo se importa dos veces con
-# nombres distintos, como hace el gate de tools/monolitizar.py.
+# ("Attempted to call function marked as skipped"). Si el registro
+# cae dentro del forward compilado, el arranque muere en profile_run.
+# El hasattr evita el choque cuando el modulo se importa dos veces
+# con nombres distintos, como hace el gate de tools/monolitizar.py.
 if not hasattr(torch.ops.vllm, "genesis_sk01_gdn_qkvz_q0"):
     from vllm.utils.torch_utils import direct_register_custom_op
     direct_register_custom_op(
@@ -24953,16 +24945,12 @@ if not hasattr(torch.ops.vllm, "genesis_sk01_gdn_qkvz_q0"):
 
 
 def _lanzar_quant0(grid, *args):
-    """PTX embebido via custom op; cae al Triton con el kill-switch.
+    """Lanza el PTX embebido. Es el UNICO camino ejecutable.
 
-    ``GENESIS_PTQ_NATIVO=0`` vuelve al kernel Triton, que queda en este
-    archivo como referencia para los tests.
+    No hay fallback a Triton ni kill-switch: el kernel Triton de este
+    archivo es privado y solo lo llaman los tests. Si el cubin no
+    aplica a estos inputs, `_Nativo` levanta ValueError en vez de
+    degradar en silencio a otro camino.
     """
-    if habilitado():
-        g = [grid] if isinstance(grid, int) else list(grid)
-        return torch.ops.vllm.genesis_sk01_gdn_qkvz_q0(g, *args)
-    ce = ['BLOCK', 'EPS']
-    nom = ['x_ptr', 'w_ptr', 'q_ptr', 's_ptr', 'K', 'stride_xm', 'stride_qm', 'BLOCK', 'EPS']
-    return _sk01_rmsnorm_quant_kernel[grid](*args[:len(nom) - len(ce)],
-                    **{n: args[nom.index(n)] for n in ce},
-                    num_warps=8, num_stages=1)
+    g = [grid] if isinstance(grid, int) else list(grid)
+    return torch.ops.vllm.genesis_sk01_gdn_qkvz_q0(g, *args)
