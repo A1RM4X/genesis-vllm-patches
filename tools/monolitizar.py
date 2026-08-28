@@ -234,12 +234,13 @@ def compilar_todas(mod, kern, K, N):
 # --------------------------------------------------------------------------
 
 def transformar(fuente: str, kernel: str, bloque: str, orig=None,
-                quant=()) -> tuple[str, dict]:
+                quant=(), entradas=None) -> tuple[str, dict]:
     """Saca Triton/plomeria compartida y mete el bloque PTX. Devuelve (src, stats)."""
     arbol = ast.parse(fuente)
     lineas = fuente.splitlines(True)
     borrar = []          # (lin_ini, lin_fin) 1-based inclusive
     reemplazos_extra = []
+    viejos = {}   # nombre del descriptor viejo -> entry del PTX
     # jit / triton_ref se CUENTAN pero no se borran: quedan de referencia.
     stats = {"jit": 0, "triton_ref": 0, "import_rt": 0, "ptx_viejo": 0, "lanzamiento": 0}
 
@@ -268,7 +269,15 @@ def transformar(fuente: str, kernel: str, bloque: str, orig=None,
         # llamadores del quant referenciando nombres inexistentes: el archivo
         # compilaba y reventaba con NameError recien en runtime.
         elif isinstance(nodo, ast.Assign):
-            if isinstance(nodo.value, ast.Call) and \
+            if isinstance(nodo.value, ast.Constant) and \
+                    isinstance(nodo.value.value, str) and \
+                    '.visible .entry' in nodo.value.value:
+                # PTX viejo embebido: lo reemplazan mis variantes, que traen
+                # las mismas ediciones E1/E2 pero aplicadas por script, mas
+                # los guards de `horneado` y `div16`.
+                stats['ptx_viejo'] += 1
+                borrar.append((nodo.lineno, nodo.end_lineno))
+            elif isinstance(nodo.value, ast.Call) and \
                     isinstance(nodo.value.func, ast.Name) and \
                     nodo.value.func.id == "KernelNativo":
                 stats["ptx_viejo"] += 1
@@ -289,12 +298,44 @@ def transformar(fuente: str, kernel: str, bloque: str, orig=None,
                          % (ast.unparse(nodo.targets[0]), pos[0], var_ptx, entry,
                             kw.get("num_warps", "4"), kw.get("shared", "0"),
                             abi, kw.get("horneado", "{}")))
-                reemplazos_extra.append((nodo.lineno, nodo.end_lineno, 0, nuevo))
+                viejos[ast.unparse(nodo.targets[0])] = entry
+                borrar.append((nodo.lineno, nodo.end_lineno))
+
+    # Rangos de linea de las funciones *_triton: sus lanzamientos NO se
+    # reescriben. Son la referencia de Triton para los tests, y si se les
+    # cambia el cuerpo por el PTX dejan de ser referencia de nada: el
+    # kill-switch GENESIS_PTQ_NATIVO=0 caia en un camino que tambien era PTX.
+    intocables = []
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and nodo.name.endswith('_triton'):
+            intocables.append((nodo.lineno, nodo.end_lineno))
+
+    # Los `if habilitado(): PTX else: return X_triton(...)` de las funciones
+    # publicas se aplanan al cuerpo del if. El PTX es el unico camino
+    # ejecutable: no hay kill-switch ni degradado silencioso a Triton. El
+    # kernel Triton queda privado, solo para los tests.
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.If):
+            continue
+        if 'habilitado()' not in ast.unparse(nodo.test):
+            continue
+        a0 = nodo.body[0].lineno
+        b0 = nodo.body[-1].end_lineno
+        cuerpo = []
+        for ln in lineas[a0 - 1:b0]:
+            cuerpo.append(ln[4:] if ln.startswith('    ') else ln)
+        reemplazos_extra.append((nodo.lineno, nodo.end_lineno, 0,
+                                 ''.join(cuerpo).rstrip('\n')))
+        stats['sin_fallback'] = stats.get('sin_fallback', 0) + 1
 
     # sitio de lanzamiento: kernel[grid](...)
     reemplazos = []
     for nodo in ast.walk(arbol):
         if not isinstance(nodo, ast.Call):
+            continue
+        if any(a <= nodo.lineno <= b for a, b in intocables):
+            stats['intocado'] = stats.get('intocado', 0) + 1
             continue
         f = nodo.func
         if not (isinstance(f, ast.Subscript) and isinstance(f.value, ast.Name)
@@ -345,7 +386,42 @@ def transformar(fuente: str, kernel: str, bloque: str, orig=None,
                     for a, b, c, nuevo in reemplazos + reemplazos_extra])
     for a, b, texto in sorted(ediciones, key=lambda x: -x[0]):
         lineas[a - 1:b] = [] if texto is None else [texto]
-    return "".join(lineas), stats
+    src = "".join(lineas)
+    # Un solo camino PTX: los usos de los descriptores viejos apuntan a mis
+    # variantes, que van detras del custom op. Antes convivian dos caminos
+    # y el publico usaba el viejo, que no era opaco a dynamo.
+    for nom, entry in (viejos or {}).items():
+        idx = (entradas or {}).get(entry)
+        if idx is None:
+            continue
+        src = src.replace(nom + ".horneado", "_QVAR%d.horneado" % idx)
+        src = re.sub(r"\b" + re.escape(nom) + r"\(", "_lanzar_quant%d(" % idx, src)
+        stats["redirigidos"] = stats.get("redirigidos", 0) + 1
+    return _limpiar_docs(src), stats
+
+
+_RE_STALE = None
+
+
+def _limpiar_docs(src: str) -> str:
+    """Saca de los docstrings las promesas que ya no se cumplen.
+
+    Los textos heredados decian que con ``GENESIS_PTQ_NATIVO=0`` o con una
+    geometria fuera del cubin se caia al kernel Triton. Eso ya no pasa: el PTX
+    es el unico camino ejecutable y un desajuste levanta ValueError. Un
+    docstring que promete un fallback inexistente es peor que no tenerlo.
+    """
+    global _RE_STALE
+    if _RE_STALE is None:
+        _RE_STALE = re.compile(
+            r"^.*(GENESIS_PTQ_NATIVO|cae al kernel Triton|"
+            r"camino Triton de referencia|kill-switch).*$\n?", re.M)
+    fuera = []
+    for linea in src.splitlines(True):
+        if _RE_STALE.match(linea) and not linea.lstrip().startswith(("#", "def ", "if ")):
+            continue
+        fuera.append(linea)
+    return "".join(fuera)
 
 
 def cabecera_imports(src: str) -> str:
@@ -473,7 +549,13 @@ def _tabla_quant(K, M, eps, gamma=0.0, con_sp=False, semilla=0):
     # s_pow2 ausente = escalar 1.0 con stride 0, igual que en produccion.
     sp = (torch.rand(K, device="cuda") + 0.5 if con_sp
           else torch.ones((), dtype=torch.float32, device="cuda"))
+    # SiLU+mul+quant: entra gate_up [M, 2*N2] y sale q [M, N2]. Nombres propios
+    # de SK-05 (gu_ptr / N2 / stride_gu_m / stride_q_m), no los genericos.
+    gu = torch.randn((M, 2 * K), dtype=torch.bfloat16, device="cuda")
+    qn2 = torch.empty((M, K), dtype=torch.int8, device="cuda")
     return {
+        "gu_ptr": gu, "N2": K,
+        "stride_gu_m": gu.stride(0), "stride_q_m": qn2.stride(0),
         "x_ptr": x, "w_ptr": w, "q_ptr": q, "s_ptr": sc, "out_ptr": out,
         "bias_ptr": bias, "s_pow2_ptr": sp,
         "K": K, "N": K, "M": M,
@@ -642,16 +724,14 @@ def bloque_quant(mod_nombre, kernel, v, n=0) -> str:
         '        op_name="%(op)s",\n        op_func=_q%(n)d_impl,\n'
         '        mutates_args=%(sal)r,\n        fake_impl=_q%(n)d_fake,\n    )\n\n\n'
         'def _lanzar_quant%(n)d(grid, *args):\n'
-        '    """PTX embebido via custom op; cae al Triton con el kill-switch.\n\n'
-        '    ``GENESIS_PTQ_NATIVO=0`` vuelve al kernel Triton, que queda en este\n'
-        '    archivo como referencia para los tests.\n    """\n'
-        '    if habilitado():\n'
-        '        g = [grid] if isinstance(grid, int) else list(grid)\n'
-        '        return torch.ops.vllm.%(op)s(g, *args)\n'
-        '    ce = %(ce)r\n    nom = %(nombres)r\n'
-        '    return %(kernel)s[grid](*args[:len(nom) - len(ce)],\n'
-        '                    **{n: args[nom.index(n)] for n in ce},\n'
-        '                    num_warps=8, num_stages=1)\n' % d)
+        '    """Lanza el PTX embebido. Es el UNICO camino ejecutable.\n\n'
+        '    No hay fallback a Triton ni kill-switch: el kernel Triton de este\n'
+        '    archivo es privado y solo lo llaman los tests. Si el cubin no\n'
+        '    aplica a estos inputs, `_Nativo` levanta ValueError en vez de\n'
+        '    degradar en silencio a otro camino.\n    """\n'
+        '    g = [grid] if isinstance(grid, int) else list(grid)\n'
+        '    return torch.ops.vllm.%(op)s(g, *args)\n'
+        % d)
 
 
 def gate_sk08(orig, nuevo, kern, v, n=0):
@@ -734,6 +814,35 @@ def gate_quant(orig, nuevo, kern, K, eps, v, n=0):
     return ok, tot, fallos
 
 
+def _invariante_opaco(src):
+    """Todo lanzamiento PTX tiene que ir detras del custom op.
+
+    Un `_QVARn(...)` o `_VAR_n(...)` llamado directo desde el modulo cae dentro
+    del forward que vLLM compila con fullgraph=True y mata el arranque. Ya paso:
+    convivian dos caminos PTX y el publico usaba el que no era opaco. El gate
+    no lo veia porque compara kernels, no el cableado.
+
+    Se permiten solo dentro de `_qN_impl` (el cuerpo del custom op) y de
+    `_lanzar`, que se llama desde el GEMM ya envuelto por sk_ops.
+    """
+    arbol = ast.parse(src)
+    permitido = []
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                re.match(r"_q\d+_impl$", nodo.name) or nodo.name == "_lanzar"):
+            permitido.append((nodo.lineno, nodo.end_lineno))
+    malos = []
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.Call) or not isinstance(nodo.func, ast.Name):
+            continue
+        if not re.match(r"(_QVAR\d+|_VAR_\d+)$", nodo.func.id):
+            continue
+        if any(a <= nodo.lineno <= b for a, b in permitido):
+            continue
+        malos.append("%s:%d" % (nodo.func.id, nodo.lineno))
+    return malos
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mod", required=True)
@@ -757,7 +866,8 @@ def main():
     variantes = compilar_todas(orig, kern, a.K, a.N) if kern else {}
     quants = [q for q in a.quant.split(",") if q]
     qvs = [(q, compilar_quant(orig, getattr(orig, q), a.K, a.eps)) for q in quants]
-    src, stats = transformar(fuente, a.kernel, "", orig, quants)
+    entradas = {qv["entry"]: n for n, (_qn, qv) in enumerate(qvs)}
+    src, stats = transformar(fuente, a.kernel, "", orig, quants, entradas)
     src = insertar_plomeria(cabecera_imports(src))
     if variantes:
         src += bloque_ptx(a.mod, variantes)
@@ -772,6 +882,11 @@ def main():
         ast.parse(src)
     except SyntaxError as e:
         print("%-24s SINTAXIS ROTA linea %s: %s" % (a.mod, e.lineno, e.msg))
+        return 1
+    mal = _invariante_opaco(src)
+    if mal:
+        print("%-24s INVARIANTE ROTO: lanzamientos PTX fuera del custom op: %s"
+              % (a.mod, mal))
         return 1
     nuevo = cargar(tmp, a.mod + "_nuevo")
     ok, tot, fallos = gate(orig, nuevo, kern, a.K, a.N) if kern else (0, 0, [])
@@ -788,10 +903,11 @@ def main():
     if ok == tot:
         os.replace(tmp, destino)
         print("%-24s OK  variantes=%2d  %6.0f KB  gate %d/%d  "
-              "(triton conservado: %d jit + %d ref; imp-%d ptx-%d lanz-%d)"
+              "(triton: %d jit + %d ref privadas; imp-%d ptx_viejo-%d lanz-%d redir-%d sinfb-%d)"
               % (a.mod, len(variantes), kb, ok, tot, stats["jit"],
                  stats["triton_ref"], stats["import_rt"], stats["ptx_viejo"],
-                 stats["lanzamiento"]))
+                 stats["lanzamiento"], stats.get("redirigidos", 0),
+                 stats.get("sin_fallback", 0)))
         return 0
     os.remove(tmp)
     print("%-24s GATE FALLA %d/%d  %s" % (a.mod, ok, tot, fallos[:3]))
