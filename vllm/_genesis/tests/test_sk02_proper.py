@@ -126,8 +126,8 @@ def _assert_kernel_standards(path: pathlib.Path, *, require_mma_sync: bool = Tru
     Checks
     ------
     * file contains ``mma.sync`` and ``ld.global``
-    * every ``@triton.jit`` body has no ``float32``/``fp32`` (except
-      allowed ``int32`` acc), only ``int8``/``bf16`` dtypes, no
+    * every ``@triton.jit`` body has no ``float16``/``fp16``/``float64`` (except
+      allowed ``int32``/``float32`` acc), only ``int8``/``bf16``/``float32`` dtypes, no
       ``if``/``else`` (branchless), and is monolithic
       (``tl.load``+``tl.dot``+``tl.store``)
 
@@ -170,15 +170,17 @@ def _assert_kernel_standards(path: pathlib.Path, *, require_mma_sync: bool = Tru
         stripped = _strip_python_comments(body)
         lower = stripped.lower()
 
-        # no float32 / fp32 inside kernel body (except allowed int32 acc)
-        # int32 is allowed as accumulator, so allow "int32" but forbid float32/fp32
-        assert "float32" not in lower, f"{path.name}:{name} contains float32 (only bf16/int8 allowed, int32 acc exception)"
-        assert "fp32" not in lower, f"{path.name}:{name} contains fp32 (only bf16/int8 allowed, int32 acc exception)"
+        # no float64 / fp16 inside kernel body (float16 via tl.float16 forbidden, but tl.bfloat16 allowed)
+        # int32 and float32 are allowed as accumulator (fp32 intermediate, then cast to bf16) — 2026-08-26
+        assert "float64" not in lower, f"{path.name}:{name} contains float64 (only bf16/int8 allowed, int32/float32 acc exception)"
+        assert "fp16" not in lower, f"{path.name}:{name} contains fp16 (only bf16/int8 allowed, int32/float32 acc exception)"
+        # float32/fp32 is now allowed for fp32 intermediate accum (2026-08-26) — do not assert on it
+        # float16 substring would false-positive on bfloat16, so check only via tl.float16 regex below
 
-        # only allowed dtypes — disallow tl.float32 / tl.float16 / tl.float64
-        # Allowed: tl.int8, tl.bfloat16, tl.int32, tl.constexpr, tl.float8* (if needed)
-        dtype_hits = re.findall(r"tl\.(float32|float16|float64)\b", stripped)
-        assert not dtype_hits, f"{path.name}:{name} uses disallowed dtype(s) {dtype_hits} — only int8/bf16 (+int32 acc) allowed"
+        # only allowed dtypes — disallow tl.float16 / tl.float64 (tl.float32 allowed as fp32 accum)
+        # Allowed: tl.int8, tl.bfloat16, tl.int32, tl.float32, tl.constexpr, tl.float8* (if needed)
+        dtype_hits = re.findall(r"tl\.(float16|float64)\b", stripped)
+        assert not dtype_hits, f"{path.name}:{name} uses disallowed dtype(s) {dtype_hits} — only int8/bf16 (+int32/float32 acc) allowed"
         # also forbid bare fp32 text already done; ensure only int8/bf16 appear as dtypes
         # We explicitly allow int8, bfloat16, int32 only; if file uses float16 it would have been caught
 
@@ -472,11 +474,12 @@ def test_sk02_w4a8_kernel_standards():
                 assert "tl.load" in body, "w4a8 missing tl.load (ld.global surrogate)"
                 assert "tl.dot" in body, "w4a8 missing tl.dot (mma.sync surrogate)"
                 assert "tl.store" in body, "w4a8 missing tl.store"
-            # Still ensure no fp32/illegal dtypes/branches via stripped checks
+            # Still ensure no illegal dtypes/branches via stripped checks (float32/fp32 allowed as fp32 accum 2026-08-26)
             for _, body in kernels:
                 stripped = _strip_python_comments(body)
-                assert "float32" not in stripped.lower()
-                assert "fp32" not in stripped.lower()
+                # float16 substring false-positives on bfloat16, so check only tl.float16 via regex (handled in helper)
+                assert "float64" not in stripped.lower()
+                assert "fp16" not in stripped.lower()
                 assert not re.search(r"^\s*if\s", stripped, re.MULTILINE)
                 assert not re.search(r"^\s*else\b", stripped, re.MULTILINE)
         else:

@@ -1,3 +1,14 @@
+# docker-compose.pn110-nomtp.yml — IGUAL a pn110-cg.yml pero SIN MTP.
+#
+# Para comparar PN110 contra Marlin sin que la tasa de aceptacion del
+# speculative decoding contamine el resultado: con MTP el throughput depende de
+# cuantos borradores acepta el verificador (medido 42-49% con PN110 contra 58%
+# con Marlin), asi que un cambio en los kernels y un cambio en la calidad de la
+# cuantizacion se mezclan en el mismo numero.
+#
+# OJO al interpretar: sin MTP, M = requests (no 4 x requests), asi que con 4-6
+# requests el GEMM corre a M=4..6 -- regimen limitado por MEMORIA, donde el
+# margen de los kernels es chico por definicion.
 # ─────────────────────────────────────────────────────────────────────────────
 # Qwen3.8-27B Uncensored FP8 (orcarouter) — copia de w8a16-mtp con otro modelo.
 #
@@ -286,14 +297,9 @@ services:
       #   PN110_SK=0       -> superkernels OFF (queda el boilerplate INT8)
       #   PN110_DISABLE=1  -> PN110 entero OFF (baseline FP8/Marlin)
       #   PN110_HYBRID     -> Diseño C diádico (1) vs B per-channel (0)
-      - GENESIS_PN110_HYBRID=${PN110_HYBRID:-0}
+      - GENESIS_PN110_HYBRID=${PN110_HYBRID:-1}
       - GENESIS_PN110_QUANTIZE=${PN110_QUANTIZE:-fp8_int8}
       - GENESIS_PN110_SK=${PN110_SK:-1}
-      - GENESIS_PN110_SK_ONLY=${PN110_SK_ONLY:-}
-      - GENESIS_PN110_SK_SKIP=${PN110_SK_SKIP:-}
-      - GENESIS_PN110_SWAP_ONLY_SK=${PN110_SWAP_ONLY_SK:-1}
-      - GENESIS_PN110_MAX_LAYERS=${PN110_MAX_LAYERS:-}
-      - GENESIS_PN110_LAYER_INDEX=${PN110_LAYER_INDEX:-}
       # P113: fusiona gate_up + SiLU en un solo GEMM (epilogo de SK-05).
       # Elimina el intermedio [M,17408] bf16 y un lanzamiento por capa.
       - GENESIS_P113_MLP_FUSED_SILU=${P113:-0}
@@ -452,7 +458,6 @@ services:
       # antes de llegar a la API -- preservarlo es un parche aparte.
       - --enable-prompt-tokens-details
       - --trust-remote-code
-      - --enforce-eager
       # ── PROFILER (v0.27.1) ──────────────────────────────────────────────
       # VLLM_TORCH_PROFILER_DIR fue ELIMINADA en v0.27.1. Las rutas
       # /start_profile y /stop_profile las monta attach_router() en
@@ -772,9 +777,6 @@ services:
       - "36"
       - "40"
       - --async-scheduling
-      # Decodificación especulativa MTP nativa con 3 tokens borrador por paso
-      - --speculative-config
-      - '{"method":"mtp","num_speculative_tokens":3}'
       - --host
       - "0.0.0.0"
       - --port

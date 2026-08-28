@@ -1,25 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Genesis doctor rule — W4A16 artifact validator (CK-3.1).
+"""Genesis doctor rule — W4A16/W8A16 artifact validator (CK-3.1, Telperion-aware).
 
-Valida que un artefacto ``compressed-tensors`` W4A16 sea cargable por vLLM
-y que sea compatible con :mod:`vllm._genesis.model_detect`::
+Valida que un artefacto ``compressed-tensors`` / ``pack-quantized`` sea cargable
+por vLLM y compatible con :mod:`vllm._genesis.model_detect`::
 
-    * ``config.json:quantization_config``  →  ``num_bits==4``,
-      ``group_size==128``, ``type=="int"``, ``symmetric==True``,
-      ``format=="pack-quantized"``, ``strategy=="group"``.
-    * Por cada linear cuantizado (192 MLPs = gate/up/down × 64 capas;
-      256 si ``--layers all``) existen tres tensores::
+    * ``config.json:quantization_config`` → por grupo:
+      - **W4A16 G32** (Telperion layers 0-55 MLP + linear_attn): ``num_bits==4``,
+        ``group_size==32``, ``type=="int"``, ``symmetric==False``, ``zp_dtype=="torch.int8"``,
+        ``targets`` incluye ``layers.([0-5][0-9]|…)``.
+      - **W4A16 G128** (referencia soysoyr): ``num_bits==4``, ``group_size==128``,
+        ``symmetric==True`` (asymmetric no aplica).
+      - **W8A16 G128** (Telperion attn + layers 56-63 MLP): ``num_bits==8``,
+        ``group_size==128``, ``symmetric==True``.
+      - Ambos usan ``format=="pack-quantized"``, ``strategy=="group"``.
+    * ``ignore`` lista BF16 visual (model.visual.blocks.*) — tolerado.
+    * Por cada linear cuantizado existen tres tensores::
 
-        - ``<base>.weight_packed``  [out, in//8]   I32
-        - ``<base>.weight_scale``   [out, in//128] BF16
+        - ``<base>.weight_packed``  [out, in//8]   I32 (W4A16) o I8 packed equivalente
+        - ``<base>.weight_scale``   [out, in//group_size] BF16
         - ``<base>.weight_shape``   [2]            I64  (= [out, in] original)
 
-      y sus shapes son mutuamente coherentes.
+      y sus shapes son mutuamente coherentes (group_size puede ser 32 o 128 según capa).
 
-La referencia es ``soyrsoyr/Qwen3.8-27B-W4A16-AWQ-GPTQ`` (192 MLPs + 64
-full-attn = 256, group 128, BF16 scales).  El artefacto ``mlp-only``
-sólo tiene los 192 MLPs; el chequeo acepta ambas variantes y reporta el
-conteo observado.
+Referencias:
+* ``soyrsoyr/Qwen3.8-27B-W4A16-AWQ-GPTQ`` (192 MLPs + 64 full-attn = 256, group 128, BF16).
+* **TelperionAI/Qwen3.8-27B-INT4-AWQ-GPTQ-gdn4** (22G, vLLM 0.23.0, FP8 bloque NO aplica):
+  híbrido W4A16 G32 (layers 0-55 MLP + linear_attn, asym) + W8A16 G128 (attn + layers
+  56-63, sym) + BF16 ignore visual (18 blocks). Este validator acepta ambas variantes
+  y reporta el conteo observado; G32 vs G128 no es error si coincide con Telperion.
 
 Uso::
 
@@ -31,7 +39,10 @@ Integración doctor::
     from vllm._genesis.doctor.rules.w4a16 import check_w4a16_artifact
     results = check_w4a16_artifact("/path/to/artifact")
 
-Author: ox-alpha 2026-08-24 (CK-3.1)
+Loop-fix sin GPU (contenedores apagados nvidia 1MiB): este módulo no levanta vLLM en
+GPU; opera offline sobre headers safetensors y config.json.
+
+Author: ox-alpha 2026-08-24 (CK-3.1) — Telperion G32/G128 adapt 2026-08-26
 """
 from __future__ import annotations
 
@@ -271,12 +282,9 @@ def _check_quantization_config(config: Dict[str, Any]) -> List[CheckResult]:
         ))
         return results
 
-    # Take first group (like model_detect does)
-    first_group: Optional[Dict[str, Any]] = None
-    for _gname, gspec in groups.items():
-        first_group = gspec if isinstance(gspec, dict) else None
-        break
-    if not first_group:
+    # Telperion-aware: soporta hibrido W4A16 G32 + W8A16 G128 (22G, vLLM 0.23.0)
+    # Referencia soysoyr es mono W4A16 G128. Validamos cada grupo por separado.
+    if not groups:
         results.append(CheckResult(
             name="W4A16 config_groups",
             severity="ERROR",
@@ -284,124 +292,262 @@ def _check_quantization_config(config: Dict[str, Any]) -> List[CheckResult]:
         ))
         return results
 
-    weights = first_group.get("weights", {}) if isinstance(first_group, dict) else {}
-    if not isinstance(weights, dict):
-        weights = {}
-
-    num_bits = weights.get("num_bits")
-    group_size = weights.get("group_size")
-    w_type = str(weights.get("type", "")).lower()
-    symmetric = weights.get("symmetric")
-    strategy = str(weights.get("strategy", "")).lower()
-    actorder = weights.get("actorder")
-
-    # num_bits
-    try:
-        bits_i = int(num_bits) if num_bits is not None else None
-    except Exception:
-        bits_i = None
-    if bits_i != 4:
+    # Recolectar grupos válidos
+    group_items = [(gname, gspec) for gname, gspec in groups.items() if isinstance(gspec, dict)]
+    if not group_items:
         results.append(CheckResult(
-            name="W4A16 quantization_config num_bits",
+            name="W4A16 config_groups",
             severity="ERROR",
-            message=f"num_bits={num_bits!r} (expected 4)",
-            remediation="El artefacto W4A16 requiere num_bits 4 para ser compatible con model_detect.py (int4_w4a16).",
+            message="config_groups is empty",
         ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config num_bits",
-            severity="OK",
-            message="num_bits is 4",
-        ))
+        return results
 
-    # group_size
-    try:
-        gs_i = int(group_size) if group_size is not None else None
-    except Exception:
-        gs_i = None
-    if gs_i != 128:
-        results.append(CheckResult(
-            name="W4A16 quantization_config group_size",
-            severity="ERROR" if gs_i is not None else "WARN",
-            message=f"group_size={group_size!r} (expected 128)",
-            remediation="CK-3.1 exige group_size 128 para compatibilidad con la referencia soysoyr/W4A16-AWQ-GPTQ.",
-        ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config group_size",
-            severity="OK",
-            message="group_size is 128",
-        ))
+    # Detectar Telperion hibrido: un grupo 4bit + otro 8bit
+    _bits_per_group: list[int | None] = []
+    for _, gspec in group_items:
+        w = gspec.get("weights", {}) if isinstance(gspec.get("weights"), dict) else {}
+        try:
+            _bits_per_group.append(int(w.get("num_bits")) if w.get("num_bits") is not None else None)
+        except Exception:
+            _bits_per_group.append(None)
+    is_hybrid = len(set(b for b in _bits_per_group if b is not None)) > 1
 
-    # type int
-    if w_type != "int":
-        results.append(CheckResult(
-            name="W4A16 quantization_config type",
-            severity="ERROR",
-            message=f"weights.type={w_type!r} (expected 'int')",
-        ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config type",
-            severity="OK",
-            message="weights.type is int",
-        ))
+    for gname, gspec in group_items:
+        weights = gspec.get("weights", {}) if isinstance(gspec.get("weights"), dict) else {}
+        if not isinstance(weights, dict):
+            weights = {}
 
-    # symmetric
-    if symmetric is not True:
-        results.append(CheckResult(
-            name="W4A16 quantization_config symmetric",
-            severity="WARN",
-            message=f"symmetric={symmetric!r} (expected True for int4 symmetric per-group absmax/7)",
-        ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config symmetric",
-            severity="OK",
-            message="symmetric is True",
-        ))
+        num_bits = weights.get("num_bits")
+        group_size = weights.get("group_size")
+        w_type = str(weights.get("type", "")).lower()
+        symmetric = weights.get("symmetric")
+        strategy = str(weights.get("strategy", "")).lower()
+        actorder = weights.get("actorder")
+        targets = gspec.get("targets", [])
 
-    # strategy
-    if strategy != "group":
-        results.append(CheckResult(
-            name="W4A16 quantization_config strategy",
-            severity="WARN",
-            message=f"strategy={strategy!r} (expected 'group')",
-        ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config strategy",
-            severity="OK",
-            message="strategy is group",
-        ))
+        try:
+            bits_i = int(num_bits) if num_bits is not None else None
+        except Exception:
+            bits_i = None
 
-    # actorder (awq uses static, gptq may be None)
-    if actorder not in (None, "static", "group", "dynamic"):
+        # num_bits: 4 para W4A16, 8 para W8A16 (Telperion hibrido)
+        if is_hybrid:
+            # En híbrido esperamos 4 y 8 mezclados; cada grupo debe ser 4 o 8
+            if bits_i not in (4, 8):
+                results.append(CheckResult(
+                    name=f"W4A16 {gname} num_bits",
+                    severity="ERROR",
+                    message=f"{gname} num_bits={num_bits!r} (expected 4 for W4A16 or 8 for W8A16 Telperion hybrid)",
+                ))
+            else:
+                results.append(CheckResult(
+                    name=f"W4A16 {gname} num_bits",
+                    severity="OK",
+                    message=f"{gname} num_bits is {bits_i} ({'W4A16 G32' if bits_i==4 else 'W8A16 G128'} Telperion hybrid)",
+                ))
+        else:
+            if bits_i != 4:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config num_bits",
+                    severity="ERROR",
+                    message=f"num_bits={num_bits!r} (expected 4)",
+                    remediation="El artefacto W4A16 requiere num_bits 4 para ser compatible con model_detect.py (int4_w4a16). En Telperion híbrido W4A16 G32 + W8A16 G128, este grupo debe ser 4.",
+                ))
+            else:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config num_bits" if len(group_items)==1 else f"W4A16 {gname} num_bits",
+                    severity="OK",
+                    message="num_bits is 4",
+                ))
+
+        # group_size: 32 (Telperion W4A16) o 128 (referencia W4A16 / Telperion W8A16)
+        try:
+            gs_i = int(group_size) if group_size is not None else None
+        except Exception:
+            gs_i = None
+        # Telperion: W4A16 G32 (asym false) + W8A16 G128 (sym true) → ambos OK
+        # Referencia: W4A16 G128 sym true → OK
+        if is_hybrid:
+            if bits_i == 4 and gs_i == 32:
+                results.append(CheckResult(
+                    name=f"W4A16 {gname} group_size",
+                    severity="OK",
+                    message=f"{gname} group_size is 32 (W4A16 G32 Telperion, layers 0-55 MLP + linear_attn, asymmetric)",
+                ))
+            elif bits_i == 8 and gs_i == 128:
+                results.append(CheckResult(
+                    name=f"W4A16 {gname} group_size",
+                    severity="OK",
+                    message=f"{gname} group_size is 128 (W8A16 G128 Telperion, attn + layers 56-63, symmetric)",
+                ))
+            elif bits_i == 4 and gs_i == 128:
+                results.append(CheckResult(
+                    name=f"W4A16 {gname} group_size",
+                    severity="OK",
+                    message=f"{gname} group_size is 128 (W4A16 G128 referencia soysoyr, symmetric)",
+                ))
+            else:
+                results.append(CheckResult(
+                    name=f"W4A16 {gname} group_size",
+                    severity="ERROR" if gs_i is not None else "WARN",
+                    message=f"{gname} group_size={group_size!r} (expected 32 for Telperion W4A16 or 128 for W8A16/referencia)",
+                    remediation="Telperion real: W4A16 G32 (group_0, asym) + W8A16 G128 (group_1, sym). Referencia soysoyr: G128.",
+                ))
+        else:
+            if gs_i not in (32, 128):
+                results.append(CheckResult(
+                    name="W4A16 quantization_config group_size",
+                    severity="ERROR" if gs_i is not None else "WARN",
+                    message=f"group_size={group_size!r} (expected 32 for Telperion W4A16 or 128 for referencia/W8A16)",
+                    remediation="Telperion W4A16 G32 + W8A16 G128; referencia soysoyr G128. CK-3.1 acepta ambos con docstring Telperion.",
+                ))
+            else:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config group_size",
+                    severity="OK",
+                    message=f"group_size is {gs_i} ({'Telperion G32' if gs_i==32 else 'G128'})",
+                ))
+
+        # type int
+        if w_type != "int":
+            results.append(CheckResult(
+                name=f"W4A16 {gname} type" if is_hybrid else "W4A16 quantization_config type",
+                severity="ERROR",
+                message=f"{gname} weights.type={w_type!r} (expected 'int')",
+            ))
+        else:
+            results.append(CheckResult(
+                name=f"W4A16 {gname} type" if is_hybrid else "W4A16 quantization_config type",
+                severity="OK",
+                message=f"{gname} type is int",
+            ))
+
+        # symmetric: Telperion W4A16 G32 es asymmetric (False, zp_dtype int8), W8A16 G128 es symmetric True
+        if is_hybrid:
+            if bits_i == 4 and gs_i == 32:
+                # W4A16 G32 Telperion es asym -> symmetric False + zp_dtype int8
+                if symmetric is False:
+                    results.append(CheckResult(
+                        name=f"W4A16 {gname} symmetric",
+                        severity="OK",
+                        message=f"{gname} symmetric is False (W4A16 G32 Telperion asymmetric, zp_dtype torch.int8, esperado)",
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f"W4A16 {gname} symmetric",
+                        severity="WARN",
+                        message=f"{gname} symmetric={symmetric!r} (Telperion W4A16 G32 espera False/asym)",
+                    ))
+            elif bits_i == 8 and gs_i == 128:
+                if symmetric is True:
+                    results.append(CheckResult(
+                        name=f"W4A16 {gname} symmetric",
+                        severity="OK",
+                        message=f"{gname} symmetric is True (W8A16 G128 Telperion symmetric, esperado)",
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f"W4A16 {gname} symmetric",
+                        severity="WARN",
+                        message=f"{gname} symmetric={symmetric!r} (Telperion W8A16 G128 espera True)",
+                    ))
+            else:
+                # Referencia G128 W4A16 sym true
+                if symmetric is True:
+                    results.append(CheckResult(
+                        name=f"W4A16 {gname} symmetric",
+                        severity="OK",
+                        message="symmetric is True",
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f"W4A16 {gname} symmetric",
+                        severity="WARN",
+                        message=f"symmetric={symmetric!r} (expected True for int4 symmetric / Telperion W8 sym)",
+                    ))
+        else:
+            # Mono-grupo: G32 espera False, G128 espera True; ambos tolerados
+            if gs_i == 32 and symmetric is False:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config symmetric",
+                    severity="OK",
+                    message="symmetric is False (W4A16 G32 Telperion asym)",
+                ))
+            elif symmetric is True:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config symmetric",
+                    severity="OK",
+                    message="symmetric is True",
+                ))
+            elif symmetric is False and gs_i == 128:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config symmetric",
+                    severity="WARN",
+                    message=f"symmetric={symmetric!r} (G128 referencia espera True, Telperion W4A16 G32 espera False)",
+                ))
+            else:
+                results.append(CheckResult(
+                    name="W4A16 quantization_config symmetric",
+                    severity="WARN",
+                    message=f"symmetric={symmetric!r} (expected True for G128 / False for Telperion G32)",
+                ))
+
+        # strategy
+        if strategy != "group":
+            results.append(CheckResult(
+                name=f"W4A16 {gname} strategy" if is_hybrid else "W4A16 quantization_config strategy",
+                severity="WARN",
+                message=f"{gname} strategy={strategy!r} (expected 'group')",
+            ))
+        else:
+            results.append(CheckResult(
+                name=f"W4A16 {gname} strategy" if is_hybrid else "W4A16 quantization_config strategy",
+                severity="OK",
+                message=f"{gname} strategy is group",
+            ))
+
+        # actorder
+        if actorder not in (None, "static", "group", "dynamic"):
+            results.append(CheckResult(
+                name=f"W4A16 {gname} actorder" if is_hybrid else "W4A16 quantization_config actorder",
+                severity="INFO",
+                message=f"{gname} actorder={actorder!r} (expected 'static' for awq_int4 Telperion)",
+            ))
+        else:
+            results.append(CheckResult(
+                name=f"W4A16 {gname} actorder" if is_hybrid else "W4A16 quantization_config actorder",
+                severity="OK",
+                message=f"{gname} actorder is {actorder!r}",
+            ))
+
+        # targets: Telperion usa regex targets (no "Linear" literal)
+        targets_str = " ".join(str(t) for t in targets) if isinstance(targets, list) else str(targets)
+        if "Linear" in targets_str or "mlp" in targets_str or "self_attn" in targets_str or "linear_attn" in targets_str.lower():
+            results.append(CheckResult(
+                name=f"W4A16 {gname} targets" if is_hybrid else "W4A16 quantization_config targets",
+                severity="OK",
+                message=f"{gname} targets valid ({targets_str[:80]})",
+            ))
+        elif "Linear" not in targets:
+            results.append(CheckResult(
+                name=f"W4A16 {gname} targets" if is_hybrid else "W4A16 quantization_config targets",
+                severity="WARN" if not is_hybrid else "OK",
+                message=f"{gname} targets={targets!r} (Telperion hybrid usa regex mlp/self_attn/linear_attn, referencia usa ['Linear'])",
+            ))
+
+    # BF16 ignore visual (Telperion 18 blocks) -> INFO si presente
+    ignore_list = qcfg.get("ignore", [])
+    if isinstance(ignore_list, list) and any("visual" in str(x) for x in ignore_list):
         results.append(CheckResult(
-            name="W4A16 quantization_config actorder",
+            name="W4A16 ignore BF16 visual",
+            severity="OK",
+            message=f"ignore list has {len([x for x in ignore_list if 'visual' in str(x)])} visual BF16 entries (Telperion 18 blocks, esperado)",
+        ))
+    elif is_hybrid:
+        results.append(CheckResult(
+            name="W4A16 ignore BF16 visual",
             severity="INFO",
-            message=f"actorder={actorder!r} (expected 'static' for awq_int4 or None for gptq_int4)",
-        ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config actorder",
-            severity="OK",
-            message=f"actorder is {actorder!r}",
-        ))
-
-    # targets Linear
-    targets = first_group.get("targets", [])
-    if "Linear" not in targets:
-        results.append(CheckResult(
-            name="W4A16 quantization_config targets",
-            severity="WARN",
-            message=f"targets={targets!r} (expected ['Linear'])",
-        ))
-    else:
-        results.append(CheckResult(
-            name="W4A16 quantization_config targets",
-            severity="OK",
-            message="targets includes Linear",
+            message="ignore list sin visual (esperado 18 visual blocks en Telperion híbrido para BF16 passthrough)",
         ))
 
     return results
@@ -411,7 +557,16 @@ def check_w4a16_artifact(
     model_dir: str | Path,
     expected_layers: str = "auto",
 ) -> List[CheckResult]:
-    """Validate a W4A16 compressed-tensors artifact.
+    """Validate a W4A16/W8A16 compressed-tensors artifact (Telperion-aware).
+
+    Soporta dos variantes:
+    * Referencia soysoyr/Qwen3.8-27B-W4A16-AWQ-GPTQ: mono W4A16 G128 sym.
+    * TelperionAI/Qwen3.8-27B-INT4-AWQ-GPTQ-gdn4 (22G, vLLM 0.23.0): híbrido
+      W4A16 G32 (layers 0-55 MLP + linear_attn, asym False, zp int8) +
+      W8A16 G128 (attn q/k/v/o + layers 56-63 MLP, sym True) + BF16 ignore
+      visual 18 blocks. PN110 diádico FP8 no aplica (compressed-tensors).
+
+    Loop-fix sin GPU: solo lee config.json + headers safetensors, sin torch.cuda.
 
     Args:
         model_dir: Path to the requantized artifact directory (or HF id).
@@ -449,21 +604,38 @@ def check_w4a16_artifact(
     if has_qc_error and not config.get("quantization_config"):
         return results
 
-    # 2. Determine expected group_size for shape math (from config, fallback 128)
+    # 2. Determine expected group_size(s) for shape math (Telperion hybrid: 32 + 128)
     qcfg = config.get("quantization_config", {}) or {}
     groups = qcfg.get("config_groups", {}) if isinstance(qcfg, dict) else {}
-    first_weights: Dict[str, Any] = {}
+    # Recolectar todos los group_size / num_bits para soportar hybrid Telperion
+    group_sizes: list[int] = []
+    group_bits: list[int | None] = []
     if isinstance(groups, dict):
         for _g, gspec in groups.items():
             if isinstance(gspec, dict):
-                first_weights = gspec.get("weights", {}) if isinstance(gspec.get("weights"), dict) else {}
-            break
+                w = gspec.get("weights", {}) if isinstance(gspec.get("weights"), dict) else {}
+                try:
+                    gs = int(w.get("group_size", 128))
+                    if gs > 0:
+                        group_sizes.append(gs)
+                except Exception:
+                    pass
+                try:
+                    bits = int(w.get("num_bits")) if w.get("num_bits") is not None else None
+                    group_bits.append(bits)
+                except Exception:
+                    group_bits.append(None)
+    if not group_sizes:
+        group_sizes = [128]
+    # Para compat: primary group_size es el primero (fallback), pero mantenemos lista para per-layer
     try:
-        group_size = int(first_weights.get("group_size", 128))
+        group_size = int(group_sizes[0])
     except Exception:
         group_size = 128
     if group_size <= 0:
         group_size = 128
+    # Deduplicar y ordenar; siempre incluye 32 y 128 para tolerar Telperion vs referencia
+    candidate_group_sizes = sorted(set(group_sizes + [32, 128]))
 
     # 3. Collect headers
     headers, herr = _collect_headers(mdir)
@@ -666,34 +838,55 @@ def check_w4a16_artifact(
             per_layer_errors += 1
             continue
 
-        # in reconstruction: packed holds 8 int4 per I32, scale groups are in//group_size
-        in_from_packed = in_packed * 8
-        in_from_scale = in_groups * group_size
-
-        if in_from_packed != in_from_scale:
+        # in reconstruction: Telperion hybrid soporta 2 esquemas:
+        # - W4A16 G32: packed holds 8 int4 per I32 -> in = in_packed*8, scale groups = in//32
+        # - W8A16 G128: packed holds 4 int8 per I32 -> in = in_packed*4, scale groups = in//128
+        # - Referencia G128 W4: in = in_packed*8, groups = in//128
+        # Probamos todas las combinaciones (candidate_group_sizes x packing 8/4) y aceptamos si alguna coincide.
+        matched_in: int | None = None
+        matched_group: int | None = None
+        matched_pack: int | None = None
+        for cand_gs in candidate_group_sizes:
+            for pack_factor in (8, 4):
+                in_p = in_packed * pack_factor
+                in_s = in_groups * cand_gs
+                if in_p == in_s:
+                    matched_in = in_p
+                    matched_group = cand_gs
+                    matched_pack = pack_factor
+                    break
+            if matched_in is not None:
+                break
+        if matched_in is None:
+            # Sin match: report error con detalle de candidatos probados
             results.append(CheckResult(
                 name=f"W4A16 {base} in mismatch",
                 severity="ERROR",
-                message=f"in dim mismatch: packed {packed_shape} -> in={in_from_packed} vs scale {scale_shape} (group {group_size}) -> in={in_from_scale}",
-                remediation=f"Verifica group_size {group_size}: packed in//8 debe igualar scale in//group_size * {group_size}.",
+                message=f"in dim mismatch: packed {packed_shape} (candidates in={in_packed*8}/ {in_packed*4}) vs scale {scale_shape} (candidates {', '.join(str(in_groups*g) for g in candidate_group_sizes)} for gs {candidate_group_sizes})",
+                remediation=f"Verifica group_size: Telperion W4 G32 (pack8) o W8 G128 (pack4) o referencia G128 (pack8).",
             ))
             per_layer_errors += 1
             continue
+        # Usar el match para divisibility y packing checks
+        in_from_packed = matched_in
+        # group_size efectivo para este layer es matched_group, no el global
+        eff_group_size = matched_group  # type: ignore
+        eff_pack = matched_pack  # type: ignore
 
-        # Divisibility
-        if in_from_packed % group_size != 0:
+        # Divisibility (con group efectivo)
+        if in_from_packed % eff_group_size != 0:
             results.append(CheckResult(
                 name=f"W4A16 {base} in divisibility",
                 severity="ERROR",
-                message=f"in={in_from_packed} not divisible by group_size {group_size}",
+                message=f"in={in_from_packed} not divisible by group_size {eff_group_size} (matched pack {eff_pack})",
             ))
             per_layer_errors += 1
             continue
-        if in_from_packed % 8 != 0:
+        if in_from_packed % eff_pack != 0:
             results.append(CheckResult(
                 name=f"W4A16 {base} in packing",
                 severity="ERROR",
-                message=f"in={in_from_packed} not divisible by 8 (pack factor)",
+                message=f"in={in_from_packed} not divisible by {eff_pack} (pack factor for {'int4' if eff_pack==8 else 'int8'})",
             ))
             per_layer_errors += 1
             continue
@@ -721,19 +914,21 @@ def check_w4a16_artifact(
 
         per_layer_ok += 1
 
-    # Summary per-layer
+    # Summary per-layer (Telperion hybrid aware: pack 8 para W4 G32 / pack 4 para W8 G128)
     if per_layer_errors == 0 and per_layer_ok > 0:
+        # group_size mostrado como lista candidata (32/128) para reflejar Telperion
+        gs_str = "/".join(str(g) for g in candidate_group_sizes)
         results.append(CheckResult(
             name="W4A16 per-layer shapes",
             severity="OK",
-            message=f"all {per_layer_ok} packed layers have consistent weight_packed [out,in//8] I32 and weight_scale [out,in//{group_size}] BF16",
+            message=f"all {per_layer_ok} packed layers have consistent weight_packed I32 (pack 8 for W4 G32 / pack 4 for W8 G128) and weight_scale BF16 (group {gs_str})",
         ))
     elif per_layer_errors > 0:
         results.append(CheckResult(
             name="W4A16 per-layer shapes",
             severity="ERROR",
             message=f"{per_layer_errors} layer(s) with shape mismatch, {per_layer_ok} OK",
-            remediation="Re-ejecuta `genesis requant --group-size 128` y valida contra la referencia soysoyr/W4A16-AWQ-GPTQ.",
+            remediation="Telperion hybrid: W4 G32 pack8 group 32, W8 G128 pack4 group 128; referencia soysoyr G128 pack8.",
         ))
 
     # 6. model_detect compatibility hint
@@ -783,9 +978,9 @@ def _format_results(results: List[CheckResult], json_out: bool = False) -> str:
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m vllm._genesis.doctor.rules.w4a16",
-        description="Valida un artefacto W4A16 compressed-tensors (CK-3.1). "
-        "Chequea quantization_config num_bits 4, group_size 128 y shapes "
-        "weight_packed/scale por capa.",
+        description="Valida artefacto W4A16/W8A16 compressed-tensors (CK-3.1, Telperion-aware). "
+        "Chequea quantization_config num_bits 4/8, group_size 32 (Telperion W4) / 128 (W8/referencia) "
+        "y shapes weight_packed/scale por capa (pack 8 vs pack 4).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(

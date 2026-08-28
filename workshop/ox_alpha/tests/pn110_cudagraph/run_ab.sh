@@ -42,6 +42,11 @@ run_one() {
   docker compose -f "$COMPOSE" up -d
   sleep 5
   local json="$OUTDIR/report_${TAG}.json"
+  # Borrar el reporte previo ANTES de medir. Sin esto, si el arranque falla,
+  # bench_pn110.py no escribe nada y la comparativa de abajo imprime el JSON de
+  # una corrida ANTERIOR como si fuera de esta -- paso de verdad: se reporto
+  # sk1=97.89 tok/s de una corrida vieja cuando el server ni habia arrancado.
+  rm -f "$json"
   python3 bench_pn110.py --container "$CONT" --port 8390 --label "$TAG" \
     --prompt-decode-len 24 --gen-decode 200 --prompt-prefill-len 2000 \
     --gen-prefill 16 --requests 3 --warmup 1 --timeout 480 --req-timeout 180 \
@@ -72,7 +77,7 @@ echo "==================== COMPARATIVA PN110 (decode tok/s | TTFT s | cudagraphs
 printf "%-10s | %12s | %10s | %12s | %10s | %s\n" "CONFIG" "decode_tok/s" "TTFT_s" "prefill_tok/s" "cudagraphs" "cg_error"
 for cfg in "${CONFIGS[@]}"; do
   j="$OUTDIR/report_${cfg}.json"
-  [ -f "$j" ] || { printf "%-10s | %s\n" "$cfg" "(sin reporte)"; continue; }
+  [ -f "$j" ] || { printf "%-10s | %s\n" "$cfg" "SIN DATO (el server no arranco o el bench fallo)"; continue; }
   python3 - "$j" <<'PY'
 import json,sys
 r=json.load(open(sys.argv[1]))

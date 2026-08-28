@@ -83,31 +83,15 @@ def _fused_gate_up(gate_up_proj, x_2d: torch.Tensor) -> torch.Tensor | None:
     if getattr(gate_up_proj, "gather_output", False):
         return None
 
-    from vllm._genesis.kernels.sk05_mlp_gateup import (
-        sk05_gateup_silu_gemm,
-        sk05_permute_gateup,
-    )
+    from vllm._genesis.kernels.sk05_mlp_gateup import sk05_gateup_silu_gemm
     from vllm._genesis.kernels.sk09_norm_embed import quant_per_token
 
+    # La permutacion ya se hizo en la CARGA, dentro de _genesis_bind_super_kernel.
+    # Aca no se muta nada: cualquier escritura de estado en el forward aborta la
+    # captura de cudagraphs. Si no esta, P113 no aplica a esta capa.
     w = state.get("sk_perm_w")
     if w is None:
-        # Permutación una sola vez, al primer forward. Reemplaza al peso
-        # original (no lo duplica) y deja registrado el orden para que el
-        # camino no fusionado de PN110 pueda deshacerlo.
-        w, bs = sk05_permute_gateup(state["b_col"], state["sk_bscales"])
-        n2 = w.shape[1] // 2
-        perm = torch.empty(w.shape[1], dtype=torch.long, device=w.device)
-        idx = torch.arange(n2, dtype=torch.long, device=w.device)
-        perm[0::2] = idx
-        perm[1::2] = idx + n2
-        state["sk_perm_w"] = w
-        state["sk_perm_bs"] = bs
-        state["sk_gateup_perm"] = perm
-        state["b_col"] = w
-        state["w_int8"] = w
-        state["sk_bscales"] = bs
-        torch.cuda.empty_cache()
-        log.info("P113: gate_up permutado a pares intercalados (%s)", tuple(w.shape))
+        return None
 
     out_dtype = x_2d.dtype if x_2d.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
     a_i8, a_scales = quant_per_token(x_2d)

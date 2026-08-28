@@ -105,9 +105,9 @@ def args_kernel(mod, K, N, M, has_shift, con_residual, semilla=0, shifts=None,
     a, b, out, res, asc, bsc, rm, rn = operandos(K, N, M, con_residual, semilla=semilla)
     if shifts is None:
         nb = (N + 127) // 128
-        shifts = (torch.randint(-3, 1, (K // 128, nb), dtype=torch.int8, device="cuda")
+        shifts = (torch.rand((K // 128, nb), dtype=torch.float32, device="cuda") * 0.01 + 1e-3
                   if has_shift else
-                  torch.zeros((K // 128, nb), dtype=torch.int8, device="cuda"))
+                  torch.zeros((K // 128, nb), dtype=torch.float32, device="cuda"))
     bm, bn, bk, gm, warps, stages = cfg_de(mod, M, N)
     return [
         a, b, out, res, asc, bsc, shifts, M, N, K,
@@ -132,9 +132,9 @@ def _args_por_nombre(mod, kern, K, N, M, has_shift, con_residual, semilla,
     a, b, out, res, asc, bsc, rm, rn = operandos(K, N, M, con_residual, semilla=semilla)
     if shifts is None:
         nb = (N + 127) // 128
-        shifts = (torch.randint(-3, 1, (K // 128, nb), dtype=torch.int8, device="cuda")
+        shifts = (torch.rand((K // 128, nb), dtype=torch.float32, device="cuda") * 0.01 + 1e-3
                   if has_shift else
-                  torch.zeros((K // 128, nb), dtype=torch.int8, device="cuda"))
+                  torch.zeros((K // 128, nb), dtype=torch.float32, device="cuda"))
     bm, bn, bk, gm, warps, stages = cfg_de(mod, M, N)
     idx = torch.arange(N, dtype=torch.int32, device="cuda")
     # W4A8: peso empaquetado dos nibbles por byte -> [K//2, N], y escalas por

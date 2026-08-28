@@ -441,6 +441,17 @@ services:
       # antes de llegar a la API -- preservarlo es un parche aparte.
       - --enable-prompt-tokens-details
       - --trust-remote-code
+      # ── PROFILER (v0.27.1) ──────────────────────────────────────────────
+      # En v0.27.1 VLLM_TORCH_PROFILER_DIR YA NO EXISTE. Las rutas
+      # /start_profile y /stop_profile se registran en
+      # entrypoints/serve/profile/api_router.py:attach_router(), y SOLO si
+      # args.profiler_config.profiler is not None. Sin este flag el endpoint
+      # devuelve 404 y la traza nunca se escribe -- que es exactamente lo que
+      # pasaba con perfil_decode.sh.
+      # Inerte por defecto: PROF_KIND vacio -> profiler null -> router no montado.
+      # Para perfilar: PROF_KIND='"torch"' PROF_DIR=/traces/<label>
+      - --profiler-config
+      - '{"profiler": ${PROF_KIND:-null}, "torch_profiler_dir": "${PROF_DIR:-}", "torch_profiler_with_stack": false, "torch_profiler_record_shapes": false, "torch_profiler_use_gzip": true, "ignore_frontend": true, "delay_iterations": ${PROF_DELAY:-0}, "max_iterations": ${PROF_MAX:-0}}'
       - --attention-backend
       - FLASHINFER
       - --moe-backend

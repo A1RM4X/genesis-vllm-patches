@@ -496,11 +496,12 @@ def mlp_down_w4a8_scaled_residual(
 ) -> torch.Tensor:
     """Capa completa down_proj W4A8: quant -> GEMM -> all_reduce -> residual."""
     a, a_scales = sk06_mlp_down_w4a8_quant(act)
-    if not do_allreduce:
+    if not do_allreduce or not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return sk06_mlp_down_w4a8_gemm(a, w_packed, a_scales, w_scales, residual, out_dtype)
     out = sk06_mlp_down_w4a8_gemm(a, w_packed, a_scales, w_scales, None, out_dtype)
     torch.distributed.all_reduce(out)
-    out.add_(residual)
+    if residual is not None:
+        out.add_(residual)
     return out
 
 

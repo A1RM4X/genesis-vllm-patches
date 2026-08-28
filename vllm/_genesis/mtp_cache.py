@@ -145,8 +145,15 @@ import time
 from typing import Any, Iterable, Iterator, Tuple
 
 import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
+
+try:
+    from safetensors import safe_open  # type: ignore
+    from safetensors.torch import save_file  # type: ignore
+    _SAFETENSORS_AVAILABLE = True
+except ImportError:  # pragma: no cover - CPU-only env sin safetensors (Telperion 22G, contenedores apagados)
+    safe_open = None  # type: ignore
+    save_file = None  # type: ignore
+    _SAFETENSORS_AVAILABLE = False
 
 try:
     from vllm.logger import init_logger
@@ -159,7 +166,13 @@ GENESIS_CACHE_VERSION = "v1.0"
 
 
 def compute_file_hash(filepath: str) -> str:
-    """Compute a fast SHA256 fingerprint from file metadata and boundary chunks."""
+    """Compute a fast SHA256 fingerprint from file metadata and boundary chunks.
+
+    Telperion: checkpoint pack-quantized (compressed-tensors) usa este hash para
+    la clave de cache MTP. En Telperion 22G descargado vLLM 0.23.0 con contenedores
+    apagados (nvidia 1MiB), el hash se valida offline sin GPU. Si el archivo
+    no existe devuelve "missing" (auditoria B4).
+    """
     # [B4] Devolver "missing" como si fuera un hash válido es lo que vuelve hueco
     # todo el fingerprint: el llamador la concatena en la clave sin darse cuenta
     # de que no se leyó ningún peso. Debería ser una excepción, o al menos forzar
@@ -183,7 +196,12 @@ def compute_file_hash(filepath: str) -> str:
 
 
 def quantize_linear_weight_int8(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize 2D linear weight matrix to symmetric INT8 with per-channel scales."""
+    """Quantize 2D linear weight matrix to symmetric INT8 with per-channel scales.
+
+    Comportamiento Telperion: W4A16 G32 (layers 0-55 MLP) y W8A16 G128 (attn + layers 56-63)
+    usan este quant per-channel para MTP draft. En CPU sin GPU (contenedores apagados)
+    valida roundtrip sin levantar vLLM.
+    """
     # [GRANULARIDAD] RTN absmax per-row, sin calibración. Si el checkpoint de
     # origen es Block-FP8 con escalas 128x128, esto es un DOWNGRADE de esquema:
     # cambia una escala por bloque por una escala por canal de salida. La
@@ -201,7 +219,11 @@ def quantize_linear_weight_int8(weight: torch.Tensor) -> Tuple[torch.Tensor, tor
 
 
 def dequantize_linear_weight_int8(qweight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize INT8 weight back to target float precision (FP16/BF16) on GPU."""
+    """Dequantize INT8 weight back to target float precision (FP16/BF16) on GPU.
+
+    Inverso de quantize_linear_weight_int8. En Telperion (W4A16 G32 asym + W8A16 G128 sym)
+    el dequant se testea en CPU para no requerir GPU ni contenedor.
+    """
     # [B2] ⚠️ ESTA FUNCIÓN ES EL PROBLEMA CENTRAL DEL PARCHE.
     # Se la llama en los DOS caminos (cache HIT y cache MISS) antes de entregar
     # los pesos al loader de vLLM. Resultado: el INT8 sólo existe en el archivo
@@ -214,7 +236,13 @@ def dequantize_linear_weight_int8(qweight: torch.Tensor, scale: torch.Tensor, dt
 
 
 class MTPQuantDiskCacheManager:
-    """Manages disk caching and loading of quantized MTP draft weights."""
+    """Manages disk caching and loading of quantized MTP draft weights.
+
+    En modo loop-fix sin GPU (Telperion 22G, vLLM 0.23.0, PN110 diádico no aplica),
+    funciona CPU-only: si safetensors no está instalado degrada a passthrough sin
+    cuantizar, evitando failures en CI offline. En PROD con GPU y safetensors,
+    mantiene cache MTP INT8 para draft layers.
+    """
 
     def __init__(
         self,
@@ -252,13 +280,25 @@ class MTPQuantDiskCacheManager:
         weights: Iterable[Tuple[str, torch.Tensor]],
         target_dtype: torch.dtype = torch.float16,
     ) -> Iterator[Tuple[str, torch.Tensor]]:
-        """Processes weights with Cache Hit / Cache Miss logic."""
+        """Processes weights with Cache Hit / Cache Miss logic.
+
+        Telperion-aware: si safetensors no está disponible (CPU-only .venv sin
+        dependencia) hace passthrough directo sin cache, evitando import failures.
+        En Telperion real (W4A16 G32, W8A16 G128, BF16 ignore visual) el draft MTP
+        es BF16/FP16; este path solo aplica cuando backbone es W4A16/W8A16.
+        """
         # [B5] El wiring nunca pasa target_dtype → siempre gana este default.
         # Un engine en bfloat16 recibiría pesos fp16 sin ningún aviso.
         # [B1] Acá falta el guard de aplicabilidad: antes de tocar nada habría
         # que inspeccionar el stream y hacer no-op si los pesos YA vienen
         # cuantizados (F8_E4M3 / I8, o con `*_scale_inv` acompañantes).
         if not self.enabled:
+            for name, weight in weights:
+                yield name, weight
+            return
+        # Safetensors no disponible en .venv CPU-only (Telperion offline) -> passthrough
+        if not _SAFETENSORS_AVAILABLE or safe_open is None or save_file is None:  # type: ignore
+            log.debug("[Genesis MTP Cache] safetensors no disponible, passthrough sin cache (CPU-only)")
             for name, weight in weights:
                 yield name, weight
             return

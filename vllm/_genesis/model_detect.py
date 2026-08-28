@@ -341,7 +341,18 @@ def _probe_quant_format(cfg: Any, hf_config: Any) -> str:
 
 def _refine_compressed_tensors_format(hf_config: Any) -> str:
     """When quantization id is 'compressed-tensors', look at inner
-    config_groups[*].weights to discriminate fp8 vs int8 vs int4."""
+    config_groups[*].weights to discriminate fp8 vs int8 vs int4.
+
+    Telperion-aware: detecta hibrido W4A16 G32 + W8A16 G128 (TelperionAI/
+    Qwen3.8-27B-INT4-AWQ-GPTQ-gdn4, pack-quantized 22G, vLLM 0.23.0) donde
+    group_0 es int4 G32 asym (layers 0-55 MLP + linear_attn) y group_1 es
+    int8 G128 sym (attn + layers 56-63). En ese caso retorna "compressed_tensors"
+    generico para no ocultar la mitad W8 cuando solo se mira primer grupo.
+    En mono-grupo mantiene discriminacion fp8/int8/int4 como antes.
+
+    Soporta G32 y G128 para W4A16 (Telperion G32 vs referencia G128 soysoyr).
+    No levanta vLLM en GPU; solo inspecciona config.json sin torch.
+    """
     try:
         qcfg = getattr(hf_config, "quantization_config", None)
         if qcfg is None and isinstance(hf_config, dict):
@@ -354,8 +365,9 @@ def _refine_compressed_tensors_format(hf_config: Any) -> str:
         )
         if not groups:
             return "compressed_tensors"
-        # Take the first group's weights spec (reasonable default — model-wide
-        # mixed quant is rare; we report the dominant format).
+        # Recolectar todos los grupos para detectar hibrido Telperion (W4+W8)
+        seen_formats: set[str] = set()
+        first_bits: int | None = None
         for _gname, gspec in (groups.items() if isinstance(groups, dict) else []):
             weights = (
                 gspec.get("weights") if isinstance(gspec, dict)
@@ -376,13 +388,26 @@ def _refine_compressed_tensors_format(hf_config: Any) -> str:
                 wbits_i = int(wbits) if wbits is not None else None
             except Exception:
                 wbits_i = None
+            if first_bits is None:
+                first_bits = wbits_i
             if "float" in wtype_s and wbits_i == 8:
-                return "fp8"
-            if "int" in wtype_s and wbits_i == 8:
-                return "int8_w8a16"
-            if "int" in wtype_s and wbits_i == 4:
-                return "int4_w4a16"
-            break
+                seen_formats.add("fp8")
+            elif "int" in wtype_s and wbits_i == 8:
+                seen_formats.add("int8_w8a16")
+            elif "int" in wtype_s and wbits_i == 4:
+                seen_formats.add("int4_w4a16")
+            # else unknown
+        # Hibrido W4+W8 (Telperion) -> generico para no perder info
+        if len(seen_formats) > 1:
+            # Telperion típico: {"int4_w4a16","int8_w8a16"} -> compressed_tensors
+            return "compressed_tensors"
+        # Mono-formato: discriminar como antes (compatible referencia G128 y Telperion G32)
+        if "fp8" in seen_formats:
+            return "fp8"
+        if "int8_w8a16" in seen_formats:
+            return "int8_w8a16"
+        if "int4_w4a16" in seen_formats:
+            return "int4_w4a16"
     except Exception as e:
         log.debug("compressed_tensors probe failed: %s", e, exc_info=True)
     return "compressed_tensors"
