@@ -170,7 +170,19 @@ def _args_por_nombre(mod, kern, K, N, M, has_shift, con_residual, semilla,
 
 
 def _constexprs(kern):
-    """Los constexpr que este kernel realmente declara (varian entre SKs)."""
+    """Los constexpr que este kernel declara, sacados de la FIRMA real.
+
+    Clasificarlos por nombre estaba mal: ``K`` es ``tl.constexpr`` en el gated
+    delta rule de SK-08 y un argumento runtime en todos los kernels de quant.
+    Con la lista fija de nombres, Triton recibia K posicional y por keyword a la
+    vez ("got multiple values for argument 'K'").
+    """
+    params = getattr(kern, "params", None)
+    if params is None:
+        params = getattr(getattr(kern, "fn", None), "params", None)
+    if params:
+        return [p.name for p in params if getattr(p, "is_constexpr", False)]
+    # Sin `params` (versiones viejas de Triton): heuristica por nombre.
     return [n for n in nombres_args(kern)
             if n in ("BLOCK_M", "BLOCK_N", "BLOCK_S", "BLOCK_K", "GROUP_M",
                      "SHIFT_BLOCK", "HAS_SHIFT", "SPLIT_K")]
@@ -534,11 +546,7 @@ def compilar_quant(mod, kern, K, eps, gamma=0.0, con_sp=False):
     if faltan0:
         raise KeyError("quant %s: no se como armar %s" % (kern.__name__, faltan0))
     args = [tabla[n] for n in nombres]
-    ce = [n for n in nombres
-          if str(h0.get(n, "")) == "constexpr"] if False else \
-        [n for n in nombres if n in ("BLOCK", "EPS", "GAMMA_OFFSET", "WIDTH",
-                                     "BLOCK_D", "SCALE", "H", "HV", "K", "V",
-                                     "SOFTPLUS_THRESHOLD")]
+    ce = _constexprs(kern)
     pos = args[:len(nombres) - len(ce)]
     nw, ns = (8, 2) if "conv1d" in nk else (4, 1) if "_sk08_" in nk else (8, 1)
     h = kern[grid_esp or (M,)](*pos, **{n: tabla[n] for n in ce},
@@ -561,6 +569,10 @@ def compilar_quant(mod, kern, K, eps, gamma=0.0, con_sp=False):
                         if any(x2[0] == "tt.divisibility" for x2 in a)
                         and i in orden and i in enteros),
         "nombres": nombres, "ce": ce, "gamma": gamma, "con_sp": con_sp,
+        # Tipo python REAL de cada arg, para anotar el custom op. Deducirlo por
+        # nombre fallaba: GAMMA_OFFSET es float y quedaba declarado SymInt, y
+        # el registro moria con "Unable to cast Python instance of type float".
+        "tipos": {nm: type(tabla[nm]).__name__ for nm in nombres},
     }
 
 
@@ -571,28 +583,75 @@ def _params(ptx):
 
 
 def bloque_quant(mod_nombre, kernel, v, n=0) -> str:
-    """Emite el PTX del quant, su descriptor y el respaldo Triton."""
-    return ('\n\n# --- quant: PTX embebido (E1=%d lop3, E2=%d mul) ---\n\n'
-            '_QPTX%d = r"""%s"""\n\n'
-            '_QVAR%d = _Nativo(\n    "%s/%s",\n    _QPTX%d, %r,\n'
-            '    warps=%d, shared=%d,\n    abi=%r,\n    horneado=%r,\n'
-            '    div16=%r,\n)\n\n\n'
-            'def _lanzar_quant%d(grid, *args):\n'
-            '    """PTX embebido; cae al Triton si el kill-switch esta puesto.\n\n'
-            '    Con ``GENESIS_PTQ_NATIVO=0`` va por el kernel Triton, que queda\n'
-            '    en este archivo como referencia para los tests. Si los valores\n'
-            '    horneados no coinciden (otro K, otro eps), ``_Nativo`` levanta\n'
-            '    ValueError en vez de dar un numero mal en silencio.\n    """\n'
-            '    if habilitado():\n'
-            '        return _QVAR%d(grid, *args)\n'
-            '    ce = %r\n'
-            '    nom = %r\n'
-            '    return %s[grid](*args[:len(nom) - len(ce)],\n'
-            '                    **{n: args[nom.index(n)] for n in ce},\n'
-            '                    num_warps=8, num_stages=1)\n'
-            % (v["e1"], v["e2"], n, v["ptx"], n, mod_nombre, v["entry"], n,
-               v["entry"], v["warps"], v["shared"], v["orden"], v["horneado"],
-               v["div16"], n, n, v["ce"], v["nombres"], kernel))
+    """Emite el PTX del quant, su descriptor, el custom op y el respaldo Triton.
+
+    El lanzamiento va DETRAS de ``direct_register_custom_op`` y no se llama
+    directo. Razon, medida contra el server: estos kernels corren dentro del
+    forward que vLLM compila con ``fullgraph=True``, y un lanzamiento crudo por
+    ctypes no es trazable por dynamo. Sin el custom op el arranque muere en
+    ``profile_run``, primero con "Dynamo does not know how to enter a `lock`
+    context manager" y, sacado el lock, con "Skip inlining
+    torch.compiler.disable()'d function", porque fullgraph no admite cortes de
+    grafo. El custom op lo vuelve opaco sin romper el grafo: es lo mismo que
+    hace sk_ops.py con los GEMM, y por eso los GEMM si pasaban.
+    """
+    nombres, ce = v["nombres"], v["ce"]
+    salidas = [x for x in nombres
+               if x in ("q_ptr", "s_ptr", "out_ptr", "o_ptr", "state_ptr")]
+
+    tipos = v.get("tipos", {})
+
+    def anota(nm):
+        t = tipos.get(nm, "")
+        if t == "Tensor" or nm.endswith("_ptr"):
+            return "%s: torch.Tensor" % nm
+        if t == "float":
+            return "%s: float" % nm
+        return "%s: int" % nm
+
+    firma = ", ".join(anota(x) for x in nombres)
+    paso = ", ".join(nombres)
+    op = "genesis_%s_q%d" % (mod_nombre.replace(".", "_"), n)
+    d = {"n": n, "ptx": v["ptx"], "mod": mod_nombre, "entry": v["entry"],
+         "warps": v["warps"], "shared": v["shared"], "abi": v["orden"],
+         "horn": v["horneado"], "div16": v["div16"], "e1": v["e1"],
+         "e2": v["e2"], "firma": firma, "paso": paso, "op": op,
+         "sal": salidas, "ce": ce, "nombres": nombres, "kernel": kernel}
+    return (
+        '\n\n# --- quant: PTX embebido (E1=%(e1)d lop3, E2=%(e2)d mul) ---\n\n'
+        '_QPTX%(n)d = r"""%(ptx)s"""\n\n'
+        '_QVAR%(n)d = _Nativo(\n    "%(mod)s/%(entry)s",\n'
+        '    _QPTX%(n)d, "%(entry)s",\n'
+        '    warps=%(warps)d, shared=%(shared)d,\n    abi=%(abi)r,\n'
+        '    horneado=%(horn)r,\n    div16=%(div16)r,\n)\n\n\n'
+        'def _q%(n)d_impl(grid: list[int], %(firma)s) -> None:\n'
+        '    """Cuerpo del custom op: lanza el PTX embebido."""\n'
+        '    _QVAR%(n)d(tuple(grid), %(paso)s)\n\n\n'
+        'def _q%(n)d_fake(grid: list[int], %(firma)s) -> None:\n'
+        '    """Meta impl: no toca la GPU; las salidas se mutan in-place."""\n'
+        '    return None\n\n\n'
+        '# Registro AL IMPORTAR, no en el primer uso: direct_register_custom_op\n'
+        '# llama a torch._library.infer_schema, que dynamo se niega a trazar\n'
+        '# ("Attempted to call function marked as skipped"). Si el registro\n'
+        '# cae dentro del forward compilado, el arranque muere en profile_run.\n'
+        '# El hasattr evita el choque cuando el modulo se importa dos veces\n'
+        '# con nombres distintos, como hace el gate de tools/monolitizar.py.\n'
+        'if not hasattr(torch.ops.vllm, "%(op)s"):\n'
+        '    from vllm.utils.torch_utils import direct_register_custom_op\n'
+        '    direct_register_custom_op(\n'
+        '        op_name="%(op)s",\n        op_func=_q%(n)d_impl,\n'
+        '        mutates_args=%(sal)r,\n        fake_impl=_q%(n)d_fake,\n    )\n\n\n'
+        'def _lanzar_quant%(n)d(grid, *args):\n'
+        '    """PTX embebido via custom op; cae al Triton con el kill-switch.\n\n'
+        '    ``GENESIS_PTQ_NATIVO=0`` vuelve al kernel Triton, que queda en este\n'
+        '    archivo como referencia para los tests.\n    """\n'
+        '    if habilitado():\n'
+        '        g = [grid] if isinstance(grid, int) else list(grid)\n'
+        '        return torch.ops.vllm.%(op)s(g, *args)\n'
+        '    ce = %(ce)r\n    nom = %(nombres)r\n'
+        '    return %(kernel)s[grid](*args[:len(nom) - len(ce)],\n'
+        '                    **{n: args[nom.index(n)] for n in ce},\n'
+        '                    num_warps=8, num_stages=1)\n' % d)
 
 
 def gate_sk08(orig, nuevo, kern, v, n=0):

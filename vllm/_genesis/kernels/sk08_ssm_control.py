@@ -1176,14 +1176,13 @@ def _q0_fake(grid: list[int], x_ptr: torch.Tensor, w_ptr: torch.Tensor, bias_ptr
     return None
 
 
-_q0_registrado = False
-
-
-def _q0_registrar() -> None:
-    """Registra el op una sola vez, fuera de la region compilada."""
-    global _q0_registrado
-    if _q0_registrado:
-        return
+# Registro AL IMPORTAR, no en el primer uso: direct_register_custom_op
+# llama a torch._library.infer_schema, que dynamo se niega a trazar
+# ("Attempted to call function marked as skipped"). Si el registro cae
+# dentro del forward compilado, el arranque muere en profile_run.
+# El hasattr evita el choque cuando el modulo se importa dos veces con
+# nombres distintos, como hace el gate de tools/monolitizar.py.
+if not hasattr(torch.ops.vllm, "genesis_sk08_ssm_control_q0"):
     from vllm.utils.torch_utils import direct_register_custom_op
     direct_register_custom_op(
         op_name="genesis_sk08_ssm_control_q0",
@@ -1191,7 +1190,6 @@ def _q0_registrar() -> None:
         mutates_args=['state_ptr', 'out_ptr'],
         fake_impl=_q0_fake,
     )
-    _q0_registrado = True
 
 
 def _lanzar_quant0(grid, *args):
@@ -1201,7 +1199,6 @@ def _lanzar_quant0(grid, *args):
     archivo como referencia para los tests.
     """
     if habilitado():
-        _q0_registrar()
         g = [grid] if isinstance(grid, int) else list(grid)
         return torch.ops.vllm.genesis_sk08_ssm_control_q0(g, *args)
     ce = ['WIDTH', 'BLOCK_D']
@@ -4934,14 +4931,13 @@ def _q1_fake(grid: list[int], qkv_ptr: torch.Tensor, a_ptr: torch.Tensor, b_ptr:
     return None
 
 
-_q1_registrado = False
-
-
-def _q1_registrar() -> None:
-    """Registra el op una sola vez, fuera de la region compilada."""
-    global _q1_registrado
-    if _q1_registrado:
-        return
+# Registro AL IMPORTAR, no en el primer uso: direct_register_custom_op
+# llama a torch._library.infer_schema, que dynamo se niega a trazar
+# ("Attempted to call function marked as skipped"). Si el registro cae
+# dentro del forward compilado, el arranque muere en profile_run.
+# El hasattr evita el choque cuando el modulo se importa dos veces con
+# nombres distintos, como hace el gate de tools/monolitizar.py.
+if not hasattr(torch.ops.vllm, "genesis_sk08_ssm_control_q1"):
     from vllm.utils.torch_utils import direct_register_custom_op
     direct_register_custom_op(
         op_name="genesis_sk08_ssm_control_q1",
@@ -4949,7 +4945,6 @@ def _q1_registrar() -> None:
         mutates_args=['state_ptr', 'o_ptr'],
         fake_impl=_q1_fake,
     )
-    _q1_registrado = True
 
 
 def _lanzar_quant1(grid, *args):
@@ -4959,7 +4954,6 @@ def _lanzar_quant1(grid, *args):
     archivo como referencia para los tests.
     """
     if habilitado():
-        _q1_registrar()
         g = [grid] if isinstance(grid, int) else list(grid)
         return torch.ops.vllm.genesis_sk08_ssm_control_q1(g, *args)
     ce = ['SCALE', 'H', 'HV', 'K', 'V', 'SOFTPLUS_THRESHOLD']

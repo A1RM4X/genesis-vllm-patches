@@ -435,9 +435,23 @@ class _Nativo:
         self._mod = None
 
     def _cargar(self):
-        """Ensambla y carga el modulo una sola vez (thread-safe)."""
-        if self._fn is not None:
-            return
+        """Camino rapido: si ya esta cargado no hace nada.
+
+        El ensamblado vive aparte y marcado con ``torch.compiler.disable``
+        porque usa un lock, y dynamo no sabe entrar a un context manager de
+        `lock`: falla con "Unsupported context manager". El lanzamiento cae
+        DENTRO de la region que vLLM compila (el forward del modelo), asi que
+        con el `with` en el camino trazado el arranque se muere en
+        ``profile_run`` -> ``_dummy_run``. Medido: ensamblar y cargar cuesta
+        ~25 ms por variante y pasa una sola vez, asi que el corte de grafo del
+        camino lento no se paga en regimen.
+        """
+        if self._fn is None:
+            self._ensamblar_y_cargar()
+
+    @torch.compiler.disable
+    def _ensamblar_y_cargar(self):
+        """Ensambla con ptxas y carga el modulo. Una sola vez, thread-safe."""
         with _cerrojo:
             if self._fn is not None:
                 return
