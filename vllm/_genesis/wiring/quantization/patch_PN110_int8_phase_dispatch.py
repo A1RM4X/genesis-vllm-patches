@@ -2932,6 +2932,13 @@ def _build_int8_state(
         w_scales = torch.ones((N, 1), dtype=torch.float32, device=device)
         b_scales = torch.ones((1, N), dtype=torch.float32, device=device)
 
+        # Referencia para el diagnostico de extremo a extremo: el peso fp8
+        # dequantizado, en [K,N]. Sólo con GENESIS_PN110_DIAG_REF=1, porque son
+        # ~170 MB por capa; usarlo siempre con MAX_LAYERS chico.
+        _diag_wref = None
+        if os.environ.get("GENESIS_PN110_DIAG_REF", "") == "1":
+            _diag_wref = w_fp32_tiles.permute(0, 2, 1, 3).reshape(K, N).contiguous()
+
         # Diagnostico de carga (GENESIS_PN110_DIAG_SK=1): valida la
         # cuantizacion Y el layout contra el peso fp8 de origen, con los
         # tensores que realmente entrega vLLM. Una vez por forma.
@@ -2964,6 +2971,7 @@ def _build_int8_state(
             "w_int8": b_col,
             "w_scales": w_scales,
             "w_shifts": block_scales,
+            "diag_wref": _diag_wref,
             "b_col": b_col,
             "b_scales": b_scales,
             "bias_ref_ok": bias_ref_ok,
@@ -4121,6 +4129,36 @@ def _make_apply_wrapper(original, cls):
                     state["sk_op_id"],
                     out_dtype,
                 )
+                # Diagnostico de extremo a extremo con la activacion REAL: es
+                # lo unico que los tests offline no pueden ver, porque usan
+                # gaussianas. Compara el camino INT8 completo (quant per-token
+                # + GEMM) contra x @ dequant(peso fp8).
+                #
+                # Tiene side-effect y corre DENTRO de la region trazada, asi
+                # que aborta la captura de cudagraphs: usar sólo en una corrida
+                # de diagnostico, con --enforce-eager y MAX_LAYERS chico.
+                _wref = state.get("diag_wref")
+                if _wref is not None and not state.get("_diag_hecho"):
+                    state["_diag_hecho"] = True
+                    try:
+                        _ref = x_2d.to(torch.float32) @ _wref
+                        _got = out.to(torch.float32)
+                        _cos = torch.nn.functional.cosine_similarity(
+                            _ref.flatten(), _got.flatten(), dim=0).item()
+                        _esc = (_got.abs().mean()
+                                / _ref.abs().mean().clamp_min(1e-30)).item()
+                        _out_ratio = (x_2d.to(torch.float32).abs().amax(1)
+                                      / x_2d.to(torch.float32).abs()
+                                      .median(1).values.clamp_min(1e-30)).mean().item()
+                        log.warning(
+                            "DIAG_REF %s M=%d | cos(INT8,fp8ref)=%.6f escala=%.4f | "
+                            "x amax/mediana=%.1f | a_scales min=%.3g max=%.3g | %s",
+                            _genesis_layer_name(layer) or "?", x_2d.shape[0],
+                            _cos, _esc, _out_ratio,
+                            a_scales.min().item(), a_scales.max().item(),
+                            "OK" if _cos > 0.99 else "*** LA CAPA MIENTE ***")
+                    except Exception as _e:
+                        log.warning("DIAG_REF fallo: %s: %s", type(_e).__name__, _e)
                 return out.reshape(*x.shape[:-1], -1)
             out = int8_linear(
                 a_i8,

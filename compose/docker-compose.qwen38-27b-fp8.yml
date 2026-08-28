@@ -279,11 +279,16 @@ services:
       - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=1
       # PN110 (2026-08-25): Requant FP8→INT8 W8A8 por capa con swap 1:1 (b_col
       # column-major, chunked 512, excluye GDN/mamba, invalida cache Dynamo).
-      # A/B prefill 2×8000 tokens en lab TP=2 (0.80 util): wall 7.21s -> 5.56s
-      # (-23%, 17.8 -> 23.0 tps). Sin OOM tras fix nn.Parameter. Queda pendiente
-      # gate CK-2.4 completo (tool-calls 10/10 y TTFT 126k) antes de considerar
-      # promoción definitiva, pero el prefill ya rinde para cargas largas.
-      - GENESIS_ENABLE_PN110_INT8_PHASE_DISPATCH=1
+      - GENESIS_ENABLE_PN110_INT8_PHASE_DISPATCH=${PN110_ENABLE:-1}
+      - GENESIS_DISABLE_PN110=${PN110_DISABLE:-0}
+      - GENESIS_PN110_SK=${PN110_SK:-0}
+      - GENESIS_PN110_SK_ONLY=${PN110_SK_ONLY:-}
+      - GENESIS_PN110_SK_SKIP=${PN110_SK_SKIP:-}
+      - GENESIS_PN110_SWAP_ONLY_SK=${PN110_SWAP_ONLY_SK:-1}
+      - GENESIS_PN110_MAX_LAYERS=${PN110_MAX_LAYERS:-}
+      - GENESIS_PN110_LAYER_INDEX=${PN110_LAYER_INDEX:-}
+      - GENESIS_PN110_EXCLUDE_LAYERS=${PN110_EXCLUDE:-mtp.layers}
+      - GENESIS_PN110_DIAG_REF=${PN110_DIAG_REF:-0}
       # B3 (2026-08-25): Custom all-reduce TP=2 fast path con fallback robusto
       # (P2P PIX entre las dos 3090). Sin esto vLLM usa PYNCCL genérico.
       # A/B aislado PN110 solo (2026-08-25): B2/B3/B5/B7 apagados para medir delta real
@@ -554,9 +559,9 @@ services:
       # (custom_all_reduce.cuh:455 'invalid argument'), ver la nota de arriba.
       - --tensor-parallel-size
       - "2"
-      # Contexto máximo soportado de 262K tokens
+      # Contexto máximo soportado (default 32k para fit seguro de KV cache en FP8)
       - --max-model-len
-      - "262144"
+      - ${MAX_MODEL_LEN:-32768}
       # Asignación de VRAM por GPU para pesas + pool de KV Cache (97.5% de 24GB)
       # 0.965 -> 0.82 al activar el offloading. --enable-cumem-allocator (que
       # OffloadingConnector exige) hace que el profiler SOBREESTIME el KV
