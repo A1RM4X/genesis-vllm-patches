@@ -538,6 +538,55 @@ def _genesis_sk_for_layer(layer, K: int, N: int) -> tuple[str, bool]:
     return sk, sk_id in _sk_gemm_table()
 
 
+_DIAG_SK_VISTAS: set = set()
+_DIAG_Q_VISTAS: set = set()
+
+
+def _sk_shifts_para(sk_id, w_shifts, K: int, N: int, device):
+    """Normaliza ``w_shifts`` al tensor fp32 que espera CADA familia de kernel.
+
+    Dos cosas que no coinciden y hay que reconciliar acá, en la carga, porque
+    el forward no puede ramificar:
+
+    1. **El dtype.** Los cubins tienen el puntero de shifts especializado a
+       fp32. Pasarles el int8 del diseño diádico lee 4x fuera de rango y
+       devuelve NaN, en silencio.
+    2. **La semántica del bucle.** SK-05 y SK-07 nunca se migraron del diseño
+       diádico: su bucle hace ``acc += d * exp2(sh)``. Las otras seis familias
+       hacen ``acc += d * sh``, con el factor directo.
+
+    Con la cuantización por bloques 128x128, ``w_shifts`` es el factor fp32 y
+    ``b_scales`` viene en unos. Alimentar ese factor a un bucle que le aplica
+    ``exp2`` da ``exp2(1e-3) ~= 1.0007``, o sea el factor del bloque
+    desaparece y la salida sale a ~1000x de escala. Es lo que rompía el
+    gate_up de las 64 capas.
+
+    La solución no toca ningún asm: se le pasa ``log2(factor)`` a las dos
+    familias que hacen ``exp2``, y el ``exp2`` del bucle lo deshace. El error
+    de ida y vuelta en fp32 es ~2**-22, contra los 8 bits de mantisa de la
+    salida en bf16.
+
+    :param sk_id: id de familia, ``"SK-01"`` .. ``"SK-10"``.
+    :param w_shifts: el tensor del estado, o ``None`` si la capa no tiene.
+    :param K: dimensión de contracción, per-rank.
+    :param N: columnas, per-rank.
+    :param device: device del peso.
+    :returns: tensor fp32 [K/128, N/128] contiguo.
+    """
+    hace_exp2 = sk_id in ("SK-05", "SK-07")
+    if w_shifts is None:
+        # Factor neutro. Para las de exp2, ``exp2(0) = 1``; para las otras,
+        # ``_has_shift`` da False y el bucle ni lee el tensor.
+        return torch.zeros((K // 128, N // 128), dtype=torch.float32,
+                           device=device)
+    f = w_shifts.to(torch.float32)
+    if not w_shifts.is_floating_point():
+        # Diseño C diádico: el tensor son exponentes enteros.
+        return (f if hace_exp2 else torch.exp2(f)).contiguous()
+    # Cuantización por bloques: el tensor YA es el factor.
+    return (torch.log2(f) if hace_exp2 else f).contiguous()
+
+
 def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
     """Resuelve el super kernel de la capa y deja el callable en el estado.
 
@@ -580,9 +629,7 @@ def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
     b_col = state.get("b_col", state.get("w_int8"))
     if b_scales is None or b_col is None:
         return sk
-    shifts = state.get("w_shifts")
-    if shifts is None:
-        shifts = torch.zeros((K // 128, N // 128), dtype=torch.float32, device=b_col.device)
+    shifts = _sk_shifts_para(sk_id, state.get("w_shifts"), K, N, b_col.device)
     state["sk_id"] = sk_id
     state["sk_fn"] = fn
     # id entero para el custom op. El callable directo NO se puede llamar desde
@@ -633,6 +680,39 @@ def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
     state["sk_zero"] = torch.zeros(
         1, dtype=torch.bfloat16, device=b_col.device
     ).as_strided((1, 1), (0, 0))
+    # Diagnostico opcional (GENESIS_PN110_DIAG_SK=1): una vez por familia,
+    # corre el GEMM SK y el hibrido sobre el MISMO input y loguea la razon.
+    # Corre en la CARGA, no en el forward, asi que no toca cudagraphs.
+    if os.environ.get("GENESIS_PN110_DIAG_SK", "") == "1" and sk_id not in _DIAG_SK_VISTAS:
+        _DIAG_SK_VISTAS.add(sk_id)
+        try:
+            from vllm._genesis.kernels.sk_ops import sk_gemm_op as _sk_op
+            from vllm._genesis.kernels.int8_hybrid_gemm import int8_hybrid_gemm as _hib
+            _M = 16
+            _a = torch.randint(-127, 127, (_M, K), dtype=torch.int8,
+                               device=b_col.device)
+            _asc = torch.full((_M,), 0.01, dtype=torch.float32, device=b_col.device)
+            _sk_out = _sk_op(_a, b_col, _asc, b_scales.reshape(-1),
+                             shifts.contiguous(), state["sk_zero"],
+                             SK_POR_ID.get(sk_id, 0), torch.bfloat16).float()
+            _wsh = state.get("w_shifts")
+            if _wsh is None:
+                _wsh = torch.zeros((K // 128, N // 128), dtype=torch.float32,
+                                   device=b_col.device)
+            _hb_out = _hib(_a, b_col, _asc, b_scales.reshape(-1), _wsh,
+                           torch.float32)
+            _cos = torch.nn.functional.cosine_similarity(
+                _sk_out.flatten(), _hb_out.flatten(), dim=0).item()
+            _esc = (_sk_out.abs().mean() / _hb_out.abs().mean().clamp_min(1e-30)).item()
+            log.warning(
+                "DIAG_SK %s K=%d N=%d | cos(SK,hibrido)=%.6f escala=%.4f | "
+                "shifts dtype=%s min=%.4g max=%.4g | bscales min=%.4g max=%.4g | %s",
+                sk_id, K, N, _cos, _esc,
+                shifts.dtype, shifts.min().item(), shifts.max().item(),
+                b_scales.min().item(), b_scales.max().item(),
+                "OK" if _cos > 0.99 and 0.9 < _esc < 1.1 else "*** DIFIEREN ***")
+        except Exception as _e:
+            log.warning("DIAG_SK %s fallo: %s: %s", sk_id, type(_e).__name__, _e)
     # SK-07 cachea un arange por (device, vocab); se precalienta acá para que el
     # camino caliente no aloje ni mute nada.
     if sk_id == "SK-07":
@@ -2851,6 +2931,32 @@ def _build_int8_state(
 
         w_scales = torch.ones((N, 1), dtype=torch.float32, device=device)
         b_scales = torch.ones((1, N), dtype=torch.float32, device=device)
+
+        # Diagnostico de carga (GENESIS_PN110_DIAG_SK=1): valida la
+        # cuantizacion Y el layout contra el peso fp8 de origen, con los
+        # tensores que realmente entrega vLLM. Una vez por forma.
+        if os.environ.get("GENESIS_PN110_DIAG_SK", "") == "1" and (K, N) not in _DIAG_Q_VISTAS:
+            _DIAG_Q_VISTAS.add((K, N))
+            try:
+                _ref = w_fp32_tiles.permute(0, 2, 1, 3).reshape(K, N)
+                _rec = (w_i8_tiles.to(torch.float32)
+                        * block_scales.unsqueeze(-1).unsqueeze(-1)
+                        ).permute(0, 2, 1, 3).reshape(K, N)
+                _cosq = torch.nn.functional.cosine_similarity(
+                    _ref.flatten(), _rec.flatten(), dim=0).item()
+                # b_col es lo que consume el GEMM: tiene que coincidir con w_i8.
+                _cosb = torch.nn.functional.cosine_similarity(
+                    b_col.to(torch.float32).flatten(), w_i8.to(torch.float32).flatten(),
+                    dim=0).item()
+                log.warning(
+                    "DIAG_Q K=%d N=%d | w_fp8 %s %s | scale_inv %s %s | "
+                    "cos(recon,ref)=%.6f cos(b_col,w_i8)=%.6f | %s",
+                    K, N, tuple(w_fp8_orig.shape), w_fp8_orig.dtype,
+                    tuple(scale_inv_orig.shape), scale_inv_orig.dtype,
+                    _cosq, _cosb,
+                    "OK" if _cosq > 0.999 and _cosb > 0.999 else "*** CUANTIZACION/LAYOUT MAL ***")
+            except Exception as _e:
+                log.warning("DIAG_Q %dx%d fallo: %s: %s", K, N, type(_e).__name__, _e)
 
         bias = getattr(layer, "bias", None)
         bias_ref_ok = bias is not None and bias.numel() > 0

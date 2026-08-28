@@ -289,6 +289,8 @@ services:
       - GENESIS_PN110_HYBRID=${PN110_HYBRID:-0}
       - GENESIS_PN110_QUANTIZE=${PN110_QUANTIZE:-fp8_int8}
       - GENESIS_PN110_SK=${PN110_SK:-1}
+      # Diagnostico de carga: compara cada familia SK contra el hibrido.
+      - GENESIS_PN110_DIAG_SK=${PN110_DIAG_SK:-0}
       - GENESIS_PN110_SK_ONLY=${PN110_SK_ONLY:-}
       - GENESIS_PN110_SK_SKIP=${PN110_SK_SKIP:-}
       - GENESIS_PN110_SWAP_ONLY_SK=${PN110_SWAP_ONLY_SK:-1}
@@ -452,7 +454,14 @@ services:
       # antes de llegar a la API -- preservarlo es un parche aparte.
       - --enable-prompt-tokens-details
       - --trust-remote-code
-      - --enforce-eager
+      # --enforce-eager: APAGADO. Se habia puesto para perfilar (el profiler
+      # atribuye mal los kernels con cudagraphs) y quedo prendido en el compose
+      # que se llama justamente "cg". Cuesta LA MITAD del decode: 103.6 tok/s
+      # con cudagraphs contra 55.5 sin ellos, mismo modelo y mismo prompt.
+      # Ademas deja el despacho de CPU en el camino critico: ~30-42 us por
+      # lanzamiento medidos, por ~460 lanzamientos de kernel por forward.
+      # Volver a ponerlo SOLO mientras se perfila, y sacarlo despues.
+      # - --enforce-eager
       # ── PROFILER (v0.27.1) ──────────────────────────────────────────────
       # VLLM_TORCH_PROFILER_DIR fue ELIMINADA en v0.27.1. Las rutas
       # /start_profile y /stop_profile las monta attach_router() en
