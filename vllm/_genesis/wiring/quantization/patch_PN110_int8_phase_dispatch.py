@@ -582,7 +582,7 @@ def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
         return sk
     shifts = state.get("w_shifts")
     if shifts is None:
-        shifts = torch.zeros((K // 128, N // 128), dtype=torch.int8, device=b_col.device)
+        shifts = torch.zeros((K // 128, N // 128), dtype=torch.float32, device=b_col.device)
     state["sk_id"] = sk_id
     state["sk_fn"] = fn
     # id entero para el custom op. El callable directo NO se puede llamar desde
@@ -591,6 +591,12 @@ def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
     from vllm._genesis.kernels.sk_ops import SK_POR_ID, registrar as _reg_sk_ops
     _reg_sk_ops()
     state["sk_op_id"] = SK_POR_ID.get(sk_id, 0)
+    state["sk_shifts"] = shifts.contiguous()
+    state["sk_bscales"] = b_scales.reshape(-1)
+    state["sk_max_m"] = _genesis_sk_max_m()
+    state["sk_min_big_m"] = _genesis_sk_min_big_m()
+    # Con shifts el alternativo es int8_hybrid_gemm (2-5x peor): SK siempre.
+    state["sk_always"] = state.get("w_shifts") is not None
     # P113: si esta activo, la permutacion de gate_up se hace ACA, en la carga.
     # Antes se hacia perezosamente en el primer forward, y eso mutaba el estado
     # del modulo (state["b_col"], state["sk_perm_w"]) DENTRO del forward, ademas
@@ -615,12 +621,6 @@ def _genesis_bind_super_kernel(layer, state: dict, K: int, N: int) -> str:
         state["b_col"] = w_perm
         state["w_int8"] = w_perm
         state["sk_bscales"] = bs_perm
-    state["sk_max_m"] = _genesis_sk_max_m()
-    state["sk_min_big_m"] = _genesis_sk_min_big_m()
-    # Con shifts el alternativo es int8_hybrid_gemm (2-5x peor): SK siempre.
-    state["sk_always"] = state.get("w_shifts") is not None
-    state["sk_shifts"] = shifts.contiguous()
-    state["sk_bscales"] = b_scales.reshape(-1)
     # Epílogo neutro precomputado: un único cero con strides (0,0), o sea un
     # broadcast que no cuesta ancho de banda.
     #
@@ -2489,9 +2489,14 @@ def int8_linear(
             )
             if _hybrid_available() and a_i8_2d.is_cuda and w_int8.is_cuda:
                 try:
-                    return _hybrid_gemm(
+                    _o = _hybrid_gemm(
                         a_i8_2d, w_int8, a_scales, w_scales, w_shifts, out_dtype
                     )
+                    # El bias NO lo aplica el kernel hibrido. Sin esto la capa
+                    # devuelve el GEMM pelado y el bias se pierde en silencio.
+                    if bias is not None:
+                        _o = _o + bias.to(_o.dtype)
+                    return _o
                 except Exception as e:
                     log.warning(
                         "PN110 int8_linear kernel custom falló (%s: %s) — "
@@ -2824,89 +2829,35 @@ def _build_int8_state(
                 )
                 # Continuar al camino B per-channel
 
-        # ── Diseño B per-channel chunked (fallback) ────────────────────────
-        chunk_rows = 512
-        if chunk_rows % bk != 0:
-            chunk_rows = ((chunk_rows + bk - 1) // bk) * bk
-        chunk_rows = min(chunk_rows, K)
-
-        # Vistas transpuestas [K,N] y [K/Bk, N/Bn] — sin copia
-        w_fp8_T = w_fp8_orig.t()
-        s_T = scale_inv_orig.t()
-
-        # Alocar SOLO b_col column-major [K,N] (1x) — sin w_i8 completo
-        try:
-            b_col = torch.empty_strided((K, N), (1, K), dtype=torch.int8, device=device)
-        except Exception:
-            # Fallback: alocando transpuesto (sin pico 2x intermedio de .t().contiguous().t())
-            b_col = torch.empty((N, K), dtype=torch.int8, device=device).t()
-
-        # Pasada 1: acumular amax por columna en [N] fp32
-        amax_per_col = torch.zeros(N, dtype=torch.float32, device=device)
+        # ── Cuantización exacta por Bloques 128x128 (Vectorizada) ────────
+        w_fp8_T = w_fp8_orig.t().contiguous()
+        s_T = scale_inv_orig.t().contiguous()
+        n_blocks_k = K // bk
         n_blocks_n = N // bn
-        for r in range(0, K, chunk_rows):
-            r_end = min(r + chunk_rows, K)
-            chunk_k = r_end - r
-            w_chunk = w_fp8_T[r:r_end]
-            r_blk_start = r // bk
-            r_blk_end = r_end // bk
-            if chunk_k % bk == 0 and (r_blk_end - r_blk_start) * bk == chunk_k:
-                w_4d = w_chunk.reshape(chunk_k // bk, bk, n_blocks_n, bn)
-                s_slice = s_T[r_blk_start:r_blk_end].reshape(chunk_k // bk, 1, n_blocks_n, 1)
-                w_fp32_4d = w_4d.to(torch.float32) * s_slice.to(torch.float32)
-                w_fp32 = w_fp32_4d.reshape(chunk_k, N)
-            else:
-                s_slice = s_T[r_blk_start:r_blk_end]
-                s_expanded = s_slice.repeat_interleave(bk, dim=0).repeat_interleave(bn, dim=1)
-                if s_expanded.shape[0] > chunk_k:
-                    s_expanded = s_expanded[:chunk_k]
-                elif s_expanded.shape[0] < chunk_k:
-                    pad = chunk_k - s_expanded.shape[0]
-                    s_expanded = torch.cat([s_expanded, s_expanded[-1:].repeat(pad, 1)], dim=0)
-                w_fp32 = w_chunk.to(torch.float32) * s_expanded.to(torch.float32)
-            col_amax = w_fp32.abs().amax(dim=0)
-            amax_per_col = torch.maximum(amax_per_col, col_amax)
 
-        # Escalas per-channel [N,1] fp32
-        scales_per_channel = amax_per_col / 127.0
-        scales_per_channel = torch.where(
-            scales_per_channel > 0, scales_per_channel,
-            torch.ones_like(scales_per_channel))
-        w_scales = scales_per_channel.unsqueeze(1).contiguous()  # [N,1]
-        # P1: b_scales pre-transpuesto [1,N] fp32
-        b_scales = w_scales.t().contiguous().float()
-        scale_vec = scales_per_channel  # [N]
+        # Tiling 2D exacto: [n_blocks_k, n_blocks_n, bk, bn]
+        w_tiles = w_fp8_T.unflatten(0, (n_blocks_k, bk)).unflatten(2, (n_blocks_n, bn)).permute(0, 2, 1, 3)
+        s_tiles = s_T.unsqueeze(-1).unsqueeze(-1)
+        w_fp32_tiles = w_tiles.to(torch.float32) * s_tiles.to(torch.float32)
 
-        # Pasada 2: cuantizar por chunks y escribir DIRECTAMENTE en b_col
-        for r in range(0, K, chunk_rows):
-            r_end = min(r + chunk_rows, K)
-            chunk_k = r_end - r
-            w_chunk = w_fp8_T[r:r_end]
-            r_blk_start = r // bk
-            r_blk_end = r_end // bk
-            if chunk_k % bk == 0 and (r_blk_end - r_blk_start) * bk == chunk_k:
-                w_4d = w_chunk.reshape(chunk_k // bk, bk, n_blocks_n, bn)
-                s_slice = s_T[r_blk_start:r_blk_end].reshape(chunk_k // bk, 1, n_blocks_n, 1)
-                w_fp32_4d = w_4d.to(torch.float32) * s_slice.to(torch.float32)
-                w_fp32 = w_fp32_4d.reshape(chunk_k, N)
-            else:
-                s_slice = s_T[r_blk_start:r_blk_end]
-                s_expanded = s_slice.repeat_interleave(bk, dim=0).repeat_interleave(bn, dim=1)
-                if s_expanded.shape[0] > chunk_k:
-                    s_expanded = s_expanded[:chunk_k]
-                elif s_expanded.shape[0] < chunk_k:
-                    pad = chunk_k - s_expanded.shape[0]
-                    s_expanded = torch.cat([s_expanded, s_expanded[-1:].repeat(pad, 1)], dim=0)
-                w_fp32 = w_chunk.to(torch.float32) * s_expanded.to(torch.float32)
-            w_i8_chunk = (w_fp32 / scale_vec.unsqueeze(0)).round().clamp(-127, 127).to(torch.int8)
-            b_col[r:r_end] = w_i8_chunk
+        amax_2d = w_fp32_tiles.abs().amax(dim=(2, 3))
+        block_scales = torch.where(amax_2d > 1e-12, amax_2d / 127.0, torch.ones_like(amax_2d))
+
+        w_i8_tiles = (w_fp32_tiles / block_scales.unsqueeze(-1).unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        w_i8 = w_i8_tiles.permute(0, 2, 1, 3).reshape(K, N).contiguous()
+
+        b_col = torch.empty_strided((K, N), (1, K), dtype=torch.int8, device=device)
+        b_col.copy_(w_i8)
+
+        w_scales = torch.ones((N, 1), dtype=torch.float32, device=device)
+        b_scales = torch.ones((1, N), dtype=torch.float32, device=device)
 
         bias = getattr(layer, "bias", None)
         bias_ref_ok = bias is not None and bias.numel() > 0
-        # w_int8 alias a b_col para compatibilidad (no duplica VRAM)
         _state = {
             "w_int8": b_col,
             "w_scales": w_scales,
+            "w_shifts": block_scales,
             "b_col": b_col,
             "b_scales": b_scales,
             "bias_ref_ok": bias_ref_ok,
@@ -3524,6 +3475,20 @@ def _make_pwal_wrapper(original, cls):
         _sk_str = ""
         if _genesis_swap_only_sk():
             _sk_str, _usa_sk = _genesis_sk_for_layer(layer, int(k), int(n))
+        if _usa_sk and os.environ.get("GENESIS_PN110_LAYER_INDEX") is not None:
+            try:
+                target_idx = int(os.environ["GENESIS_PN110_LAYER_INDEX"])
+                l_name = _genesis_layer_name(layer) or ""
+                if f"layers.{target_idx}." not in l_name:
+                    _usa_sk = False
+            except Exception:
+                pass
+        if _usa_sk and os.environ.get("GENESIS_PN110_MAX_LAYERS") is not None:
+            try:
+                if _pn110_summary["converted"] >= int(os.environ["GENESIS_PN110_MAX_LAYERS"]):
+                    _usa_sk = False
+            except Exception:
+                pass
         if not _usa_sk:
             with _pn110_summary_lock:
                 _pn110_summary["excluded"] += 1
@@ -3664,10 +3629,7 @@ def _make_pwal_wrapper(original, cls):
                                 Bn_ = _n // Nb if Nb else _n
                                 # GPU vectorizado: w_int8 [K,N] -> [Kb,Bk,Nb,Bn], s_row [N] -> [Nb,Bn], shifts [Kb,Nb] -> scale_factor
                                 _w_4d = _w_i8.view(Kb, Bk_, Nb, Bn_)
-                                s_row_2d = s_row_v.view(Nb, Bn_)
-                                scale_factor = torch.pow(2.0, _sh.to(torch.float32)).unsqueeze(-1)
-                                scale_eff_3d = s_row_2d.unsqueeze(0) * scale_factor
-                                _int8_4d_f = _w_4d.to(torch.float32) * scale_eff_3d.unsqueeze(1)
+                                _int8_4d_f = _w_4d.to(torch.float32) * _sh.to(torch.float32).reshape(Kb, 1, Nb, 1)
                                 _int8_fp32 = _int8_4d_f.reshape(_k, _n).contiguous()
                             except Exception:
                                 # Fallback a per-channel sin shift si falla
@@ -3746,6 +3708,10 @@ def _make_pwal_wrapper(original, cls):
                                 try:
                                     del w_orig
                                     del s_orig
+                                except Exception:
+                                    pass
+                                try:
+                                    original(self, layer)
                                 except Exception:
                                     pass
                                 _schedule_summary()
@@ -3851,34 +3817,11 @@ def _make_pwal_wrapper(original, cls):
                         _pn110_summary["fallback"] += 1
                     _schedule_summary()
                     return
-                if hasattr(layer, "workspace"):
-                    try:
-                        # Liberación agresiva KV OOM: workspace es buffer Marlin
-                        # transitorio (~512KB por capa) que ya no se necesita
-                        # tras el swap 1:1; reemplazar por tensor vacío libera
-                        # el storage CUDA inmediatamente.
-                        _ws_dev = state["b_col"].device if isinstance(state.get("b_col"), torch.Tensor) else getattr(layer, "weight", state["b_col"]).device if hasattr(getattr(layer, "weight", None), "device") else "cuda"
-                        setattr(layer, "workspace", torch.empty(0, device=_ws_dev))
-                    except Exception:
-                        try:
-                            delattr(layer, "workspace")
-                        except Exception:
-                            pass
-                    # Fallback extra: asegurar que el atributo quede liberado
-                    # incluso si el setattr anterior falló silenciosamente.
-                    try:
-                        if hasattr(layer, "workspace"):
-                            _ws = getattr(layer, "workspace", None)
-                            if isinstance(_ws, torch.Tensor) and _ws.numel() != 0:
-                                try:
-                                    setattr(layer, "workspace", torch.empty(0, device=_ws_dev))
-                                except Exception:
-                                    try:
-                                        delattr(layer, "workspace")
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
+                try:
+                    _ws_dev = state["b_col"].device if isinstance(state.get("b_col"), torch.Tensor) else "cuda"
+                    setattr(layer, "workspace", torch.empty(0, device=_ws_dev))
+                except Exception:
+                    pass
                 # empty_cache cada 16 capas convertidas
                 # NO llamar a _liberar_segmentos_cumem() aca: PROBADO Y ROTO.
                 # Ver la nota en esa funcion. El empty_cache() que habia antes

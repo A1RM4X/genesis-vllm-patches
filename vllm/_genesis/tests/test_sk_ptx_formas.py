@@ -107,10 +107,16 @@ def test_gemm_todas_las_formas(mod, fn, K, N, M, con_shift):
     a = torch.randint(-127, 127, (M, K), dtype=torch.int8, device="cuda")
     asc = torch.rand(M, device="cuda") * 0.01 + 1e-3
     bsc = torch.rand(N, device="cuda") * 0.01 + 1e-3
-    sh = (torch.randint(-3, 1, (K // 128, (N + 127) // 128),
-                        dtype=torch.int8, device="cuda") if con_shift
+    # fp32, NO int8: los kernels pasaron del shift diadico entero a la escala
+    # por bloque en fp32. El puntero de shifts esta especializado a fp32 en el
+    # cubin, asi que pasarle un int8 lee 4x fuera de rango y devuelve NaN. Es
+    # exactamente la clase de fallo silencioso que este barrido existe para
+    # atrapar; que la trampa haya caido sobre el propio test no la hace menos
+    # real. Tiene que espejar `tools/monolitizar.py:operandos`.
+    sh = (torch.rand((K // 128, (N + 127) // 128), dtype=torch.float32,
+                     device="cuda") * 0.01 + 1e-3 if con_shift
           else torch.zeros((K // 128, (N + 127) // 128),
-                           dtype=torch.int8, device="cuda"))
+                           dtype=torch.float32, device="cuda"))
     out = f(a, b, asc, bsc, sh, None, torch.bfloat16)
     # Sincronizar ACA: un illegal memory access es asincrono y sin esto aparece
     # en otro test, o peor, en otro kernel.
@@ -137,7 +143,7 @@ def test_gemm_con_residual(mod, fn, K, N, M):
     a = torch.randint(-127, 127, (M, K), dtype=torch.int8, device="cuda")
     asc = torch.rand(M, device="cuda") * 0.01 + 1e-3
     bsc = torch.rand(N, device="cuda") * 0.01 + 1e-3
-    sh = torch.zeros((K // 128, (N + 127) // 128), dtype=torch.int8, device="cuda")
+    sh = torch.zeros((K // 128, (N + 127) // 128), dtype=torch.float32, device="cuda")
     res = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
     out = f(a, b, asc, bsc, sh, res, torch.bfloat16)
     torch.cuda.synchronize()
