@@ -168,3 +168,134 @@ comentarios, vacías). Se dejan a propósito.
   original. Correrlo sobre uno ya convertido duplica el bloque PTX.
 * **No paralelizar `git`**: dos instancias tocando el índice chocan con
   `index.lock` y el `checkout` falla en silencio, dejando el archivo equivocado.
+
+---
+
+# Medición del 2026-08-28 — dónde queda techo y dónde no
+
+Todo lo de abajo con ráfagas alternadas, mediana de 40-60 rondas, tiles de
+producción. Scripts: `vllm/_genesis/bench_decode_bn.py` y
+`vllm/_genesis/bench_w4_vs_w8.py`.
+
+## §8. Bug de corrección, ya arreglado: `w_shifts` con dos semánticas
+
+**Era esto lo que producía la basura de §3.1, y no los super kernels.**
+
+`state["w_shifts"]` [K/128,N/128] lo producen dos diseños y sólo se distinguen
+por dtype: **int8** = shift diádico (factor `2**shift`), **fp32** = la escala del
+bloque tal cual, con `b_scales` en unos. `int8_hybrid_gemm` — el camino de toda
+capa **sin** super kernel ligado — asumía siempre el diádico y hacía
+`shifts.to(tl.int32)`. Con el tensor fp32 (valores ~1e-3) eso trunca a 0: el
+factor del bloque desaparece.
+
+Reproducido: `ref_absmax=1.76` contra `got_absmax=2649`. **1500x de escala.**
+
+Explica las dos cosas a la vez:
+
+* la corrida con `GENESIS_PN110_SK_ONLY=SK-06` daba basura mientras SK-06 en
+  aislamiento daba `CosSim=0.99976` contra referencia fp32 — porque el que salía
+  mal era *todo lo demás*, por el híbrido;
+* el 0% de aceptación de MTP: `GENESIS_PN110_EXCLUDE_LAYERS=mtp.layers` manda las
+  capas MTP por ese mismo camino.
+
+Arreglado unificando ambos diseños en un multiplicador fp32 resuelto antes del
+kernel. Es bit-exacto contra el corrimiento entero: el acumulador de un bloque
+son 128 productos de int8, `|acc| <= 2064512 < 2**24`, o sea cabe entero en la
+mantisa de fp32. Verificado en los dos diseños, `cos=1.000000`.
+
+De paso, el mismo camino se comía el `bias` en silencio.
+
+## §9. Los GEMM de decode ya están en el techo. No queda nada en su PTX.
+
+Tráfico = `K*N` bytes de peso (cada byte se lee una vez, sea cual sea el tile):
+
+| kernel | K x N | µs | GB/s | % de 730 | veces/fwd | ms/fwd |
+|---|---|---:|---:|---:|---:|---:|
+| SK-01 | 5120x8192 | 57.3 | 732 | 100% | 48 | 2.75 |
+| SK-02 | 3072x5120 | 25.6 | 614 | 84% | 48 | 1.23 |
+| SK-03 | 5120x7168 | 50.2 | 731 | 100% | 16 | 0.80 |
+| SK-04 | 3072x5120 | 25.6 | 614 | 84% | 16 | 0.41 |
+| SK-05 | 5120x17408 | 118.8 | 750 | 103% | 64 | 7.60 |
+| SK-06 | 8704x5120 | 62.5 | 713 | 98% | 64 | 4.00 |
+| | | | | | | **16.80** |
+
+Los 16.80 ms/fwd reproducen la traza del profiler (16.840): el microbenchmark
+mide lo mismo que producción.
+
+**Cuatro de seis están en el techo.** Cualquier micro-optimización del asm de
+estos GEMM está peleando por el 0-2% que queda.
+
+Barrido de tiles para el bucket de decode (M<=32), como falsación de la hipótesis
+"faltan CTAs": con N=5120 el tile actual da 40 CTAs para 82 SM, media GPU
+parada. **La hipótesis es falsa.** Bajar `BLOCK_N` para duplicar o cuadruplicar
+los CTAs sale peor siempre — hasta **0.26x** con `32x64/w4`. Lo que manda no es
+el conteo de CTAs sino los **warps por CTA**: con `BLOCK_N=64` y 4 warps cada
+warp hace 8 mma en vez de 4 y se pierde el solapamiento.
+
+Único ajuste que gana, y es modesto: **`16x64` manteniendo 8 warps y stages=3**,
+1.03-1.07x en SK-02, SK-04 y SK-06. Vale ~0.3 ms/fwd (~2%).
+
+SK-02 y SK-04 al 84% son los únicos con aire: 15.7 MB a 730 GB/s son 21.5 µs
+contra 25.6 medidos, o sea ~4 µs de rampa y cola. Son las formas más chicas.
+
+## §10. Dónde SÍ queda un 2x: el desempaque de nibbles de W4A8
+
+W4A8 mueve la mitad de los bytes y debería dar 2x. Medido da **0.71x a 1.17x**:
+
+| forma | W8 GB/s | W4 GB/s | gana |
+|---|---:|---:|---:|
+| SK-02/04 3072x5120 | 614 | 265 | 0.86x |
+| SK-03 5120x7168 | 731 | 373 | 1.02x |
+| SK-01 5120x8192 | 731 | 366 | 1.00x |
+| SK-06 8704x5120 | 713 | 403 | 1.13x |
+| SK-05 5120x17408 | 806 | 473 | 1.17x |
+
+W4 no es DRAM-bound: está a 220-473 GB/s contra 700-800 de W8. El cuerpo del
+bucle dice por qué (tile de decode 16x128x128):
+
+| | W8 | W4 |
+|---|---:|---:|
+| instrucciones | **86** | **485** |
+| mma | 8 | 8 |
+| **ldmatrix** | **8** | **0** |
+| ld.shared | 0 | 40 |
+| cvt | 8 | 136 |
+| prmt | 0 | 120 |
+
+**W4 pierde `ldmatrix` por completo.** 296 de 485 instrucciones — el 61% del
+bucle — son desempaque a mano: 40 `ld.shared` escalares más 136 `cvt` más 120
+`prmt` para armar los operandos del mma byte por byte.
+
+La causa está en el fuente Triton, no en la conversión a PTX. El operando de
+`tl.dot` se produce con aritmética en registros:
+
+```python
+packed = tl.load(w_ptrs).to(tl.int32)
+w_lo = ((packed & 15) - 8).to(tl.int8)
+w_hi = (((packed >> 4) & 15) - 8).to(tl.int8)
+```
+
+Con el operando fabricado así, Triton no puede usar el camino que alimenta
+`mma.sync` directo desde shared en el layout de fragmento, y cae a una conversión
+genérica de layout.
+
+**Meter `lop3`/`prmt` a mano en el asm no alcanza.** Es lo que pide
+`optimizaciones_plx.md` §4.1 y está bien como táctica, pero si el layout no sirve
+para `ldmatrix` no hay parche de asm que lo arregle. Primero hay que
+**pre-permutar el peso W4 en la carga**, como hace Marlin, al orden de fragmento
+que espera el mma — de modo que un `ld.shared.b32` más dos `lop3` den cuatro
+operandos int8 ya en orden. PN110 ya re-acomoda el peso en la carga
+(`_build_int8_state`, `sk05_permute_gateup`), así que la permutación no cuesta
+nada en runtime.
+
+Si el bucle W4 llega al conteo del W8, el GEMM de decode pasa de 16.80 a **~8.6
+ms/fwd**. Es el único 2x que queda en el proyecto.
+
+## §11. Orden de trabajo que sale de todo esto
+
+1. Verificar en el server que con §8 arreglado el modelo genera texto coherente
+   con todos los SK activos, y que MTP recupera aceptación.
+2. Pre-permutación W4 + bucle con `ldmatrix` (§10). Es el 2x.
+3. El quant de SK-09, 0.648 ms/fwd (§4). Vale ~4%.
+4. `16x64/w8/s3` en SK-02, SK-04 y SK-06 (§9). Vale ~2%.
+5. No tocar el asm de los GEMM W8. Están en el techo (§9).
