@@ -355,15 +355,22 @@ and how they behave.
 | `GENESIS_PREALLOC_TOKEN_BUDGET` | `4096` | Token budget for prefill output prealloc (P26) |
 | `GENESIS_PROFILE_RUN_CAP_M` | `4096` | M cap for profile_run (P72) — unblocks `--max-num-batched-tokens > 4096` |
 | `GENESIS_P68_P69_LONG_CTX_THRESHOLD_CHARS` | `8000` | Char threshold for long-context tool-call hooks (P68/P69) |
-| `GENESIS_PN110_SK` | `0` | Enable compiled Super-Kernels (PTX/CUBIN) for PN110 INT8 W8A8 dispatch |
-| `GENESIS_PN110_SK_ONLY` | (empty) | Inclusions filter for super-kernel families (e.g. `SK-06`, `SK-01,SK-02`) |
+| `GENESIS_PN110_SK` | `1` | Enable compiled Super-Kernels (PTX/CUBIN) for PN110 INT8 W8A8 dispatch. NOTE: the shipped compose sets it to `0`; with `SWAP_ONLY_SK=1` that converts **zero** layers and measures the FP8 baseline, not the INT8 path |
+| `GENESIS_PN110_SK_ONLY` | (empty) | Inclusion filter for super-kernel families (e.g. `SK-06`, `SK-01,SK-02`). Takes precedence over `SK_SKIP` |
 | `GENESIS_PN110_SK_SKIP` | (empty) | Exclusion filter for super-kernel families (e.g. `SK-05`) |
 | `GENESIS_PN110_SWAP_ONLY_SK` | `1` | Only convert layers to INT8 if their corresponding super-kernel is active; keep others in Marlin FP8 |
-| `GENESIS_PN110_MAX_LAYERS` | (empty) | Limit maximum number of layers converted to INT8 (for binary search of numerical drift) |
-| `GENESIS_PN110_LAYER_INDEX` | (empty) | Only convert a single layer matching `layers.<index>.` (e.g. `0`, `1`) for isolated live debugging |
-| `GENESIS_PN110_EXCLUDE_LAYERS` | `mtp.layers` | Layer name substring filter to exclude from INT8 conversion |
-| `GENESIS_PN110_DIAG_SK` | `0` | Checkpoint load diagnostic: validates INT8 128x128 block quant and b_col layout vs FP8 source |
-| `GENESIS_PN110_DIAG_REF` | `0` | Runtime forward diagnostic: compares live activation INT8 GEMM vs FP8 dequant reference |
+| `GENESIS_PN110_MAX_LAYERS` | (empty) | Cap on INT8 conversions **per worker process**, in load order (with TP=2 you get this many on each rank) |
+| `GENESIS_PN110_LAYER_INDEX` | (empty) | Only convert layers whose name contains `layers.<index>.` — matches `mtp.layers.<index>.` too |
+| `GENESIS_PN110_EXCLUDE_LAYERS` | (empty) | Layer name substring filter to exclude from INT8 conversion. The shipped compose sets `mtp.layers` |
+| `GENESIS_PN110_QUANTIZE` | `fp8_int8` | Accepted source dtypes, comma separated: `fp8_int8`, `bf16_int8` |
+| `GENESIS_PN110_HYBRID` | `0` | Design C dyadic weights (per-channel float + int8 per-block shift). With `0`, exact 128x128 fp32 block quantization is used |
+| `GENESIS_PN110_KL_THRESHOLD` | `0.05` | CK-2.3 gate: a layer whose FP8→INT8 KL divergence exceeds this stays in Marlin. Doubled when block scales are present |
+| `GENESIS_PN110_KL_CALIB_TOKENS` | `512` | Rows used to compute that KL |
+| `GENESIS_PN110_SK_MAX_M` | `64` | Only applies **without** block scales: SK is used up to this M and above `SK_MIN_BIG_M`; `cutlass_scaled_mm` wins in between |
+| `GENESIS_PN110_SK_MIN_BIG_M` | `4096` | Upper end of that window |
+| `GENESIS_PN110_W8A8_MIN_TOKENS` | `256` | Dead: kept for compatibility, the dispatch no longer looks at M |
+| `GENESIS_PN110_DIAG_SK` | `0` | Load-time diagnostic, two checks: `DIAG_Q` validates 128x128 block quant and `b_col` layout against the FP8 source; `DIAG_SK` runs the super-kernel GEMM against `int8_hybrid_gemm` on the same input. Accepts the literal `1` only |
+| `GENESIS_PN110_DIAG_REF` | `0` | First-forward diagnostic per layer: compares the full INT8 path against `x @ dequant(fp8)` using the **real** activation. Costs ~170 MB fp32 per layer and aborts CUDA graph capture — pair with `--enforce-eager` and a small `MAX_LAYERS`. Accepts the literal `1` only |
 
 ---
 

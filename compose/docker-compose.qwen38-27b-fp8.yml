@@ -289,6 +289,10 @@ services:
       - GENESIS_PN110_LAYER_INDEX=${PN110_LAYER_INDEX:-}
       - GENESIS_PN110_EXCLUDE_LAYERS=${PN110_EXCLUDE:-mtp.layers}
       - GENESIS_PN110_DIAG_REF=${PN110_DIAG_REF:-0}
+      # Diagnostico de CARGA: valida cuantizacion+layout contra el peso fp8
+      # y el GEMM del super kernel contra int8_hybrid_gemm. No toca el
+      # forward, asi que no interfiere con cudagraphs. Acepta solo "1".
+      - GENESIS_PN110_DIAG_SK=${PN110_DIAG_SK:-0}
       # B3 (2026-08-25): Custom all-reduce TP=2 fast path con fallback robusto
       # (P2P PIX entre las dos 3090). Sin esto vLLM usa PYNCCL genérico.
       # A/B aislado PN110 solo (2026-08-25): B2/B3/B5/B7 apagados para medir delta real
