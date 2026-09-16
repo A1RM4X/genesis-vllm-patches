@@ -139,6 +139,21 @@ def _section_environment() -> dict[str, Any]:
         except Exception as e:
             out["errors"].append(f"nvidia-smi pcie probe: {e}")
 
+    # P2P entre placas. Importa mucho con TP>=2: si el hardware/driver lo soporta y se lo apaga
+    # con NCCL_P2P_DISABLE, todo el trafico entre GPU pasa por la RAM del host.
+    out["p2p"] = {"matriz": None, "deshabilitado_por_env": bool(os.environ.get("NCCL_P2P_DISABLE"))}
+    if shutil.which("nvidia-smi") and len(out.get("pcie_lanes", [])) >= 2:
+        try:
+            res = subprocess.run(["nvidia-smi", "topo", "-p2p", "r"],
+                                 capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                txt = res.stdout
+                # "OK" en alguna celda que no sea la diagonal = hay P2P entre dos placas
+                cuerpo = [l for l in txt.splitlines() if l.strip().startswith("GPU")]
+                out["p2p"]["matriz"] = "OK" if any("OK" in l for l in cuerpo) else "no"
+        except Exception as e:
+            out["errors"].append(f"nvidia-smi topo -p2p probe: {e}")
+
     return out
 
 
@@ -319,6 +334,24 @@ def _section_recommendations(report: dict[str, Any]) -> list[str]:
                 "Check motherboard slot allocation (often x8/x8 vs x16/x16 BIOS "
                 "setting) or PCIe riser cable integrity."
             )
+
+    # P2P apagado teniendo P2P disponible: el caso mas caro y mas silencioso
+    p2p = env.get("p2p") or {}
+    if p2p.get("matriz") == "OK" and p2p.get("deshabilitado_por_env"):
+        rec.append(
+            "[WARN] las placas TIENEN P2P (nvidia-smi topo -p2p r dice OK) pero "
+            "NCCL_P2P_DISABLE=1 lo apaga. Con TP>=2 eso manda todo el trafico entre GPU por la "
+            "RAM del host. Medido en 2x 3090 con el driver P2P: el intercambio directo da "
+            "13 GB/s. Varios presets traen NCCL_P2P_DISABLE=1 porque se verificaron con el "
+            "driver de fabrica, donde las GeForce no tienen P2P; con el fork "
+            "aikitoria/open-gpu-kernel-modules instalado hay que sacarlo."
+        )
+    elif p2p.get("matriz") == "no" and len(env.get("pcie_lanes", [])) >= 2:
+        rec.append(
+            "[INFO] no hay P2P entre las placas. En GeForce eso es lo normal con el driver de "
+            "fabrica; el fork aikitoria/open-gpu-kernel-modules lo habilita por BAR1 (necesita "
+            "iommu=pt). Sin P2P, NCCL_P2P_DISABLE=1 es lo correcto."
+        )
 
     # Show at least one recommendation if everything is clean
     if not rec:

@@ -11,24 +11,29 @@ la menor latencia). Eso lo pone a competir por SM con el GEMM, y medido sobre es
   * a nivel de bloque MLP (que llena los 82 SM) el solape se va a **0%**: los bloques de NCCL no
     consiguen lugar. Darle prioridad alta al stream tampoco cambia nada.
 
-Una ``cudaMemcpyPeerAsync`` la ejecuta el MOTOR DE COPIA, que no usa SM ninguno, asi que solapa por
-construccion. El problema es el ancho de banda (tests/proto/p2p_duplex.py, 40 MB):
+Una ``cudaMemcpyPeerAsync`` la ejecuta el MOTOR DE COPIA, que no usa SM ninguno, y sobre memoria
+compartida como corresponde da **13,0 GB/s** (mas que NCCL) con **105% de solape**: o sea que se
+esconde entera detras del computo y sale gratis. Ese es el transporte que usa este modulo.
 
-    NCCL all_gather                      11,2 GB/s
-    cudaMemcpyPeerAsync, una direccion    5,6 GB/s   <- el techo del motor DMA
-    idem, los dos a la vez                5,7 GB/s
+DE DONDE SALE LA MEMORIA: ES LO QUE DECIDE TODO
+-----------------------------------------------
+Medido sobre 40 MB (tests/proto/p2p_origen_memoria.py), compartiendo el MISMO tensor de tres
+formas distintas:
 
-**En estas 3090 el motor de copia va a la mitad que NCCL**, y no es por duplex ni por falta de
-``cudaDeviceEnablePeerAccess`` (probado, no cambia nada): en placas GeForce el DMA P2P esta capado.
-NCCL llega al doble porque copia con los SM. Resultado: el solape devuelve exactamente lo que
-pierde el transporte, y PN136 queda en 1,00x. Ver ``vllm._genesis.mlp_solapado``.
+| forma de compartir                        | memcpyPeer | ¿un kernel puede leerlo? |
+|-------------------------------------------|------------|--------------------------|
+| ``multiprocessing.reductions.reduce_tensor`` | 4,9 GB/s | **NO, acceso ilegal**    |
+| ``cudaIpcGetMemHandle`` a mano sobre el tensor | **13,0 GB/s** | si                  |
+| ``cudaMalloc`` crudo + IPC a mano          | 13,0 GB/s  | si                       |
 
-Estas primitivas quedan igual porque son correctas y reutilizables, y porque en placas con P2P sin
-capar (Tesla/Quadro, o NVLink) la cuenta da distinto.
+El camino de torch es 2,6x mas lento Y deja la memoria fuera del alcance de los kernels. Por eso
+aca el handle de IPC se saca y se abre a mano. Un tensor normal de torch sirve perfecto: lo unico
+que hay que hacer es el IPC uno mismo.
 
-TRAMPA aparte, que costo media tarde: el ``copy_`` de torch toma un camino LENTO cuando el DESTINO
-es un tensor importado por IPC — 5,9 GB/s; tirando (destino local) da 12,9, pero eso usa SM. Por eso
-aca se llama ``cudaMemcpyPeerAsync`` directo. Medido en tests/proto/p2p_ancho.py.
+Como se calcula el desplazamiento: ``cudaIpcGetMemHandle`` da un handle de la RESERVA ENTERA que
+contiene al puntero, y al abrirlo del otro lado se recibe la base de esa reserva, no el puntero.
+Con ``cuMemGetAddressRange`` cada rank averigua su propia base, manda el desplazamiento junto con
+el handle, y el que recibe se lo suma. Sin eso se escribe en el lugar equivocado.
 
 Como se sincroniza sin gastar SM
 --------------------------------
@@ -92,28 +97,78 @@ def escribir_valor(ptr: int, valor: int, stream) -> None:
         raise RuntimeError(f"cuStreamWriteValue32 -> {r}")
 
 
-def _compartir(t: torch.Tensor, grupo_cpu, rank: int, w: int):
-    """Publica un tensor por IPC y devuelve la vista del tensor de cada rank."""
-    import torch.distributed as dist
-    import torch.multiprocessing.reductions as mpr
+class IpcHandle(ctypes.Structure):
+    """``cudaIpcMemHandle_t``. TIENE que ser un Structure: ``cudaIpcOpenMemHandle`` lo recibe POR
+    VALOR, y ctypes pasa los arrays por referencia (eso da cudaErrorInvalidValue)."""
 
-    datos = pickle.dumps(mpr.reduce_tensor(t))
-    buf = torch.frombuffer(bytearray(datos), dtype=torch.uint8)
-    n = torch.tensor([buf.numel()], dtype=torch.int64)
-    ns = [torch.zeros(1, dtype=torch.int64) for _ in range(w)]
-    dist.all_gather(ns, n, group=grupo_cpu)
-    mx = int(max(int(x.item()) for x in ns))
-    pad = torch.zeros(mx, dtype=torch.uint8)
-    pad[: buf.numel()] = buf
-    rec = [torch.zeros(mx, dtype=torch.uint8) for _ in range(w)]
-    dist.all_gather(rec, pad, group=grupo_cpu)
+    _fields_ = [("reserved", ctypes.c_char * 64)]
+
+
+def _preparar_firmas():
+    rt, _ = _libs()
+    rt.cudaIpcOpenMemHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), IpcHandle, ctypes.c_uint]
+    rt.cudaIpcGetMemHandle.argtypes = [ctypes.POINTER(IpcHandle), ctypes.c_void_p]
+
+
+def habilitar_p2p(pares: list[int]) -> None:
+    """``cudaDeviceEnablePeerAccess`` hacia cada par. 704 = ya estaba, no es error."""
+    rt, _ = _libs()
+    for d in pares:
+        r = rt.cudaDeviceEnablePeerAccess(ctypes.c_int(d), ctypes.c_uint(0))
+        if r not in (0, 704):
+            log.warning("cudaDeviceEnablePeerAccess(%d) -> %d", d, r)
+
+
+def _base_y_desplazamiento(ptr: int) -> tuple[int, int]:
+    """Base de la reserva que contiene a `ptr`, y cuanto hay que correrse desde ahi."""
+    _, drv = _libs()
+    base = ctypes.c_ulonglong()
+    tam = ctypes.c_size_t()
+    r = drv.cuMemGetAddressRange_v2(ctypes.byref(base), ctypes.byref(tam),
+                                    ctypes.c_ulonglong(ptr))
+    if r != 0:
+        raise RuntimeError(f"cuMemGetAddressRange -> {r}")
+    return base.value, ptr - base.value
+
+
+def _compartir(t: torch.Tensor, grupo_cpu, rank: int, w: int) -> list[int]:
+    """Comparte `t` por IPC y devuelve el PUNTERO equivalente de cada rank (el propio incluido).
+
+    Se hace a mano a proposito: ver el encabezado del modulo. Con ``reduce_tensor`` de torch esto
+    anda a 4,9 GB/s y los kernels no pueden tocar la memoria.
+    """
+    import torch.distributed as dist
+
+    _preparar_firmas()
+    rt, _ = _libs()
+    base, desp = _base_y_desplazamiento(t.data_ptr())
+
+    h = IpcHandle()
+    r = rt.cudaIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(base))
+    if r != 0:
+        raise RuntimeError(f"cudaIpcGetMemHandle -> {r}")
+    # el campo c_char*64 leido como atributo se TRUNCA en el primer NUL: hay que sacar los bytes
+    crudo = ctypes.string_at(ctypes.byref(h), 64)
+
+    mio = torch.zeros(72, dtype=torch.uint8)
+    mio[:64] = torch.frombuffer(bytearray(crudo), dtype=torch.uint8)
+    mio[64:72] = torch.frombuffer(desp.to_bytes(8, "little"), dtype=torch.uint8).clone()
+    todos = [torch.zeros(72, dtype=torch.uint8) for _ in range(w)]
+    dist.all_gather(todos, mio, group=grupo_cpu)
+
     fuera = []
     for i in range(w):
         if i == rank:
-            fuera.append(t)
-        else:
-            f, a = pickle.loads(bytes(rec[i][: int(ns[i].item())].numpy()))
-            fuera.append(f(*a))
+            fuera.append(t.data_ptr())
+            continue
+        ho = IpcHandle()
+        ctypes.memmove(ctypes.byref(ho), bytes(todos[i][:64].numpy()), 64)
+        d_otro = int.from_bytes(bytes(todos[i][64:72].numpy()), "little")
+        po = ctypes.c_void_p()
+        r = rt.cudaIpcOpenMemHandle(ctypes.byref(po), ho, ctypes.c_uint(1))
+        if r != 0:
+            raise RuntimeError(f"cudaIpcOpenMemHandle(rank {i}) -> {r}")
+        fuera.append(po.value + d_otro)
     return fuera
 
 
@@ -143,6 +198,8 @@ class Buzones:
         # un escalar por ranura donde se arma el valor de la bandera antes de empujarlo
         self.marca = torch.zeros((ranuras,), dtype=torch.int32, device=d)
 
+        habilitar_p2p([dispositivos[r] for r in self.pares])
+        # punteros equivalentes en cada rank (no tensores: solo hacen falta para memcpyPeer)
         self.datos_r = _compartir(self.datos, grupo_cpu, rank, w)
         self.escalas_r = _compartir(self.escalas, grupo_cpu, rank, w)
         self.banderas_r = _compartir(self.banderas, grupo_cpu, rank, w)
@@ -168,16 +225,13 @@ class Buzones:
         for par in self.pares:
             i = self._indice(par, self.rank)
             dev_par = self.dev_de_rank[par]
-            dq = self.datos_r[par]
-            ds = self.escalas_r[par]
-            db = self.banderas_r[par]
+            dq, ds, db = self.datos_r[par], self.escalas_r[par], self.banderas_r[par]
             off_q = ((ranura * self.npares + i) * self.cap) * self.ancho
             off_s = ((ranura * self.npares + i) * self.cap) * (self.ancho // self.grupo)
-            memcpy_peer(dq.data_ptr() + off_q, dev_par, q.data_ptr(), self.dev,
-                        m * self.ancho, stream)
-            memcpy_peer(ds.data_ptr() + off_s * 2, dev_par, s.data_ptr(), self.dev,
+            memcpy_peer(dq + off_q, dev_par, q.data_ptr(), self.dev, m * self.ancho, stream)
+            memcpy_peer(ds + off_s * 2, dev_par, s.data_ptr(), self.dev,
                         m * (self.ancho // self.grupo) * 2, stream)
-            memcpy_peer(db.data_ptr() + 4 * (ranura * self.npares + i), dev_par,
+            memcpy_peer(db + 4 * (ranura * self.npares + i), dev_par,
                         self.marca.data_ptr() + 4 * ranura, self.dev, 4, stream)
         return e
 

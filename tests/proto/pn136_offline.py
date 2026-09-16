@@ -9,9 +9,10 @@ las formas del modelo (H=5120, intermedio 8704 por rank), y compara:
 Comprueba que el resultado sea el mismo bit a bit (la cuantizacion int8 es identica en los dos
 caminos, asi que la unica diferencia posible seria un error de indexado en los buzones).
 
-RESULTADO: es exacto, pero NO gana. El motor de copia de estas 3090 topea en 5,6 GB/s mientras
-NCCL llega a 11,2 (NCCL copia con los SM, que en GeForce van al doble que el motor DMA). Lo que
-el solape ahorra, el transporte mas lento lo devuelve: sale 1,00x. Ver p2p_duplex.py.
+OJO con la version anterior de este banco: compartia la memoria con reduce_tensor de torch, que
+da 4,9 GB/s en vez de 13,0 y ademas deja la memoria fuera del alcance de los kernels. Con el IPC
+hecho a mano (que es lo que hace ahora p2p_buzon) el transporte va a 13 GB/s y solapa 105%.
+Ver tests/proto/p2p_origen_memoria.py.
 
 Uso: torchrun --nproc_per_node=2 pn136_offline.py
 """
@@ -108,7 +109,7 @@ def main():
       f"   | {'piezas':>40}")
 
     for M in (8192, 4096):
-        for N in (2, 4):
+        for N in (1, 2, 4):
             cap = int(math.ceil(M / N))
             bz = Buzones(cap, H, G, N, rank, w, gcpu, devs)
             x = torch.randn(M, H, device=dev, dtype=torch.float16)

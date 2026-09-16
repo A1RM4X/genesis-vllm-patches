@@ -179,7 +179,14 @@ def juntos(envio):
     return f
 
 
-casos = [("NCCL", lambda st: dist.all_gather_into_tensor(qg, dg))]
+def dma_en(st):
+    rt.cudaMemcpyPeerAsync(ctypes.c_void_p(pg_otro.value), ctypes.c_int(otro),
+                           ctypes.c_void_p(ptr_g.value), ctypes.c_int(rank),
+                           ctypes.c_size_t(GRANDE), ctypes.c_void_p(st.cuda_stream))
+
+
+casos = [("NCCL", lambda st: dist.all_gather_into_tensor(qg, dg)),
+         ("motor DMA (memcpyPeer)", dma_en)]
 for nb in (4, 8, 16, 32):
     casos.append((f"SK-21 con {nb} bloques",
                   lambda st, nb=nb: kern[nb].lanzar(

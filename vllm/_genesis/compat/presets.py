@@ -327,6 +327,7 @@ _register(Preset(
     ],
     expected_tps_ref="104 tok/s @ 256t output, CV 0.5% (5-run mean)",
     notes=[
+        "ℹ NCCL_P2P_DISABLE=1 porque se verifico con el driver de fabrica, donde las GeForce no tienen P2P. Con el fork aikitoria/open-gpu-kernel-modules instalado (y iommu=pt) SACALO: el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. `genesis doctor` lo avisa.",
         "ℹ Cliff 2 (>50K single prompt) NOT triggered at TP=2 — "
         "state splits across ranks.",
         "ℹ Default-safe baseline. Switch to a5000-2x-tool-agent if "
@@ -389,6 +390,7 @@ _register(Preset(
     ],
     expected_tps_ref="~104 tok/s @ 256t output, tool-call clean 7/7",
     notes=[
+        "ℹ NCCL_P2P_DISABLE=1 porque se verifico con el driver de fabrica, donde las GeForce no tienen P2P. Con el fork aikitoria/open-gpu-kernel-modules instalado (y iommu=pt) SACALO: el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. `genesis doctor` lo avisa.",
         "ℹ Tuned for Cline / Claude Code / OpenCode prompts with "
         "5K+ char system prompts + multi-tool schemas.",
         "ℹ P68/P69 threshold 50K chars — long sys prompts handled.",
@@ -435,6 +437,7 @@ _register(Preset(
     ],
     expected_tps_ref="~184 tok/s @ 256t output",
     notes=[
+        "ℹ NCCL_P2P_DISABLE=1 porque se verifico con el driver de fabrica, donde las GeForce no tienen P2P. Con el fork aikitoria/open-gpu-kernel-modules instalado (y iommu=pt) SACALO: el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. `genesis doctor` lo avisa.",
         "ℹ PN26b sparse-V kernel tuned for 27B BLOCK_KV=8 — works "
         "well on 35B too.",
     ],
@@ -618,6 +621,7 @@ _register(Preset(
     ],
     expected_tps_ref="~116 tok/s wall_TPS (~12% over A5000 reference)",
     notes=[
+        "ℹ NCCL_P2P_DISABLE=1 porque se verifico con el driver de fabrica, donde las GeForce no tienen P2P. Con el fork aikitoria/open-gpu-kernel-modules instalado (y iommu=pt) SACALO: el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. `genesis doctor` lo avisa.",
         "ℹ TP=2 splits GDN state — Cliff 2 single-card concern doesn't "
         "apply here. P103 / PN32 still available if you push past 200K.",
     ],
@@ -819,6 +823,7 @@ _register(Preset(
     ],
     expected_tps_ref="(JartX baseline — exact TPS varies by request shape)",
     notes=[
+        "ℹ NCCL_P2P_DISABLE=1 porque se verifico con el driver de fabrica, donde las GeForce no tienen P2P. Con el fork aikitoria/open-gpu-kernel-modules instalado (y iommu=pt) SACALO: el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. `genesis doctor` lo avisa.",
         "ℹ 8 ranks × 16GB — careful with PN12 pool sizing on small per-rank VRAM.",
     ],
 ))
