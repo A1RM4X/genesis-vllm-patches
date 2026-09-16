@@ -1,0 +1,9 @@
+      1 (EngineCore pid=151) INFO 09-14 23:46:11 [kv_cache_utils.py:2236] GPU KV cache size: 621,981 tokens
+      1 (EngineCore pid=151) INFO 09-14 23:46:11 [kv_cache_utils.py:2250] Maximum concurrency for 262,144 tokens per request: 2.37x
+      1 [INFO:genesis.apply_all] [Genesis] skipped: PN106 marlin repack disk cache — opt-in only — set GENESIS_ENABLE_PN106_MARLIN_REPACK_CACHE=1
+      1 [INFO:genesis.marlin_fp32_reduce] [Genesis P23] Marlin FP32_REDUCE: disabled=True on SM=(8, 6) (auto-from-platform)
+      1 (Worker_TP0 pid=166) INFO 09-14 23:44:02 [compressed_tensors_wNa16.py:137] Using MarlinLinearKernel for CompressedTensorsWNA16
+      1 (Worker_TP0 pid=166) INFO 09-14 23:46:11 [gpu_worker.py:605] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9000 is equivalent to --gpu-memory-utilization=0.8686 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9314. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+      1 (Worker_TP0 pid=166) WARNING 09-14 23:44:15 [marlin_utils_fp8.py:112] Your GPU does not have native support for FP8 computation but FP8 quantization is being used. Weight-only FP8 compression will be used leveraging the Marlin kernel. This may degrade performance for compute-heavy workloads.
+      1 (Worker_TP1 pid=167) INFO 09-14 23:44:01 [compressed_tensors_wNa16.py:137] Using MarlinLinearKernel for CompressedTensorsWNA16
+      1 (Worker_TP1 pid=167) INFO 09-14 23:46:11 [gpu_worker.py:605] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9000 is equivalent to --gpu-memory-utilization=0.8686 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9314. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.

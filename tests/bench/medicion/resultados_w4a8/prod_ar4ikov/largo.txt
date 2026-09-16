@@ -1,0 +1,1 @@
+prod_ar4ikov: prompt=57531 agujas=12/12 TTFT=28.6s decode=121.0 tok/s (137 tok)

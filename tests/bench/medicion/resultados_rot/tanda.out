@@ -1,0 +1,13 @@
+[21:39:31] inicio tanda de rotacion q/k
+[21:42:46] captura arriba
+[21:49:21] rot_i8_had arriba
+[21:55:00] rot_i8_had:   corrida 2: 42792 tok en 23.05s = 1857 tok/s de prefill | rot_i8_had: prompt=57532 agujas=12/12 TTFT=36.7s decode=100.2 tok/s (137 tok) | TOTAL rot_i8_had: TAR=66.2%  125 tok/s | rot_i8_had: 6/6 []   aciertos: 10/10  | logp medio del real -1.241
+[21:59:55] rot_i8_wush arriba
+[22:05:32] rot_i8_wush:   corrida 2: 42790 tok en 23.76s = 1801 tok/s de prefill | rot_i8_wush: prompt=57532 agujas=12/12 TTFT=35.8s decode=99.9 tok/s (137 tok) | TOTAL rot_i8_wush: TAR=66.2%  125 tok/s | rot_i8_wush: 6/6 []   aciertos: 10/10  | logp medio del real -1.070
+[22:10:47] rot_fp8_had arriba
+[22:15:34] rot_fp8_had:   corrida 2: 42792 tok en 19.65s = 2177 tok/s de prefill | rot_fp8_had: prompt=57532 agujas=12/12 TTFT=29.2s decode=147.4 tok/s (137 tok) | TOTAL rot_fp8_had: TAR=66.7%  122 tok/s | rot_fp8_had: 6/6 []   aciertos: 10/10  | logp medio del real -1.159
+[22:20:50] rot_fp8_wush arriba
+[22:25:37] rot_fp8_wush:   corrida 2: 42792 tok en 19.53s = 2191 tok/s de prefill | rot_fp8_wush: prompt=57531 agujas=12/12 TTFT=29.4s decode=148.4 tok/s (137 tok) | TOTAL rot_fp8_wush: TAR=65.2%  121 tok/s | rot_fp8_wush: 6/6 []   aciertos: 10/10  | logp medio del real -1.260
+[22:30:43] rot_fp8_control arriba
+[22:35:30] rot_fp8_control:   corrida 2: 42789 tok en 20.07s = 2132 tok/s de prefill | rot_fp8_control: prompt=57531 agujas=12/12 TTFT=29.1s decode=114.5 tok/s (137 tok) | TOTAL rot_fp8_control: TAR=65.3%  122 tok/s | rot_fp8_control: 6/6 []   aciertos: 10/10  | logp medio del real -1.080
+[22:35:35] fin tanda (queda arriba noon W4A8 + PN125, KV fp8)

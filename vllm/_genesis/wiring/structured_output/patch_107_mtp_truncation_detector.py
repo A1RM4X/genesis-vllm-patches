@@ -33,7 +33,7 @@ from vllm._genesis.wiring.text_patch import (
 
 log = logging.getLogger("genesis.wiring.p107_mtp_truncation_detector")
 
-GENESIS_P107_MARKER = "Genesis P107 MTP truncation detector (vllm#41467)"
+GENESIS_P107_MARKER = "Genesis P107 MTP truncation detector (vllm#41467) v2"
 
 
 def _is_enabled() -> bool:
@@ -58,7 +58,8 @@ ANCHOR_OLD = (
     "                        choice_data = ChatCompletionResponseStreamChoice("
 )
 
-ANCHOR_NEW = (
+# V1 patch that unconditionally raised GenerationError
+ANCHOR_V1 = (
     "                        if tools_streamed[i] and not tool_choice_function_name:\n"
     "                            finish_reason_ = \"tool_calls\"\n"
     "                        else:\n"
@@ -99,6 +100,49 @@ ANCHOR_NEW = (
     "                        choice_data = ChatCompletionResponseStreamChoice("
 )
 
+ANCHOR_NEW = (
+    "                        if tools_streamed[i] and not tool_choice_function_name:\n"
+    "                            finish_reason_ = \"tool_calls\"\n"
+    "                        else:\n"
+    "                            finish_reason_ = (\n"
+    "                                output.finish_reason if output.finish_reason else \"stop\"\n"
+    "                            )\n"
+    "\n"
+    "                        # [Genesis P107 vllm#41467] MTP truncation detector.\n"
+    "                        # ~0.25% rate on Qwen3.6 27B-FP8 + MTP K=3 (per upstream\n"
+    "                        # author): EOS at reasoning→tool_call boundary leaves\n"
+    "                        # finish_reason=stop with no content/tool_calls. Raise\n"
+    "                        # retryable error only when GENESIS_P107_RAISE_ERROR=1,\n"
+    "                        # otherwise complete cleanly to prevent infinite loops in\n"
+    "                        # agentic clients (OpenCode/Cline).\n"
+    "                        if (\n"
+    "                            finish_reason_ == \"stop\"\n"
+    "                            and request.tools\n"
+    "                            and not tools_streamed[i]\n"
+    "                            and parser is not None\n"
+    "                            and parser.reasoning_parser is not None\n"
+    "                            and delta_message is not None\n"
+    "                            and not delta_message.content\n"
+    "                            and not delta_message.tool_calls\n"
+    "                        ):\n"
+    "                            logger.warning(\n"
+    "                                \"[Genesis P107] MTP truncation detected for request %s: \"\n"
+    "                                \"finished with 'stop' but tools configured and only \"\n"
+    "                                \"reasoning produced.\",\n"
+    "                                request_id,\n"
+    "                            )\n"
+    "                            import os as _p107_os\n"
+    "                            if _p107_os.environ.get(\"GENESIS_P107_RAISE_ERROR\", \"\").strip().lower() in (\"1\", \"true\", \"yes\"):\n"
+    "                                from vllm.entrypoints.openai.engine.protocol import (\n"
+    "                                    GenerationError as _P107_GenError,\n"
+    "                                )\n"
+    "                                raise _P107_GenError(\n"
+    "                                    \"MTP speculative decoding truncated tool call \"\n"
+    "                                    \"generation. Please retry.\"\n"
+    "                                )\n"
+    "                        choice_data = ChatCompletionResponseStreamChoice("
+)
+
 
 def _make_patcher() -> TextPatcher | None:
     target = resolve_vllm_file(
@@ -106,20 +150,36 @@ def _make_patcher() -> TextPatcher | None:
     )
     if target is None:
         return None
+    # Los dos anchors son ALTERNATIVAS mutuamente excluyentes (texto virgen vs
+    # texto ya parcheado por la v1), no piezas independientes. Dejarlos como dos
+    # sub-patches required=False bajo un mismo marker es la trampa de aplicacion
+    # parcial que prohibe A-19: el primero que calza escribe el marker y el otro
+    # no se reintenta nunca. Se elige el anchor al construir y queda UNO solo,
+    # required=True.
+    anchor = ANCHOR_OLD
+    name = "p107_mtp_truncation_v2"
+    try:
+        with open(target, encoding="utf-8") as f:
+            content = f.read()
+        if ANCHOR_V1 in content:
+            anchor = ANCHOR_V1
+            name = "p107_mtp_truncation_v1_upgrade"
+    except OSError:
+        pass
+
     return TextPatcher(
         patch_name="P107 MTP truncation detector (vllm#41467)",
         target_file=str(target),
         marker=GENESIS_P107_MARKER,
-        sub_patches=[TextPatch(
-            name="p107_mtp_truncation",
-            anchor=ANCHOR_OLD,
-            replacement=ANCHOR_NEW,
-            required=True,
-        )],
-        upstream_drift_markers=[
-            "MTP truncation detected",
-            "MTP speculative decoding truncated",
+        sub_patches=[
+            TextPatch(
+                name=name,
+                anchor=anchor,
+                replacement=ANCHOR_NEW,
+                required=True,
+            ),
         ],
+        upstream_drift_markers=[],
     )
 
 
@@ -137,7 +197,11 @@ def apply() -> tuple[str, str]:
         return "skipped", "serving.py not found"
     result, failure = patcher.apply()
     if result == TextPatchResult.APPLIED:
-        return "applied", "P107 applied: MTP truncation now raises retryable error"
+        import os as _os
+        modo = ("error reintentable" if _os.environ.get(
+            "GENESIS_P107_RAISE_ERROR", "").strip().lower() in ("1", "true", "yes")
+            else "solo warning (GENESIS_P107_RAISE_ERROR=1 para el error)")
+        return "applied", f"P107 aplicado: deteccion de truncamiento MTP — {modo}"
     if result == TextPatchResult.IDEMPOTENT:
         return "applied", "already applied (idempotent)"
     if result == TextPatchResult.SKIPPED:

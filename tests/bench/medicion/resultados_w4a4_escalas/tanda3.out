@@ -1,0 +1,7 @@
+[00:23:15] inicio tanda 2: rotaciones grandes + g1024
+[00:26:07] sim_densa_g0 NO ARRANCO
+[00:32:50] sim_had8192_g0 arriba
+[01:06:49] sim_had8192_g0: sim_had8192_g0: 6/6 [] | top-1 == token real 80.0% | logp medio del real -1.467
+[01:11:24] sim_had_g1024 arriba
+[01:17:20] sim_had_g1024: sim_had_g1024: 5/6 ['36821'] | top-1 == token real 82.5% | logp medio del real -1.357
+[01:17:25] fin tanda 2 (queda arriba noon W4A8 + PN125)

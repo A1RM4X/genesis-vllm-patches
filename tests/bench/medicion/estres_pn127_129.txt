@@ -1,0 +1,1 @@
+concurrencia=8 duracion=613s OK=267 ERR=0 tokens=237800 (388 tok/s agregado)

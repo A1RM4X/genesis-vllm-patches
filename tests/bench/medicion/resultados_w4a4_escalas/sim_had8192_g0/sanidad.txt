@@ -1,0 +1,32 @@
+38.4 s | El sistema de archivos de Linux organiza los datos en inodos y bloques.
+351.0 s | 254 tok | 0.7 tok/s
+```python
+def primeros_n_primos(n: int) -> list[int]:
+    """
+    Devuelve una lista con los primeros n números primos.
+
+    Args:
+        n: Cantidad de números primos a devolver. Debe ser un entero positivo.
+
+    Returns:
+        Una lista de enteros con los primeros n números primos.
+
+    Raises:
+        ValueError: Si n no es un entero positivo.
+
+    Ejemplo:
+        >>> primeros_n_primos(5)
+        [2, 3, 5, 7, 11]
+    """
+    if not isinstance(n, int) or n <= 0:
+        raise ValueError("n debe ser un entero positivo")
+
+    primos = []
+    candidato = 2
+
+    while len(primos) < n:
+        es_primo = True
+        for p in primos:
+            if p * p > candidato:
+                break
+ 

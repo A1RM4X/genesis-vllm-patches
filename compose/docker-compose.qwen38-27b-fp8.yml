@@ -279,20 +279,20 @@ services:
       - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=1
       # PN110 (2026-08-25): Requant FP8→INT8 W8A8 por capa con swap 1:1 (b_col
       # column-major, chunked 512, excluye GDN/mamba, invalida cache Dynamo).
-      - GENESIS_ENABLE_PN110_INT8_PHASE_DISPATCH=${PN110_ENABLE:-1}
-      - GENESIS_DISABLE_PN110=${PN110_DISABLE:-0}
-      - GENESIS_PN110_SK=${PN110_SK:-0}
-      - GENESIS_PN110_SK_ONLY=${PN110_SK_ONLY:-}
-      - GENESIS_PN110_SK_SKIP=${PN110_SK_SKIP:-}
-      - GENESIS_PN110_SWAP_ONLY_SK=${PN110_SWAP_ONLY_SK:-1}
-      - GENESIS_PN110_MAX_LAYERS=${PN110_MAX_LAYERS:-}
-      - GENESIS_PN110_LAYER_INDEX=${PN110_LAYER_INDEX:-}
-      - GENESIS_PN110_EXCLUDE_LAYERS=${PN110_EXCLUDE:-mtp.layers}
-      - GENESIS_PN110_DIAG_REF=${PN110_DIAG_REF:-0}
+      #- GENESIS_ENABLE_PN110_INT8_PHASE_DISPATCH=${PN110_ENABLE:-1}
+      #- GENESIS_DISABLE_PN110=${PN110_DISABLE:-0}
+      #- GENESIS_PN110_SK=${PN110_SK:-0}
+      #- GENESIS_PN110_SK_ONLY=${PN110_SK_ONLY:-}
+      #- GENESIS_PN110_SK_SKIP=${PN110_SK_SKIP:-}
+      #- GENESIS_PN110_SWAP_ONLY_SK=${PN110_SWAP_ONLY_SK:-1}
+      #- GENESIS_PN110_MAX_LAYERS=${PN110_MAX_LAYERS:-}
+      #- GENESIS_PN110_LAYER_INDEX=${PN110_LAYER_INDEX:-}
+      #- GENESIS_PN110_EXCLUDE_LAYERS=${PN110_EXCLUDE:-mtp.layers}
+      #- GENESIS_PN110_DIAG_REF=${PN110_DIAG_REF:-0}
       # Diagnostico de CARGA: valida cuantizacion+layout contra el peso fp8
       # y el GEMM del super kernel contra int8_hybrid_gemm. No toca el
       # forward, asi que no interfiere con cudagraphs. Acepta solo "1".
-      - GENESIS_PN110_DIAG_SK=${PN110_DIAG_SK:-0}
+      #- GENESIS_PN110_DIAG_SK=${PN110_DIAG_SK:-0}
       # B3 (2026-08-25): Custom all-reduce TP=2 fast path con fallback robusto
       # (P2P PIX entre las dos 3090). Sin esto vLLM usa PYNCCL genérico.
       # A/B aislado PN110 solo (2026-08-25): B2/B3/B5/B7 apagados para medir delta real
@@ -302,7 +302,7 @@ services:
       - GENESIS_ENABLE_B5_REJECTION_SAMPLER=0
       - GENESIS_ENABLE_B7_LM_HEAD=0
       # P100: CUDAGraphs FULL para spec-decode -> Mejora la latencia single-stream en +5-10%
-      - GENESIS_ENABLE_P100=1
+      #- GENESIS_ENABLE_P100=1
       # PN8: Cuantización online del borrador MTP.
       # APAGADO 2026-08-19: el propio Genesis lo marca "enabled but NOT
       # recommended on this GPU (may regress or no-op)", y su lógica es no-op
@@ -317,8 +317,8 @@ services:
       # del INT8, y CERO beneficio -- ni IMMA (los pesos quedaban FP16 densos),
       # ni VRAM (0 MiB), ni velocidad. El "ahorro" real eran 39 MiB en DISCO.
       # Además corrompía los weight_scale_inv del FP8 (filtro por numel>1024).
-      - GENESIS_ENABLE_MTP_QUANT_CACHE=0
-      - GENESIS_MTP_QUANT_FORMAT=int8
+      #- GENESIS_ENABLE_MTP_QUANT_CACHE=0
+      #- GENESIS_MTP_QUANT_FORMAT=int8
       # P66: filtra --cudagraph-capture-sizes a los divisibles por K+1.
       # ACTIVADO 2026-08-19. Con K=3 las tallas actuales (4..40) ya son todas
       # múltiplos de 4, así que hoy es NO-OP. Se activa como red de seguridad
@@ -334,7 +334,14 @@ services:
       - GENESIS_P68_P69_LONG_CTX_THRESHOLD_CHARS=1000
       # Formato XML <function=...> para el parser qwen3_coder
       - GENESIS_P69_REMINDER_STYLE=qwen3_coder
-      - GENESIS_ENABLE_P107_MTP_TRUNCATION_DETECTOR=1
+      # P107: DESACTIVADO (falso positivo en v0.27 donde parser.reasoning_parser siempre existe)
+      - GENESIS_ENABLE_P107_MTP_TRUNCATION_DETECTOR=0
+      # PN114: Guarda de límites en mamba_utils para spec-decode con concurrencia >= 4 (fix vllm#35288)
+      - GENESIS_ENABLE_PN114_MAMBA_ALIGN_BOUNDS_GUARD=1
+      # Guardas sobre el VALOR del block table: apagadas. No son el caso
+      # "fresh", ocultan una inconsistencia y dejan estado recurrente rancio
+      # en el bloque destino (contaminacion silenciosa entre secuencias).
+      - GENESIS_PN114_GUARD_BLOCK_TABLE=0
       - GENESIS_ENABLE_PN50_GDN_FUSED_PROJ=1
       - GENESIS_ENABLE_PN59_STREAMING_GDN=1
       - GENESIS_ENABLE_PN54_GDN_CONTIGUOUS_DEDUP=1
@@ -518,6 +525,9 @@ services:
       # KV y con transitorio de GDN.
       #
       # Si vuelve a OOMear, el primer valor a bajar es este, no el util.
+      #
+      # 2026-08-30: Restaurado a 10 con PN114 (fix vllm#35288 en mamba_utils) y P107 desactivado.
+      # Las tallas de CUDA graph (4..40) cubren 10 seqs x 4 tokens/paso = 40.
       - --max-num-seqs
       - "10"
       # PROBADO SACARLO Y NO ANDA (2026-08-17), aun con P2P funcionando:
@@ -565,7 +575,8 @@ services:
       - "2"
       # Contexto máximo soportado (default 32k para fit seguro de KV cache en FP8)
       - --max-model-len
-      - ${MAX_MODEL_LEN:-32768}
+      - "256000"
+      #- ${MAX_MODEL_LEN:-32768}
       # Asignación de VRAM por GPU para pesas + pool de KV Cache (97.5% de 24GB)
       # 0.965 -> 0.82 al activar el offloading. --enable-cumem-allocator (que
       # OffloadingConnector exige) hace que el profiler SOBREESTIME el KV
@@ -576,7 +587,7 @@ services:
       # scratch de compresion en GPU (PN99). Achicar L1 para agrandar la
       # L2 EFECTIVA es buen negocio cuando L2 es el cuello: PN98 medía
       # L2/L1 = 0,76x, o sea que sobra L1 y falta L2.
-      - "0.745"
+      - "0.925"
       # Visión: 1 imagen por request (el contrato de agi_vision_inspector es de
       # UNA imagen) y video en 0 — nunca se usa. El budget del encoder cache se
       # dimensiona por el ítem multimodal MÁS GRANDE, y un video pesa mucho más
@@ -748,7 +759,8 @@ services:
       - "36"
       - "40"
       - --async-scheduling
-      # Decodificación especulativa MTP nativa con 3 tokens borrador por paso
+      # Decodificación especulativa MTP nativa con 3 tokens borrador por paso.
+      # Re-activado con PN114 (fix vllm#35288) y P107 desactivado.
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":3}'
       - --host

@@ -1,0 +1,1 @@
+sim_had_g256: 160 sondeos hasta 99998 tokens en 317s | top-1 == token real 80.0% | logp medio del real -1.280

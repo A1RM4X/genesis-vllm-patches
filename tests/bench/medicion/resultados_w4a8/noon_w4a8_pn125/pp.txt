@@ -1,0 +1,3 @@
+  corrida 0: 42797 tok en 21.07s = 2031 tok/s de prefill
+  corrida 1: 42797 tok en 19.67s = 2175 tok/s de prefill
+  corrida 2: 42797 tok en 19.51s = 2193 tok/s de prefill

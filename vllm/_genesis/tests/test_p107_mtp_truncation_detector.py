@@ -59,6 +59,29 @@ def test_idempotent_on_synthetic(tmp_path):
     assert r2 == TextPatchResult.IDEMPOTENT
 
 
+def test_v1_upgrade_on_synthetic(tmp_path):
+    from vllm._genesis.wiring.text_patch import TextPatchResult
+    M = _wiring()
+    target = tmp_path / "serving.py"
+    target.write_text("# header\n" + M.ANCHOR_V1 + "\n# tail\n")
+    patcher = M.TextPatcher(
+        patch_name="P107 test",
+        target_file=str(target),
+        marker=M.GENESIS_P107_MARKER,
+        sub_patches=[
+            M.TextPatch(name="p107_v2", anchor=M.ANCHOR_OLD, replacement=M.ANCHOR_NEW, required=False),
+            M.TextPatch(name="p107_v1_upgrade", anchor=M.ANCHOR_V1, replacement=M.ANCHOR_NEW, required=False),
+        ],
+    )
+    r1, _ = patcher.apply()
+    assert r1 == TextPatchResult.APPLIED
+    body = target.read_text()
+    assert "GENESIS_P107_RAISE_ERROR" in body
+    assert M.GENESIS_P107_MARKER in body
+    r2, _ = patcher.apply()
+    assert r2 == TextPatchResult.IDEMPOTENT
+
+
 def test_env_flag_default_off(monkeypatch):
     from vllm._genesis.dispatcher import should_apply
     monkeypatch.delenv("GENESIS_ENABLE_P107_MTP_TRUNCATION_DETECTOR", raising=False)

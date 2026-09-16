@@ -428,6 +428,8 @@ def _has_shift(shifts: torch.Tensor) -> bool:
     """
     v = getattr(shifts, "_has_shift", None)
     if v is None:
+        if torch.cuda.is_current_stream_capturing():
+            return True
         v = bool(shifts.any().item())
         try:
             shifts._has_shift = v

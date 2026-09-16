@@ -1,0 +1,12 @@
+  OK  esperado=19481     -> 19481
+  OK  esperado=6912      -> 6912
+  OK  esperado=12        -> 12
+  OK  esperado=225       -> 225
+  OK  esperado=366       -> 366
+  OK  esperado=Canberra  -> Canberra
+  OK  esperado=1969      -> 1969
+  OK  esperado=5040      -> 5040
+  OK  esperado=10        -> 10
+  OK  esperado=243       -> 243
+
+  aciertos: 10/10

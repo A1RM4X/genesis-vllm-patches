@@ -1,0 +1,603 @@
+# SPDX-License-Identifier: Apache-2.0
+"""PN131 — decode de atencion ENTERO (SK-18h, PTX) sobre la KV int8_per_token_head.
+
+Que hace
+--------
+Con ``--kv-cache-dtype int8_per_token_head`` y el backend TRITON_ATTN, reemplaza:
+
+* ``do_kv_cache_update``: escribe la KV con un layout PROPIO dentro de la misma
+  reserva de vLLM (520 B por token-cabeza, se usan 516):
+      K int8 [BS][NH][256] | V int8 [NH][256][BS] | escalas int16 [BS][NH][2]
+  V va por dimension porque el mma de w.v la lee asi sin transponer.
+* ``forward``: los pasos solo-decode (<= 5 tokens por pedido: MTP K=3 son 4) van por
+  SK-18h (Q.K int8, softmax entero en streaming, w.v int8) + union, todo PTX entero.
+  Los pasos con prefill decuantizan los bloques que tocan a fp16 y llaman al kernel
+  Triton de vLLM sin cuantizar.
+
+CUDA graph
+----------
+El camino de decode uniforme (lo unico que vLLM corre en FULL graph) no tiene ni una
+sincronizacion ni una decision que dependa de datos: buffers estaticos compartidos
+por todas las capas (una sola reserva del tamano maximo, vistas por lote), grilla con
+la cantidad MAXIMA de paginas (las paginas sin tokens salen en el acto), referencias de
+escala como tensores de GPU. Los lanzamientos PTX son cuLaunchKernel, igual que Triton,
+y quedan grabados en el grafo.
+
+Escalas
+-------
+skf/svf son int16 Q15 relativos a una referencia por capa (potencia de 2, 64x el
+maximo de la primera escritura real, fijada en GPU sin sincronizar). K entra al kernel
+con multiplicacion de 64 bits (sin perdida) y V con desplazamiento VSH=11 (svf <= 2048:
+hasta 4x el maximo inicial; por encima satura).
+
+Frontera flotante: cuantizar q/k/v de entrada (fp16 -> int8) y la division final
+O * escala / S -> fp16. Todo lo del medio es entero.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+
+import numpy as np
+import torch
+
+log = logging.getLogger("genesis.pn131")
+
+QD = 256
+MB = 32
+ZSH = 13
+ZSH4 = int(os.environ.get("GENESIS_PN131_ZSH4", 16))   # int4: z = (sum_g acc_g*rq_g*rk_g*kmax) >> ZSH4
+WCAP = int(os.environ.get("GENESIS_PN131_WCAP", 1911))  # tope de wp: 3 planos de nibbles
+QPLANOS = int(os.environ.get("GENESIS_PN131_QPLANOS", 2))  # 2 = q int8 en dos planos de nibbles
+PLANOS_A = int(os.environ.get("GENESIS_PN131_PLANOSA", 1 if QPLANOS == 2 else QPLANOS))
+ESPERA4 = int(os.environ.get("GENESIS_PN131_ESPERA", 1))
+# Ventana reciente en int8 (camino hibrido): PAGS paginas por secuencia espejadas en un pool
+# aparte. La atencion se concentra ahi (39-49% de la masa en las ultimas 832 posiciones), y
+# dejarla exacta baja el error de 6,5% a 4,0% (capa 35) y de 5,6% a 0,9% (capa 3).
+VENT = int(os.environ.get("GENESIS_PN131_VENTANA", 2))     # paginas espejadas (0 = sin espejo)
+ESC8 = 3               # el espejo usa refs 2^ESC8 mas chicas (mas precision de escala)   # grupos cp.async pendientes (0 = esperar todo)  # planos en la pasada del maximo
+NIV4 = int(os.environ.get("GENESIS_PN131_NIV", 119 if QPLANOS == 2 else 7))
+# escala del logit int4: q = mx*rq/(255*NIV4), k = KM*r/16 * 2^ek/32767, y 16 = sqrt(256)
+MQ4 = round(2 ** 56 / (NIV4 * 32767 * 255 * 16 * 16 * math.log(2)))
+CLIP4 = int(os.environ.get("GENESIS_PN131_CLIP", 243))   # recorte de la escala, sobre 256
+MARGEN_K4 = float(os.environ.get("GENESIS_PN131_MARGENK4", 8))   # int4: KM de 12 bits
+MARGEN4 = float(os.environ.get("GENESIS_PN131_MARGEN4", 16))    # int4: svf <= 2^VSH
+VSH = 11
+MARGEN = 64.0          # V: svf <= 2^VSH -> hasta 4x el maximo inicial
+MARGEN_K = 16.0        # K: skf con ~11 bits; satura recien a 16x (k rotada/normalizada no crece tanto)
+MAX_TOK_DECODE = 5
+CPG = 16
+LN2 = math.log(2)
+SH_H = 32 * (256 + 128) + 2 * 64 * 256 + 2 * 256 * 64 + 2 * 64 * 2 * 4
+SH_I = 32 * QPLANOS * 128 + 2 * 128 * 128 + 2 * 256 * 64 + 2 * 32 * 128 + 2 * 128 * 2 * 8
+_QA_QB = None
+_k = {}
+# Rotacion Hadamard de q/k: "ptx" = entera dentro de prep/escribir (reemplaza PN126 en capas PN131)
+ROT_PTX = os.environ.get("GENESIS_PN131_ROT", "ptx") == "ptx"
+_signos = {}
+
+
+def _signos_dev(dev):
+    s = _signos.get(dev.index)
+    if s is None:
+        g = torch.Generator(device=dev).manual_seed(126)            # mismos signos que PN126
+        s = (torch.randint(0, 2, (QD,), generator=g, device=dev).to(torch.int32) * 2 - 1).contiguous()
+        _signos[dev.index] = s
+    return s
+
+
+def _rotar_q_prefill(query):
+    """Prefill (eager): misma rotacion que el kernel entero, en fp16 (la KV ya guarda k rotada)."""
+    s = _signos_dev(query.device).to(query.dtype)
+    H = _hadamard(query.device, query.dtype)
+    return torch.einsum("de,the->thd", H, query * s) / 16.0
+
+
+_H = {}
+
+
+def _hadamard(dev, dtype):
+    k = (dev.index, dtype)
+    if k not in _H:
+        H = torch.ones(1, 1, device=dev, dtype=torch.float32)
+        while H.shape[0] < QD:
+            H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+        _H[k] = H.to(dtype)
+    return _H[k]
+
+
+def rot_ptx_activa() -> bool:
+    return _habilitado() and ROT_PTX
+
+
+# kv-cache-dtype -> camino PN131 (se elige con --kv-cache-dtype, nada mas)
+_MODOS = {"int8_per_token_head": "int8", "int4_per_token_head": "int4"}
+
+
+def _habilitado() -> bool:
+    return os.environ.get("GENESIS_ENABLE_PN131_SK18", "0") == "1"
+
+
+def _int4_listo() -> bool:
+    return os.environ.get("GENESIS_PN131_INT4", "1") == "1" and _INT4_IMPL
+
+
+_INT4_IMPL = True    # camino int4 completo (SK-18i)
+
+
+def modo(impl) -> str:
+    """"int8" o "int4" segun --kv-cache-dtype (KVQuantMode del impl)."""
+    from vllm.v1.kv_cache_interface import KVQuantMode
+    return "int4" if getattr(impl, "_kv_quant_mode", None) == KVQuantMode.INT4_PER_TOKEN_HEAD else "int8"
+
+
+def dtype_activo(cache_dtype: str) -> bool:
+    m = _MODOS.get(str(cache_dtype))
+    return _habilitado() and (m == "int8" or (m == "int4" and _int4_listo()))
+
+
+def activo(impl, layer=None) -> bool:
+    if not _habilitado():
+        return False
+    excl = os.environ.get("GENESIS_PN131_EXCLUIR", "")
+    if excl and layer is not None and any(x and x in getattr(layer, "layer_name", "") for x in excl.split(",")):
+        return False
+    from vllm.v1.kv_cache_interface import KVQuantMode
+    modo = getattr(impl, "_kv_quant_mode", None)
+    ok_modo = modo == KVQuantMode.INT8_PER_TOKEN_HEAD or (modo == KVQuantMode.INT4_PER_TOKEN_HEAD and _int4_listo())
+    return (ok_modo
+            and impl.head_size == QD and impl.alibi_slopes is None and impl.sinks is None
+            and tuple(impl.sliding_window) in ((-1, -1), (None, None)) and not impl.logits_soft_cap)
+
+
+def _coef():
+    global _QA_QB
+    if _QA_QB is None:
+        x = np.linspace(0, 1, 2000)
+        bs = np.linspace(0.1, 0.25, 3001)
+        err = [np.abs((1 - (0.5 + b) * x + b * x * x) / 2 ** (-x) - 1).max() for b in bs]
+        b = bs[int(np.argmin(err))]
+        _QA_QB = (round((0.5 + b) * 32768), round(b * 32768))
+    return _QA_QB
+
+
+def _kernels(md="int8"):
+    dev = (torch.cuda.current_device(), md)
+    if dev not in _k:
+        from vllm._genesis.kernels.ptx_lab import Kernel
+        qa, qb = _coef()
+        defs = [f"-DQA={qa}", f"-DQB={qb}"]
+        if md == "int4":
+            d4 = [f"-DWCAP={WCAP}", f"-DQPLANOS={QPLANOS}", f"-DPLANOS_A={PLANOS_A}", f"-DESPERA={ESPERA4}", f"-DDIAG={int(os.environ.get('GENESIS_PN131_DIAG4', 0))}"]
+            ks = dict(main=Kernel("sk18i_batch.cu", "sk18i_batch", defs=defs + d4, warps=4),
+                      escribir=Kernel("sk18i_escribir.cu", "sk18i_escribir", defs=[f"-DCLIP={CLIP4}"], warps=1),
+                      prep=Kernel("sk18i_prep.cu", "sk18i_prep", defs=[f"-DMQ4={MQ4}", f"-DQPLANOS={QPLANOS}", f"-DNIV={NIV4}"], warps=1),
+                      union=Kernel("sk18h_union4.cu", "sk18h_union4", defs=defs + ["-DO32=1"], warps=1),
+                      decuant=Kernel("sk18i_decuant.cu", "sk18i_decuant", warps=1),
+                      salida=Kernel("sk18i_salida.cu", "sk18i_salida", warps=1))
+            if VENT > 0:     # espejo int8 de la ventana reciente
+                ks["lado"] = Kernel("sk18i_lado.cu", "sk18i_lado", warps=4)
+                ks["escribir8"] = Kernel("sk18h_escribir2.cu", "sk18h_escribir2", defs=["-DROTV=1"], warps=1)
+                ks["prep8"] = Kernel("sk18h_prep2.cu", "sk18h_prep2", warps=1)
+                ks["espejo"] = Kernel("sk18h_batch2.cu", "sk18h_batch2",
+                                      defs=defs + [f"-DHIB=1", f"-DESC8={ESC8}", f"-DWCAPW={WCAP}"], warps=4)
+            for x in ks.values():
+                x.cargar()
+            _k[dev] = ks
+            return ks
+        ks = dict(main=Kernel("sk18h_batch2.cu", "sk18h_batch2", defs=defs, warps=4),
+                  escribir=Kernel("sk18h_escribir2.cu" if ROT_PTX else "sk18h_escribir.cu",
+                                  "sk18h_escribir2" if ROT_PTX else "sk18h_escribir", warps=1),
+                  prep=Kernel("sk18h_prep2.cu" if ROT_PTX else "sk18h_prep.cu",
+                              "sk18h_prep2" if ROT_PTX else "sk18h_prep", warps=1),
+                  union=Kernel("sk18h_union4.cu", "sk18h_union4", defs=defs, warps=1),
+                  decuant=Kernel("sk18h_decuant.cu", "sk18h_decuant", warps=1),
+                  salida=Kernel("sk18h_salida.cu", "sk18h_salida", warps=1))
+        for x in ks.values():
+            x.cargar()
+        _k[dev] = ks
+    return _k[dev]
+
+
+# ─────────────────────────── estado por capa (GPU) ─────────────────────────
+class _Capa:
+    """refs = [ek, ev] int32 en GPU: referencias 2^ek / 2^ev (las leen los kernels).
+    Se fijan en la primera escritura eager con slots validos (siempre un prefill)."""
+    __slots__ = ("refs", "refs8", "fija", "lado")
+
+    def __init__(self, dev):
+        self.refs = torch.zeros(2, dtype=torch.int32, device=dev)
+        self.refs8 = torch.zeros(2, dtype=torch.int32, device=dev)   # espejo int8 (refs - ESC8)
+        self.fija = False
+        self.lado = None          # pool espejo int8 de la ventana reciente, PROPIO de esta capa
+
+
+_capas: dict[int, _Capa] = {}
+
+
+def _capa(impl, dev) -> _Capa:
+    c = _capas.get(id(impl))
+    if c is None:
+        c = _capas[id(impl)] = _Capa(dev)
+    return c
+
+
+def _lado(c, dev, bmax, nh, bs):
+    """Pool espejo de la capa (una sola reserva; 1,7 MB por secuencia y pagina)."""
+    if c.lado is None:
+        c.lado = torch.zeros(bmax * VENT * bs * nh * 520, dtype=torch.int8, device=dev)
+        log.warning("PN131 espejo int8: %d paginas de %d tokens (%.1f MiB por capa)",
+                    bmax * VENT, bs, c.lado.numel() / 2**20)
+    return c.lado
+
+
+# ─────────────────────── buffers estaticos compartidos ─────────────────────
+class _Bufs:
+    def __init__(self, dev, bmax, nchmax, nh, bs=832):
+        self.bmax, self.nchmax, self.nh, self.bs = bmax, nchmax, nh, bs
+        R = bmax * nh * MB
+        NG = (nchmax + CPG - 1) // CPG
+        z = lambda *s, dt: torch.zeros(*s, dtype=dt, device=dev)
+        self.Q = z(bmax * nh * MB * QD, dt=torch.int8)
+        self.rq = z(R * 4, dt=torch.int32)
+        self.sq = z(R * 2 * 4, dt=torch.int32)        # sumas de q por grupo (int4, hasta 2 planos)
+        self.oc = z(nchmax * R, dt=torch.int32)       # correccion del cero de V (int4)
+        if VENT > 0:                                  # espejo int8 de la ventana reciente
+            self.dueno = torch.full((bmax * VENT,), -1, dtype=torch.int32, device=dev)
+            self.slot2 = z(16384, dt=torch.int64)
+            self.Q8 = z(R * QD, dt=torch.int8)
+            self.mqb8 = z(R, dt=torch.int32)
+            self.dcap8 = z(R, dt=torch.int32)
+            self.lim8 = z(R, dt=torch.int32)
+        self.lim = z(R, dt=torch.int32)
+        self.mqb = z(R, dt=torch.int32)
+        self.dcap = z(R, dt=torch.int32)
+        self.oh = z(nchmax * R * QD, dt=torch.int32)
+        self.ol = z(nchmax * R * QD, dt=torch.int32)
+        self.om = z(nchmax * R, dt=torch.int32)
+        self.os = z(nchmax * R, dt=torch.int32)
+        self.Og = z(NG * R * QD, dt=torch.int64)
+        self.Sg = z(NG * R, dt=torch.int64)
+        self.ar = torch.arange(MAX_TOK_DECODE, device=dev, dtype=torch.int32)
+        mb = (self.oh.numel() + self.ol.numel()) * 4 / 2**20
+        log.info("PN131 buffers: bmax=%d nchmax=%d (%.0f MiB de acumuladores)", bmax, nchmax, mb)
+
+
+_bufs: dict[int, _Bufs] = {}
+
+
+def _get_bufs(dev, nh, bs):
+    b = _bufs.get(dev.index)
+    if b is None:
+        try:
+            from vllm.config import get_current_vllm_config
+            cfg = get_current_vllm_config()
+            maxlen = int(cfg.model_config.max_model_len)
+            bmax = int(cfg.scheduler_config.max_num_seqs)
+        except Exception:
+            maxlen, bmax = 262144, 10
+        bmax = int(os.environ.get("GENESIS_PN131_BMAX", bmax))
+        nchmax = (maxlen + bs - 1) // bs
+        b = _bufs[dev.index] = _Bufs(dev, bmax, nchmax, nh, bs)
+    return b
+
+
+def _geom(kv_cache):
+    nb, nh, bs, cont = kv_cache.shape
+    blk = kv_cache.stride(0) * kv_cache.element_size()
+    raw = torch.as_strided(kv_cache, (nb, blk), (blk, 1))
+    return nb, nh, bs, blk, raw
+
+
+def _filas(x):
+    """[T, H, 256] con cada fila contigua (strides (s0, 256, 1)): se usa sin copiar."""
+    if x.dim() == 3 and x.stride(2) == 1 and x.stride(1) == QD:
+        return x
+    return x.contiguous()
+
+
+def _cuant(x):
+    """fp [..., 256] -> int8, escala float32 [...]."""
+    s = x.abs().amax(-1).float().clamp_min(1e-8) / 127.0
+    q = torch.round(x.float() / s[..., None]).clamp_(-127, 127).to(torch.int8)
+    return q, s
+
+
+# ─────────────────────────────── escritura ────────────────────────────────
+def escribir(impl, layer, key, value, kv_cache, slot_mapping):
+    """Un lanzamiento PTX entero (sk18h_escribir). Apta para CUDA graph."""
+    if kv_cache.numel() == 0:
+        return
+    n = slot_mapping.shape[0]
+    if n == 0:
+        return
+    dev = key.device
+    nb, nh, bs, blk, raw = _geom(kv_cache)
+    md = modo(impl)
+    niv = 7.0 if md == "int4" else 127.0
+    c = _capa(impl, dev)
+    if not c.fija and not torch.cuda.is_current_stream_capturing():
+        ok = slot_mapping >= 0
+        if bool(ok.any()):
+            kk_ = key[:n].float()
+            vv_ = value[:n].float()
+            if ROT_PTX:   # la referencia de K es la de k ROTADA (el max baja ~2x con Hadamard)
+                kk_ = _rotar_q_prefill(kk_.view(n, -1, QD).to(torch.float32))
+            if md == "int4":   # en int4 tambien la V va rotada
+                vv_ = _rotar_q_prefill(vv_.view(n, -1, QD).to(torch.float32))
+            sk = float(kk_.abs().amax(-1)[ok].max()) / niv
+            sv = float(vv_.abs().amax(-1)[ok].max()) / niv
+            # Las pasadas de calentamiento escriben ceros en slots "validos": no fijar la
+            # referencia con eso (la MTP quedaba en 2^-20 y toda su atencion saturaba).
+            if sk > 1e-3 and sv > 1e-3:
+                ek = math.ceil(math.log2(sk * (MARGEN_K4 if md == "int4" else MARGEN_K)))
+                ev = math.ceil(math.log2(sv * (MARGEN4 if md == "int4" else MARGEN)))
+                c.refs.copy_(torch.tensor([ek, ev], dtype=torch.int32))
+                c.refs8.copy_(torch.tensor([ek - ESC8, ev - ESC8], dtype=torch.int32))
+                c.fija = True
+                log.warning("PN131 %s: ek=%d ev=%d", getattr(layer, "layer_name", "?"), ek, ev)
+    ks = _kernels(md)
+    k16 = _filas(key[:n]).view(torch.int16)
+    v16 = _filas(value[:n]).view(torch.int16)
+    slot = slot_mapping if slot_mapping.dtype == torch.int64 else slot_mapping.to(torch.int64)
+    if md == "int4":
+        # dos tokens vecinos comparten byte en V: un lanzamiento por paridad de slot
+        for par in (0, 1):
+            ks["escribir"].lanzar((n, nh), [k16, v16, slot, raw, c.refs, _signos_dev(dev),
+                                            nh, bs, blk, VSH, k16.stride(0), v16.stride(0), par])
+        if VENT > 0:
+            _espejar(impl, ks, k16, v16, slot, n, dev, nh, bs, c)
+    elif ROT_PTX:
+        ks["escribir"].lanzar((n, nh), [k16, v16, slot, raw, c.refs, _signos_dev(dev), nh, bs, blk, VSH, k16.stride(0), v16.stride(0)])
+    else:
+        ks["escribir"].lanzar((n, nh), [k16, v16, slot, raw, c.refs, nh, bs, blk, VSH, k16.stride(0), v16.stride(0)])
+
+
+_md_forzada = None      # solo para los tests offline, que llaman escribir() sin contexto
+
+
+def _md_actual(impl, layer=None):
+    """Metadata del paso desde el contexto de forward (do_kv_cache_update no la recibe)."""
+    if _md_forzada is not None:
+        return _md_forzada
+    try:
+        from vllm.forward_context import get_forward_context
+        md = get_forward_context().attn_metadata
+    except Exception:
+        return None
+    if isinstance(md, dict):
+        md = md.get(getattr(layer, "layer_name", None)) or next(iter(md.values()), None)
+    return md if md is not None and getattr(md, "seq_lens", None) is not None else None
+
+
+def _espejar(impl, ks, k16, v16, slot, n, dev, nh, bs, c):
+    """Copia los tokens del paso al pool int8 de la ventana reciente (ranura b*VENT + p%VENT)."""
+    md = _md_actual(impl)
+    if md is None:
+        return
+    bf = _get_bufs(dev, nh, bs)
+    B = int(md.query_start_loc.shape[0]) - 1
+    if B > bf.bmax:
+        return
+    slot2 = bf.slot2[:n]
+    blk8 = bs * nh * 520
+    ks["lado"].lanzar(((n + 127) // 128, 1), [slot, md.query_start_loc, md.seq_lens, slot2,
+                                              bf.dueno, n, B, bs, VENT])
+    ks["escribir8"].lanzar((n, nh), [k16, v16, slot2, _lado(c, dev, bf.bmax, nh, bs), c.refs8, _signos_dev(dev),
+                                     nh, bs, blk8, VSH, k16.stride(0), v16.stride(0)])
+
+
+# ─────────────────────────────── forward ──────────────────────────────────
+def forward(impl, layer, query, kv_cache, md, output):
+    qsl = getattr(md, "genesis_qsl_cpu", None)
+    if qsl is not None:
+        qsl = qsl.numpy() if hasattr(qsl, "numpy") else np.asarray(qsl)
+        nreq = len(qsl) - 1
+        qlen = np.diff(qsl)[:nreq]
+        if nreq > 0 and qlen.max() <= MAX_TOK_DECODE and qlen.min() >= 1:
+            L = int(qlen.max())
+            if bool((qlen == L).all()):
+                capturando = torch.cuda.is_current_stream_capturing()
+                _decode_uniforme(impl, query, kv_cache, md, output, nreq, L, capturando)
+                _diag(impl, layer, query, kv_cache, md, output, nreq, L, capturando)
+                return output
+    return _prefill_decuant(impl, layer, query, kv_cache, md, output)
+
+
+_DIAG = os.environ.get("GENESIS_PN131_DIAG", "")
+_diag_n = {}
+
+
+def _diag(impl, layer, query, kv_cache, md, output, B, L, capturando):
+    """Compara el decode SK-18h contra decuantizado + Triton en capas que matcheen."""
+    nombre = getattr(layer, "layer_name", "")
+    if not _DIAG or capturando or _DIAG not in nombre:
+        return
+    k = _diag_n.get(nombre, 0)
+    if k >= 40:
+        return
+    _diag_n[nombre] = k + 1
+    nt = B * L
+    ref = torch.zeros_like(output)
+    _prefill_decuant(impl, layer, query, kv_cache, md, ref)
+    a = output[:nt].float().view(nt, -1)
+    r = ref[:nt].float().view(nt, -1)
+    dif = ((a - r).norm(dim=-1) / r.norm(dim=-1).clamp_min(1e-6))
+    log.warning("PN131 DIAG %s B=%d L=%d seq=%s dif_rel=%s refs=%s", nombre, B, L,
+                md.seq_lens[:B].tolist(), [round(x, 4) for x in dif.tolist()[:8]], _capa(impl, query.device).refs.tolist())
+
+
+def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
+    mo = modo(impl)
+    ks = _kernels(mo)
+    dev = query.device
+    nb, nh, bs, blk, raw = _geom(kv_cache)
+    G = impl.num_heads // nh
+    bf = _get_bufs(dev, nh, bs)
+    if B > bf.bmax:
+        raise RuntimeError(f"PN131: lote {B} > GENESIS_PN131_BMAX {bf.bmax}")
+    c = _capa(impl, dev)
+    nt = B * L
+    R = B * nh * MB
+    # En CUDA graph la grilla usa la cantidad MAXIMA de paginas; en eager, la justa.
+    NCH = bf.nchmax if capturando else min(bf.nchmax, (int(md.max_seq_len) + bs - 1) // bs)
+    NG = (NCH + CPG - 1) // CPG
+    Qb = bf.Q[: R * QD]
+    lim = bf.lim[:R]
+    mqb = bf.mqb[:R]
+    dcap = bf.dcap[:R]
+    q16 = _filas(query[:nt].view(nt, nh * G, QD)).view(torch.int16)
+    seq = md.seq_lens
+    if mo == "int4":
+        Qb = bf.Q[: R * QPLANOS * (QD // 2)].view(torch.uint8)
+        rq = bf.rq[: R * 4]
+        sqb = bf.sq[: R * QPLANOS * 4]
+        ks["prep"].lanzar((nt, nh * G), [q16, seq, c.refs, _signos_dev(dev), Qb, rq, sqb, lim, mqb, dcap,
+                                         L, nh, G, MB, ZSH4, q16.stride(0)])
+        if VENT > 0:   # q en int8 y mqb/dcap propios para el espejo de la ventana
+            ks["prep8"].lanzar((nt, nh * G), [q16, seq, c.refs8, _signos_dev(dev), bf.Q8[: R * QD],
+                                              bf.lim8[:R], bf.mqb8[:R], bf.dcap8[:R],
+                                              L, nh, G, MB, ZSH, q16.stride(0)])
+    elif ROT_PTX:
+        ks["prep"].lanzar((nt, nh * G), [q16, seq, c.refs, _signos_dev(dev), Qb, lim, mqb, dcap, L, nh, G, MB, ZSH, q16.stride(0)])
+    else:
+        ks["prep"].lanzar((nt, nh * G), [q16, seq, c.refs, Qb, lim, mqb, dcap, L, nh, G, MB, ZSH, q16.stride(0)])
+    bt = md.block_table
+    oh = bf.oh[: NCH * R * QD]
+    ol = bf.ol[: NCH * R * QD]
+    om = bf.om[: NCH * R]
+    os_ = bf.os[: NCH * R]
+    if mo == "int4":
+        oc = bf.oc[: NCH * R]
+        ks["main"].lanzar((NCH, B * nh), [Qb, rq, sqb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_, oc,
+                                          blk, bt.stride(0), bs, NCH, nh, ZSH4, VSH,
+                                          bf.dueno if VENT > 0 else oc, VENT], shared=SH_I)
+        if VENT > 0:
+            blk8 = bs * nh * 520
+            ks["espejo"].lanzar((VENT, B * nh), [bf.Q8[: R * QD], _lado(c, dev, bf.bmax, nh, bs), bt, seq, bf.lim8[:R],
+                                                bf.mqb8[:R], bf.dcap8[:R], oh, ol, om, os_,
+                                                blk8, bt.stride(0), bs, NCH, nh, ZSH, VSH,
+                                                bf.dueno, mqb, oc, VENT], shared=SH_H)
+    else:
+        ks["main"].lanzar((NCH, B * nh), [Qb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_,
+                                          blk, bt.stride(0), bs, NCH, nh, ZSH, VSH], shared=SH_H)
+    Og = bf.Og[: NG * R * QD]
+    Sg = bf.Sg[: NG * R]
+    if mo == "int4":
+        ks["union"].lanzar((R, NG), [oh, ol, om, os_, oc, mqb, dcap, seq, Og, Sg, R, NCH, CPG, nh * MB, bs])
+    else:
+        ks["union"].lanzar((R, NG), [oh, ol, om, os_, mqb, dcap, seq, Og, Sg, R, NCH, CPG, nh * MB, bs])
+    o16 = output[:nt].view(torch.int16)
+    if mo == "int4":
+        ks["salida"].lanzar((nt, nh * G), [Og, Sg, c.refs, _signos_dev(dev), o16, NG, R, L, nh, G, MB, VSH])
+    else:
+        ks["salida"].lanzar((nt, nh * G), [Og, Sg, c.refs, o16, NG, R, L, nh, G, MB, VSH])
+
+
+# ─────────────────────────── prefill (decuantizado) ───────────────────────
+def decuantizar_bloques(impl, kv_cache, ids):
+    """Paginas -> (k, v) fp16 [n, BS, NH, 256] con el kernel entero sk18h_decuant (vistas de
+    una sola reserva [n, 2, BS, NH, 256], que es lo que usa FlashInfer)."""
+    kv = decuantizar_kv(impl, kv_cache, ids)
+    return kv[:, 0], kv[:, 1]
+
+
+def decuantizar_kv(impl, kv_cache, ids):
+    nb, nh, bs, blk, raw = _geom(kv_cache)
+    c = _capa(impl, kv_cache.device)
+    ids = ids.to(torch.int64).contiguous()
+    n = ids.shape[0]
+    kv = torch.empty((n, 2, bs, nh, QD), dtype=torch.float16, device=kv_cache.device)
+    mo = modo(impl)
+    if mo == "int4":
+        _kernels(mo)["decuant"].lanzar((n, bs), [raw, ids, c.refs, _signos_dev(kv_cache.device),
+                                                 kv.view(torch.int16), blk, bs, nh])
+    else:
+        _kernels(mo)["decuant"].lanzar((n, bs), [raw, ids, c.refs, kv.view(torch.int16), blk, bs, nh])
+    return kv
+
+
+_fi = {}
+
+
+def _prefill_flashinfer(impl, layer, query, kv_cache, md, output):
+    """Prefill: decuantiza a fp16 SOLO las paginas que tocan los pedidos del paso y usa el
+    prefill paginado de FlashInfer (page 832) sobre ese cache temporal. El plan se arma una
+    vez por paso (misma metadata para las 16 capas) y se reusa."""
+    import flashinfer
+    dev = query.device
+    nact = md.num_actual_tokens
+    nb, nh, bs, blk, raw = _geom(kv_cache)
+    G = impl.num_heads // nh
+    B = md.query_start_loc.shape[0] - 1
+    est = _fi.get(dev.index)
+    if est is None:
+        ws = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        est = _fi[dev.index] = dict(w=flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD"), clave=None)
+    clave = (id(md), md.num_actual_tokens, md.max_seq_len)
+    if est["clave"] != clave:
+        seq = md.seq_lens[:B].cpu().to(torch.int64)
+        qsl = getattr(md, "genesis_qsl_cpu", None)
+        qsl = (qsl if qsl is not None else md.query_start_loc.cpu()).to(torch.int32)
+        npag = (seq + bs - 1) // bs
+        maxp = int(npag.max())
+        bt = md.block_table[:B, :maxp].to(torch.int64)
+        valid = (torch.arange(maxp)[None, :] < npag[:, None]).to(dev)
+        ids, inv = torch.unique(bt[valid], return_inverse=True)
+        kvi = torch.zeros(B + 1, dtype=torch.int32)
+        kvi[1:] = torch.cumsum(npag, 0).to(torch.int32)
+        last = (seq - (npag - 1) * bs).to(torch.int32)
+        est["w"].plan(qsl, kvi, inv.to(torch.int32), last, impl.num_heads, nh, QD, bs, causal=True,
+                      pos_encoding_mode="NONE", sm_scale=impl.scale,
+                      q_data_type=torch.float16, kv_data_type=torch.float16)
+        est.update(clave=clave, ids=ids)
+    kv = decuantizar_kv(impl, kv_cache, est["ids"])
+    o = est["w"].run(query[:nact].to(torch.float16), kv)
+    output[:nact].view(nact, impl.num_heads, QD).copy_(o.view(nact, impl.num_heads, QD))
+    return output
+
+
+def _prefill_decuant(impl, layer, query, kv_cache, md, output):
+    if ROT_PTX:
+        nact = md.num_actual_tokens
+        query = _rotar_q_prefill(query[:nact].view(nact, impl.num_heads, QD))
+    if os.environ.get("GENESIS_PN131_PREFILL", "flashinfer") == "flashinfer":
+        try:
+            return _prefill_flashinfer(impl, layer, query, kv_cache, md, output)
+        except ImportError:
+            pass
+    return _prefill_triton(impl, layer, query, kv_cache, md, output)
+
+
+def _prefill_triton(impl, layer, query, kv_cache, md, output):
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    from vllm.v1.kv_cache_interface import KVQuantMode
+    nact = md.num_actual_tokens
+    nb, nh, bs, blk, raw = _geom(kv_cache)
+    B = md.query_start_loc.shape[0] - 1
+    npag = (md.seq_lens[:B] + bs - 1) // bs
+    maxp = int((int(md.max_seq_len) + bs - 1) // bs)
+    bt = md.block_table[:B, :maxp].to(torch.int64)
+    valid = torch.arange(maxp, device=bt.device)[None, :] < npag[:, None]
+    ids, inv = torch.unique(bt[valid], return_inverse=True)
+    kd, vd = decuantizar_bloques(impl, kv_cache, ids)
+    bt2 = torch.zeros_like(bt, dtype=torch.int32)
+    bt2[valid] = inv.to(torch.int32)
+    unified_attention(
+        q=query[:nact], k=kd, v=vd, out=output[:nact],
+        cu_seqlens_q=md.query_start_loc, max_seqlen_q=md.max_query_len,
+        seqused_k=md.seq_lens, max_seqlen_k=md.max_seq_len, softmax_scale=impl.scale,
+        causal=md.causal, alibi_slopes=None, use_alibi_sqrt=False, window_size=impl.sliding_window,
+        block_table=bt2, softcap=impl.logits_soft_cap, q_descale=None,
+        k_descale=layer._k_scale.expand((B, nh)), v_descale=layer._v_scale.expand((B, nh)),
+        seq_threshold_3D=md.seq_threshold_3D, num_par_softmax_segments=md.num_par_softmax_segments,
+        softmax_segm_output=md.softmax_segm_output, softmax_segm_max=md.softmax_segm_max,
+        softmax_segm_expsum=md.softmax_segm_expsum, sinks=None, output_scale=None,
+        mm_prefix_range=md.mm_prefix_range_tensor, rswa_prefix_lens=md.rswa_prefix_lens,
+        rswa_window=md.rswa_window, kv_quant_mode=KVQuantMode.NONE, k_scale_cache=None,
+        v_scale_cache=None, chunk_lookback=impl.chunk_lookback, use_td=impl.use_td,
+        mm_prefix_clamp_sliding_window=getattr(layer, "mm_prefix_clamp_sliding_window", False),
+    )
+    return output

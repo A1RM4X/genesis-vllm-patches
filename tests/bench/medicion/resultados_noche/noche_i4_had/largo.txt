@@ -1,0 +1,1 @@
+noche_i4_had: prompt=57531 agujas=12/12 TTFT=41.6s decode=112.2 tok/s (137 tok)

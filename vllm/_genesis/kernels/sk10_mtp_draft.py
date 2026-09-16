@@ -286,7 +286,20 @@ def _cfg(m: int, n: int) -> tuple[int, int, int, int, int, int]:
     """
     c = _CFG[(m > 32) + (m > 128) + (m > 1024)]
     if m > 32 and -(-m // c[0]) * -(-n // c[1]) < _CTA_MIN:
-        return _CFG_POCOS_CTA
+        # La correccion por pocos CTAs solo se puede tomar si esa variante
+        # TIENE PTX compilado. La monolitizacion de este modulo no la incluyo
+        # (compila M en {7,15,31,63,127,1023,2047} contra un unico N), asi que
+        # con la forma real de produccion K=N=5120 todo M entre 33 y 64 pedia
+        # cfg=(64,128,128,8,4,4) y levantaba KeyError — verificado llamando al
+        # kernel: M=16 y 32 pasan, 33/40/48/64 revientan. Y 33..64 es justo el
+        # regimen de MTP (M~40 con 5-10 requests y k=3), dentro de la ventana
+        # GENESIS_PN110_SK_MAX_M=64.
+        #
+        # Esto NO es un fallback de correctitud: las dos variantes calculan lo
+        # mismo y la de BLOCK_M=64 solo es 1,41-1,45x mas rapida. Se pierde esa
+        # ganancia hasta que se regenere el monolito incluyendo la variante.
+        if any(cfg == _CFG_POCOS_CTA for cfg, _ in _POR_CFG):
+            return _CFG_POCOS_CTA
     return c
 
 

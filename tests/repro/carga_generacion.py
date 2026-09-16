@@ -208,7 +208,7 @@ def main() -> int:
             # tok/s de GENERACION pura: descuenta el prefill
             tgen = seg - (ttft or 0)
             print(f"  {nombre:<22} OK  {seg:6.1f}s  ttft {(ttft or 0):5.2f}s  "
-                  f"{ct:>5} tok  {(ct or 0) / max(tgen, 1e-9):5.1f} tok/s  "
+                  f"{(ct or 0):>5} tok  {(ct or 0) / max(tgen, 1e-9):5.1f} tok/s  "
                   f"fin={razon}")
         else:
             print(f"  {nombre:<22} FALLO {seg:6.1f}s  {err}")

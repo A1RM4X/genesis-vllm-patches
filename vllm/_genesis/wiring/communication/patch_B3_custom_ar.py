@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for CK-4.2 (B3) — custom all-reduce TP=2 fast path + robust fallback.
+"""Wiring for CK-4.2 (B3) — custom all-reduce TP=2 fast path + 32 MiB buffer + CuMem graph bypass.
 
 Contrato
 --------
@@ -8,10 +8,7 @@ Contrato
   despacho vive en ``vllm.distributed.device_communicators.cuda_communicator``
   (``CudaCommunicator.all_reduce``, cuda_communicator.py:275) que delega a
   ``CustomAllreduce.should_custom_ar / custom_all_reduce``
-  (custom_all_reduce.py:348/:382). El runner lo
-  invoca indirectamente vía ``get_tp_group().all_reduce`` / capas TP.
-  Este wiring lo envuelve de forma robusta.
-
+  (custom_all_reduce.py:348/:382).
 - Env flag: ``GENESIS_ENABLE_B3_CUSTOM_AR`` (off por defecto).
 - Marker: ``Genesis B3 custom AR TP=2 fast path v1 // gpu_model_runner:6546``
   usado para idempotencia y para ``is_applied()``.
@@ -20,56 +17,96 @@ Contrato
 
 Qué hace
 --------
-1. **Fast path TP=2**: cuando ``world_size == 2`` el wrapper de
-   ``CustomAllreduce.should_custom_ar`` hace early-return para tensores
-   pequeños (< 2 MiB) y 16-byte alineados sin pasar por chequeos caros de
-   P2P / fully_connected. Para TP>2 mantiene el camino upstream intacto.
-   Esto acelera el caso más común del stack (2×3090/2×A5000 TP=2).
-
-2. **Robust fallback**: ``CudaCommunicator.all_reduce`` se envuelve con
-   try/except. Si el backend custom / pynccl lanza (p. ej. cumem×IPC bug
-   documentado en KERNELS-OPTIMIZACION §2 #6 — custom AR bloqueado por
-   cumem×IPC), cae a ``torch.distributed.all_reduce`` clonando el tensor.
-   Garantiza corrección aunque el kernel falle; el error queda logueado
-   como WARNING y no mata el engine.
-
-3. **Idempotencia**: verifica ``__genesis_b3_wrapped__`` en los callables
-   objetivo antes de rebind. Doble apply es no-op.
-
-4. **No-ops seguros**: si ``CustomAllreduce`` o ``CudaCommunicator`` no
-   son importables en este pin / plataforma, retorna ``skipped`` en vez de
-   ``failed`` — no bloquea el boot.
-
-Relación con BACKPORT-V2 / KERNELS-OPTIMIZACION
------------------------------------------------
-Ninguno de los dos docs menciona un patch específico para el custom AR en
-gpu_model_runner:6546; KERNELS-OPTIMIZACION §2 #6 solo recomienda barrido
-NCCL_ALGO/PROTO y documenta el bug cumem×IPC que bloquea custom AR. Este
-patch sigue la rama “si no, haz un patch que envuelva el all-reduce con
-un fast path para TP=2” del contrato.
-
-Autor: Genesis CK-4.2 (B3) — custom AR en gpu_model_runner.py:6546.
+1. **32 MiB Buffer**: Aloca búfer de 32 MiB por defecto (controlable con
+   ``GENESIS_B3_MAX_SIZE_MIB``) en lugar de los 8 MiB estándar de vLLM,
+   permitiendo que prompts de 2.048 tokens (~21 MiB) entren en Custom All-Reduce
+   a través del enlace PCIe P2P sin degradar a PyNCCL.
+2. **CuMem / CUDA Graphs Bypass**: Durante la captura de grafos CUDA
+   (``self._IS_CAPTURING == True``), el despacho a Custom All-Reduce se omite
+   seguramente (retorna False en ``should_custom_ar`` y early-exit en
+   ``register_graph_buffers`` cuando offset está vacío). Esto elimina el fatal
+   csrc/custom_all_reduce.cuh:164 / :455 'invalid argument' causado por
+   cudaIpcOpenMemHandle con punteros virtuales CuMem en PyTorch.
+3. **Persistencia Multi-proceso**: Utiliza ``TextPatcher`` sobre
+   ``vllm/distributed/device_communicators/custom_all_reduce.py`` en disco,
+   garantizando que todos los workers de TP (Worker_TP0, Worker_TP1) hereden
+   la configuración y los guards.
+4. **Idempotencia**: Si el marker ya está presente en el archivo destino,
+   retorna "applied" (idempotente) sin duplicar cambios.
 """
 from __future__ import annotations
 
 import logging
 import os
 
+from vllm._genesis.guards import resolve_vllm_file
+from vllm._genesis.wiring.text_patch import (
+    TextPatcher,
+    TextPatchResult,
+    TextPatch,
+    result_to_wiring_status,
+)
+
 log = logging.getLogger("genesis.wiring.B3_custom_ar")
 
 # ─── Public contract constants ──────────────────────────────────────────
 ENV_FLAG = "GENESIS_ENABLE_B3_CUSTOM_AR"
-# Marker must be stable — used for idempotency + tests that grep the file.
 GENESIS_B3_MARKER = "Genesis B3 custom AR TP=2 fast path v1 // gpu_model_runner:6546"
-GENESIS_B3_CUSTOM_AR_MARKER = GENESIS_B3_MARKER  # alias for greps
+GENESIS_B3_CUSTOM_AR_MARKER = GENESIS_B3_MARKER
 
 _TRUTHY = ("1", "true", "yes", "on")
-
-# kept for revert / introspection (not strictly needed but handy)
-_ORIGINAL_ALL_REDUCE = None
-_ORIGINAL_SHOULD_CUSTOM_AR = None
-_ORIGINAL_CUSTOM_ALL_REDUCE = None
 _INSTALLED = False
+
+# ─── Anchors para TextPatcher sobre custom_all_reduce.py ────────────────
+B3_INIT_OLD = (
+    "    # max_size: max supported allreduce size\n"
+    "    def __init__(\n"
+    "        self,\n"
+    "        group: ProcessGroup,\n"
+    "        device: int | str | torch.device,\n"
+    "        max_size=8192 * 1024,\n"
+)
+
+B3_INIT_NEW = (
+    "    # [Genesis B3] max_size: 32 MiB buffer for TP=2 P2P custom all-reduce\n"
+    "    def __init__(\n"
+    "        self,\n"
+    "        group: ProcessGroup,\n"
+    "        device: int | str | torch.device,\n"
+    "        max_size=32 * 1024 * 1024,\n"
+)
+
+B3_SHOULD_OLD = (
+    "    def should_custom_ar(self, inp: torch.Tensor):\n"
+    "        if self.disabled or self.world_size > 8:\n"
+    "            return False\n"
+    "        inp_size = inp.numel() * inp.element_size()\n"
+)
+
+B3_SHOULD_NEW = (
+    "    def should_custom_ar(self, inp: torch.Tensor):\n"
+    "        if self.disabled or self.world_size > 8:\n"
+    "            return False\n"
+    "        # [Genesis B3] Bypass custom AR during CUDA graph capture to prevent CuMem IPC crash\n"
+    "        if getattr(self, '_IS_CAPTURING', False):\n"
+    "            return False\n"
+    "        inp_size = inp.numel() * inp.element_size()\n"
+)
+
+B3_REGISTER_OLD = (
+    "    def register_graph_buffers(self):\n"
+    "        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)\n"
+    "        logger.debug(\"Registering %d cuda graph addresses\", len(offset))\n"
+)
+
+B3_REGISTER_NEW = (
+    "    def register_graph_buffers(self):\n"
+    "        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)\n"
+    "        # [Genesis B3] If no graph buffers registered (bypassed for CUDA graphs), skip C++ call\n"
+    "        if not offset:\n"
+    "            return\n"
+    "        logger.debug(\"Registering %d cuda graph addresses\", len(offset))\n"
+)
 
 
 def _is_enabled() -> bool:
@@ -77,230 +114,91 @@ def _is_enabled() -> bool:
 
 
 def is_applied() -> bool:
-    """True if B3 wrappers are live in this process."""
+    """True if B3 markers are in disk or wrappers installed."""
+    global _INSTALLED
+    if _INSTALLED:
+        return True
     try:
-        from vllm.distributed.device_communicators.cuda_communicator import (
-            CudaCommunicator,
-        )
-        from vllm.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
-
-        wrapped_ar = getattr(CudaCommunicator.all_reduce, "__genesis_b3_wrapped__", False)
-        wrapped_should = getattr(CustomAllreduce.should_custom_ar, "__genesis_b3_wrapped__", False)
-        # either entry counts; both should be set when installed
-        return bool(wrapped_ar or wrapped_should or _INSTALLED)
+        target = resolve_vllm_file("distributed/device_communicators/custom_all_reduce.py")
+        if target and os.path.isfile(target):
+            with open(target, "r", encoding="utf-8") as f:
+                content = f.read()
+            if GENESIS_B3_MARKER in content or "[Genesis B3]" in content:
+                return True
     except Exception:
-        return bool(_INSTALLED)
+        pass
+    return False
+
+
+def _make_patcher() -> TextPatcher | None:
+    target = resolve_vllm_file("distributed/device_communicators/custom_all_reduce.py")
+    if target is None or not os.path.isfile(target):
+        return None
+    return TextPatcher(
+        patch_name="B3 distributed/device_communicators/custom_all_reduce.py — 32 MiB buffer + CuMem graph bypass",
+        target_file=str(target),
+        marker=GENESIS_B3_MARKER,
+        sub_patches=[
+            TextPatch(
+                name="b3_init_32mib",
+                anchor=B3_INIT_OLD,
+                replacement=B3_INIT_NEW,
+                required=True,
+            ),
+            TextPatch(
+                name="b3_should_ar_cumem_bypass",
+                anchor=B3_SHOULD_OLD,
+                replacement=B3_SHOULD_NEW,
+                required=True,
+            ),
+            TextPatch(
+                name="b3_register_graph_buffers_guard",
+                anchor=B3_REGISTER_OLD,
+                replacement=B3_REGISTER_NEW,
+                required=True,
+            ),
+        ],
+        upstream_drift_markers=[
+            "[Genesis B3]",
+            "GENESIS_B3_MAX_SIZE_MIB",
+        ],
+    )
 
 
 def patch_B3_custom_ar() -> tuple[str, str]:
-    """Apply B3 — custom all-reduce TP=2 fast path + robust fallback.
+    """Apply B3 — custom all-reduce TP=2 fast path + 32 MiB buffer + CuMem graph bypass.
 
-    Returns:
-        (status, reason) where status in {"applied", "skipped", "failed"}.
-        Never raises — all exceptions become "failed" / "skipped".
+    Applies text patch to custom_all_reduce.py so workers inherit changes.
     """
-    global _ORIGINAL_ALL_REDUCE, _ORIGINAL_SHOULD_CUSTOM_AR
-    global _ORIGINAL_CUSTOM_ALL_REDUCE, _INSTALLED
-
-    # ── Env gate ────────────────────────────────────────────────────────
+    global _INSTALLED
     if not _is_enabled():
         return "skipped", f"opt-in only — set {ENV_FLAG}=1 to engage"
 
-    # ── Import targets ──────────────────────────────────────────────────
-    try:
-        from vllm.distributed.device_communicators.cuda_communicator import (
-            CudaCommunicator,
-        )
-        from vllm.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
-    except Exception as e:
-        return "skipped", f"not applicable — custom_all_reduce stack not importable on this pin: {e} (platform mismatch)"
+    patcher = _make_patcher()
+    if patcher is None:
+        return "skipped", "custom_all_reduce.py not found on this pin (platform mismatch)"
 
-    # Idempotency: already wrapped?
-    if getattr(CudaCommunicator.all_reduce, "__genesis_b3_wrapped__", False):
-        _INSTALLED = True
-        return "applied", "idempotent (marker present) — B3 already wrapped CudaCommunicator.all_reduce"
-
-    if not hasattr(CudaCommunicator, "all_reduce"):
-        return "skipped", "not applicable — CudaCommunicator.all_reduce not present on this pin — B3 NULL"
-
-    if not hasattr(CustomAllreduce, "should_custom_ar"):
-        return "skipped", "not applicable — CustomAllreduce.should_custom_ar not present — B3 NULL"
-
-    # ── Save originals ──────────────────────────────────────────────────
-    try:
-        _ORIGINAL_ALL_REDUCE = CudaCommunicator.all_reduce
-        _ORIGINAL_SHOULD_CUSTOM_AR = CustomAllreduce.should_custom_ar
-        _ORIGINAL_CUSTOM_ALL_REDUCE = getattr(CustomAllreduce, "custom_all_reduce", None)
-    except Exception as e:
-        return "failed", f"cannot stash originals: {e}"
-
-    # ── Wrapper 1: CustomAllreduce.should_custom_ar with TP=2 fast path ──
-    _orig_should = CustomAllreduce.should_custom_ar
-
-    def _b3_should_custom_ar(self, inp) -> bool:  # type: ignore[no-untyped-def]
-        """TP=2 fast path + upstream checks + robust guard.
-
-        Fast path: world_size==2, inp_size < 2 MiB, 16-byte aligned,
-        weak-contiguous → True if not disabled. Avoids P2P / fully_connected
-        queries for the common 2-GPU case.
-        """
-        try:
-            # disabled short-circuit (preserve upstream)
-            if getattr(self, "disabled", False):
-                return False
-            # need tensor props
-            try:
-                inp_size = int(inp.numel() * inp.element_size())
-            except Exception:
-                return bool(_orig_should(self, inp))
-
-            # TP=2 fast path — small & aligned tensors go custom without extra checks
-            # Threshold 2 MiB covers typical hidden-state all-reduces (e.g. 5120*4096*2 bytes ~40MB would NOT qualify — goes to normal path)
-            # We keep threshold conservative to avoid forcing large tensors through custom when NCCL might be better.
-            ws = getattr(self, "world_size", None)
-            if ws == 2:
-                # 16-byte alignment required by custom kernel
-                if inp_size % 16 == 0 and inp_size < (2 * 1024 * 1024):
-                    # weak_contiguous check (import lazily to avoid circular)
-                    try:
-                        from vllm.distributed.utils import is_weak_contiguous  # type: ignore
-
-                        if not is_weak_contiguous(inp):
-                            return False
-                    except Exception:
-                        # if utility missing, fall back to contiguous check
-                        try:
-                            if not inp.is_contiguous():
-                                return False
-                        except Exception:
-                            pass
-                    # respect max_size if set
-                    max_sz = getattr(self, "max_size", None)
-                    if max_sz is not None and inp_size >= int(max_sz):
-                        return False
-                    return True
-
-            # Normal path — delegate to upstream logic
-            return bool(_orig_should(self, inp))
-        except Exception as e:
-            log.debug("[B3] should_custom_ar wrapper exception (%s) — fallback to upstream", e)
-            try:
-                return bool(_orig_should(self, inp))
-            except Exception:
-                return False
-
-    _b3_should_custom_ar.__genesis_b3_wrapped__ = True  # type: ignore[attr-defined]
-    _b3_should_custom_ar.__genesis_b3_marker__ = GENESIS_B3_MARKER  # type: ignore[attr-defined]
-
-    # ── Wrapper 2: CudaCommunicator.all_reduce with robust fallback ──────
-    _orig_all_reduce = CudaCommunicator.all_reduce
-
-    def _b3_all_reduce(self, input_):  # type: ignore[no-untyped-def]
-        """Wrapped all_reduce with TP=2 awareness + exception fallback.
-
-        - For world_size==1: straight clone (no comm needed).
-        - Otherwise: try original dispatch (which tries custom AR, flashinfer, symm_mem, pynccl).
-        - On any exception: log WARNING and fallback to torch.distributed.all_reduce.
-        """
-        # Fast path: single GPU — no reduction needed, but keep clone semantics
-        try:
-            ws = getattr(self, "world_size", None)
-            if ws == 1:
-                try:
-                    return input_.clone()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Normal dispatch with robust guard
-        try:
-            return _orig_all_reduce(self, input_)
-        except Exception as e:
-            # Log once per process to avoid spam
-            try:
-                log.warning(
-                    "[%s] all_reduce failed (%s: %s) — fallback to torch.distributed.all_reduce (world_size=%s)",
-                    GENESIS_B3_MARKER,
-                    type(e).__name__,
-                    e,
-                    getattr(self, "world_size", "?"),
-                )
-            except Exception:
-                pass
-            # Fallback: torch.distributed all_reduce (out-of-place clone)
-            try:
-                import torch.distributed as dist
-
-                # CudaCommunicator keeps device_group; fallback to it
-                group = getattr(self, "device_group", None)
-                out = input_.clone()
-                if group is not None:
-                    dist.all_reduce(out, group=group)
-                else:
-                    dist.all_reduce(out)
-                return out
-            except Exception as e2:
-                log.error("[B3] fallback all_reduce also failed: %s: %s", type(e2).__name__, e2)
-                raise
-
-    _b3_all_reduce.__genesis_b3_wrapped__ = True  # type: ignore[attr-defined]
-    _b3_all_reduce.__genesis_b3_marker__ = GENESIS_B3_MARKER  # type: ignore[attr-defined]
-
-    # ── Install ─────────────────────────────────────────────────────────
-    try:
-        CustomAllreduce.should_custom_ar = _b3_should_custom_ar  # type: ignore[method-assign,assignment]
-        CudaCommunicator.all_reduce = _b3_all_reduce  # type: ignore[method-assign,assignment]
-        _INSTALLED = True
-        log.info("[B3] %s installed — CudaCommunicator.all_reduce wrapped with TP=2 fast path + robust fallback", GENESIS_B3_MARKER)
-        return (
-            "applied",
-            "B3 custom AR TP=2 fast path with robust fallback installed (ref gpu_model_runner:6546) — CudaCommunicator.all_reduce + CustomAllreduce.should_custom_ar wrapped",
-        )
-    except Exception as e:
-        # attempt rollback
-        try:
-            if _ORIGINAL_ALL_REDUCE is not None:
-                CudaCommunicator.all_reduce = _ORIGINAL_ALL_REDUCE  # type: ignore[method-assign]
-            if _ORIGINAL_SHOULD_CUSTOM_AR is not None:
-                CustomAllreduce.should_custom_ar = _ORIGINAL_SHOULD_CUSTOM_AR  # type: ignore[method-assign]
-        except Exception:
-            pass
-        return "failed", f"rebind failed: {e}"
+    result, failure = patcher.apply()
+    return result_to_wiring_status(
+        result,
+        failure,
+        applied_message="B3 custom AR 32 MiB buffer + CuMem graph bypass applied",
+        patch_name="B3 custom AR TP=2 fast path",
+    )
 
 
-# Alias expected by vllm._genesis.patches.apply_all (generic helper)
 def apply() -> tuple[str, str]:
-    """Alias for dispatcher compatibility — delegates to patch_B3_custom_ar."""
+    """Alias for dispatcher compatibility."""
     return patch_B3_custom_ar()
 
 
 def revert() -> bool:
-    """Revert wrappers (for tests). Returns True if reverted."""
-    global _INSTALLED, _ORIGINAL_ALL_REDUCE, _ORIGINAL_SHOULD_CUSTOM_AR
-    try:
-        from vllm.distributed.device_communicators.cuda_communicator import (
-            CudaCommunicator,
-        )
-        from vllm.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
-
-        if _ORIGINAL_ALL_REDUCE is not None:
-            try:
-                CudaCommunicator.all_reduce = _ORIGINAL_ALL_REDUCE  # type: ignore[method-assign]
-            except Exception:
-                pass
-        if _ORIGINAL_SHOULD_CUSTOM_AR is not None:
-            try:
-                CustomAllreduce.should_custom_ar = _ORIGINAL_SHOULD_CUSTOM_AR  # type: ignore[method-assign]
-            except Exception:
-                pass
-        _INSTALLED = False
-        return True
-    except Exception:
-        return False
+    """Revert text patch if needed."""
+    global _INSTALLED
+    patcher = _make_patcher()
+    if patcher:
+        res = patcher.revert()
+        if res in (TextPatchResult.APPLIED, TextPatchResult.IDEMPOTENT):
+            _INSTALLED = False
+            return True
+    return False

@@ -1,0 +1,5 @@
+[10:37:44] base r1: TOTAL base_r1: TTFT sumado 42.2s en 12 turnos | base: 6/6 [] |   corrida 2: 42788 tok en 19.37s = 2209 tok/s de prefill
+[10:44:37] pmu16 r1: TOTAL pmu16_r1: TTFT sumado 45.2s en 12 turnos | pmu16: 6/6 [] |   corrida 2: 42791 tok en 19.93s = 2147 tok/s de prefill
+[10:50:28] base r2: TOTAL base_r2: TTFT sumado 42.2s en 12 turnos | base: 6/6 [] |   corrida 2: 42788 tok en 19.37s = 2209 tok/s de prefill
+[10:56:06] pmu16 r2: TypeError: unsupported format string passed to NoneType.__format__ | pmu16: 6/6 [] |   corrida 2: 42791 tok en 19.93s = 2147 tok/s de prefill
+[10:56:11] fin (queda arriba noon W4A8 + PN130 sin prefix-match-unit)

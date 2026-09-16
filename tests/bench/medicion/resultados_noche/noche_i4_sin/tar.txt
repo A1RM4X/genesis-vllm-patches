@@ -1,0 +1,9 @@
+  TAR= 73.0%    128 tok/s  Escribí una clase de Python para una cola cir
+  TAR= 88.5%    147 tok/s  Implementá en TypeScript un debounce genérico
+  TAR= 67.7%    123 tok/s  Escribí una función en Rust que parsee un CSV
+  TAR= 66.7%    122 tok/s  Escribí un script bash que rote logs de /var/
+  TAR= 85.7%    146 tok/s  Escribí un endpoint FastAPI con SQLAlchemy pa
+  TAR= 63.3%    118 tok/s  Explicá cómo funciona el paginado de memoria 
+  TAR= 37.6%     87 tok/s  Escribí un cuento de 300 palabras sobre un fa
+  TAR= 57.2%    111 tok/s  Resumí las diferencias entre TCP y QUIC en un
+TOTAL noche_i4_sin: TAR=64.9%  120 tok/s

@@ -1,0 +1,1 @@
+sim_had_g0: 160 sondeos hasta 99998 tokens en 318s | top-1 == token real 80.6% | logp medio del real -1.403

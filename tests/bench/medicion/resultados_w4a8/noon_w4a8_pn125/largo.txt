@@ -1,0 +1,1 @@
+noon_w4a8_pn125: prompt=57537 agujas=12/12 TTFT=29.2s decode=146.4 tok/s (137 tok)

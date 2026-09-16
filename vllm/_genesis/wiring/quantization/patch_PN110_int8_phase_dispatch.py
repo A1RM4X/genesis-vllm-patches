@@ -4032,11 +4032,25 @@ def _make_apply_wrapper(original, cls):
         # Siempre camino INT8 — sin despacho por M.
         try:
             x_2d = x.reshape(-1, x.shape[-1])
-            # SK-09 es el productor canónico de activación INT8. Sustituye a
-            # fused_quant_triton, que tenía BLOCK_MAX=8192 y reventaba con
-            # down_proj (K=8704 por rank en TP=2).
-            from vllm._genesis.kernels.sk09_norm_embed import quant_per_token
-            a_i8, a_scales = quant_per_token(x_2d)
+            sk_op_id = state.get("sk_op_id")
+            if sk_op_id == 6:
+                # SK-06 (mlp.down_proj): La salida de SwiGLU contiene picos/outliers
+                # concentrados en canales especificos que destruyen la precision si se
+                # cuantiza con una sola escala global por token. Se agrupa en bloques de
+                # 128 canales emparejados a las escalas de bloque 128x128 del peso, y se
+                # pliega a_scale en las escalas del peso (shifts_effective) para ejecutar
+                # en el kernel PTX nativo exacto sin tocar el ensamblado.
+                K_dim = x_2d.shape[-1]
+                x_b = x_2d.view(-1, K_dim // 128, 128).float()
+                a_sc_b = x_b.abs().amax(dim=(0, 2)).clamp_min(1e-5) / 127.0
+                a_i8 = (x_b / a_sc_b[None, :, None]).round().clamp(-128, 127).to(torch.int8).view(x_2d.shape[0], K_dim)
+                a_scales = torch.ones(x_2d.shape[0], dtype=torch.float32, device=x.device)
+                cur_shifts = state["sk_shifts"] * a_sc_b[:, None]
+                cur_shifts._has_shift = True
+            else:
+                from vllm._genesis.kernels.sk09_norm_embed import quant_per_token
+                a_i8, a_scales = quant_per_token(x_2d)
+                cur_shifts = state.get("sk_shifts", state.get("w_shifts"))
             # cutlass_scaled_mm exige out_dtype fp16/bf16 (assert en el op).
             # self.out_dtype es torch.get_default_dtype() (puede ser fp32),
             # así que se usa el dtype del input cuando es fp16/bf16.
@@ -4124,7 +4138,7 @@ def _make_apply_wrapper(original, cls):
                     b_tensor,
                     a_scales.reshape(-1),
                     state["sk_bscales"],
-                    state["sk_shifts"],
+                    cur_shifts,
                     epi,
                     state["sk_op_id"],
                     out_dtype,
@@ -4167,7 +4181,7 @@ def _make_apply_wrapper(original, cls):
                 a_scales,
                 bias_arg,
                 out_dtype,
-                w_shifts,
+                cur_shifts,
             )
             # Reshape al shape original de x.
             return out.reshape(*x.shape[:-1], -1)

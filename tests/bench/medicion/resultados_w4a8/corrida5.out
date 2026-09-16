@@ -1,0 +1,4 @@
+[21:27:43] inicio corrida 5 (W4A8 + PN125 + KV int8 Triton/PN124)
+[21:32:58] noon_w4a8_kvint8 arriba
+[21:38:38] noon_w4a8_kvint8:   corrida 2: 42795 tok en 23.03s = 1858 tok/s de prefill | noon_w4a8_kvint8: prompt=57535 agujas=12/12 TTFT=36.8s decode=101.2 tok/s (137 tok) | TOTAL noon_w4a8_kvint8: TAR=67.0%  128 tok/s | noon_w4a8_kvint8: 6/6 []   aciertos: 10/10 
+[21:38:38] fin corrida 5

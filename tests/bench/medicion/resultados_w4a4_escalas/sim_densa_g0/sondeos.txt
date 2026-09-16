@@ -1,0 +1,1 @@
+sim_densa_g0: 160 sondeos hasta 99998 tokens en 783s | top-1 == token real 81.9% | logp medio del real -1.369

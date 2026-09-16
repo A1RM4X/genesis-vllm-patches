@@ -1,0 +1,1 @@
+noche_i4_wush: prompt=57533 agujas=12/12 TTFT=42.1s decode=112.5 tok/s (137 tok)

@@ -1,0 +1,5 @@
+[21:06:11] inicio corrida 4 (W4A8 + PN125)
+[21:11:26] noon_w4a8_pn125 arriba
+[21:16:13] noon_w4a8_pn125:   corrida 2: 42797 tok en 19.51s = 2193 tok/s de prefill | noon_w4a8_pn125: prompt=57537 agujas=12/12 TTFT=29.2s decode=146.4 tok/s (137 tok) | TOTAL noon_w4a8_pn125: TAR=64.3%  119 tok/s | noon_w4a8_pn125: 6/6 []   aciertos: 10/10 
+[21:20:39] prod restaurada
+[21:20:40] fin corrida 4

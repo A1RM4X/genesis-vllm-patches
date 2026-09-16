@@ -1,0 +1,16 @@
+pmu16_r2 turno  0: prompt= 32613 cacheados=     0 nuevos=32613 TTFT=15.43s
+pmu16_r2 turno  1: prompt= 34703 cacheados= 31616 nuevos= 3087 TTFT=2.27s
+pmu16_r2 turno  2: prompt= 36854 cacheados= 33280 nuevos= 3574 TTFT=2.26s
+pmu16_r2 turno  3: prompt= 38956 cacheados= 35776 nuevos= 3180 TTFT=2.54s
+pmu16_r2 turno  4: prompt= 41023 cacheados= 37440 nuevos= 3583 TTFT=2.04s
+pmu16_r2 turno  5: prompt= 43066 cacheados= 39936 nuevos= 3130 TTFT=2.77s
+pmu16_r2 turno  6: prompt= 45130 cacheados= 41600 nuevos= 3530 TTFT=2.41s
+pmu16_r2 turno  7: prompt= 47039 cacheados= 44096 nuevos= 2943 TTFT=2.35s
+pmu16_r2 turno  8: prompt= 49081 cacheados= 45760 nuevos= 3321 TTFT=2.65s
+pmu16_r2 turno  9: prompt= 50985 cacheados= 47424 nuevos= 3561 TTFT=2.29s
+pmu16_r2 turno 10: prompt= 53101 cacheados= 49920 nuevos= 3181 TTFT=2.07s
+Traceback (most recent call last):
+  File "/home/usuario/Proyectos/genesis-vllm-patches/tests/bench/medicion/turnos.py", line 38, in <module>
+    print(f"{TAG} turno {t:2d}: prompt={uso['prompt_tokens'] if uso else '?':>6} cacheados={cached:>6} nuevos={nuevos:>5} TTFT={ttft:.2f}s", flush=True)
+                                                                                                                               ^^^^^^^^^^
+TypeError: unsupported format string passed to NoneType.__format__

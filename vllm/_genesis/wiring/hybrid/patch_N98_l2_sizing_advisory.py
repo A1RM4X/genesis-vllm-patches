@@ -78,7 +78,7 @@ ANCHOR_NEW = (
     "                )\n"
     "                for _g98_ln in _g98.informe(\n"
     "                    num_blocks=self.num_blocks,\n"
-    "                    bytes_por_bloque=self.kv_bytes_per_offloaded_block,\n"
+    "                    bytes_por_bloque=self.kv_bytes_per_chunk,\n"
     "                    tokens_por_bloque=_g98_tpb,\n"
     "                    num_grupos=_g98_grupos,\n"
     "                    max_model_len=self.vllm_config.model_config.max_model_len,\n"
@@ -88,7 +88,7 @@ ANCHOR_NEW = (
     "                ):\n"
     "                    logger.info('%s', _g98_ln)\n"
     "            except Exception as _g98_exc:  # nunca puede tumbar el arranque\n"
-    "                logger.debug('PN98: no pude calcular el informe: %s', _g98_exc)\n"
+    "                logger.warning('PN98: no pude calcular el informe: %s', _g98_exc)\n"
 )
 
 

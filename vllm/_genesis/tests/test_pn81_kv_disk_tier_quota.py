@@ -67,6 +67,7 @@ def tier(tmp_path, monkeypatch):
     monkeypatch.setenv("GENESIS_KV_DISK_CHECK_SECS", "0")
     monkeypatch.setenv("GENESIS_KV_DISK_ORPHAN_DAYS", "3")
     monkeypatch.setenv("GENESIS_KV_DISK_ORPHAN_CHECK_SECS", "3600")
+    monkeypatch.setenv("GENESIS_PN81_ASYNC", "0")
     obj._root = tmp_path
     return obj
 
@@ -243,3 +244,31 @@ def test_registrado_en_el_dispatcher():
     entry = PATCH_REGISTRY["PN81"]
     assert entry["env_flag"] == "GENESIS_ENABLE_PN81_KV_DISK_QUOTA"
     assert entry["default_on"] is False
+
+
+def test_desacoplamiento_asincrono_on_schedule_end(tier, monkeypatch):
+    """Verifica que con GENESIS_PN81_ASYNC=1 on_schedule_end() corre la cuota en hilo demonio."""
+    monkeypatch.setenv("GENESIS_PN81_ASYNC", "1")
+    monkeypatch.setenv("GENESIS_KV_DISK_MAX_GB", str(4096 / 1024**3))
+    monkeypatch.setenv("GENESIS_KV_DISK_TARGET_RATIO", "0.85")
+    root = tier._root
+    d = root / "modelo_AAAA_r0"
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        f = d / f"async_{i}.bin"
+        f.write_bytes(b"\0" * 1024)
+        t = time.time() - (10 - i) * 60
+        os.utime(f, (t, t))
+
+    tier.on_schedule_end()
+    # Verifica que el hilo demonio fue lanzado
+    worker = getattr(tier, "_genesis_pn81_worker", None)
+    assert worker is not None
+    assert worker.daemon is True
+    # Espera que el worker termine
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    # Comprueba que la poda ocurrió en segundo plano
+    total = sum(p.stat().st_size for p in d.glob("async_*.bin"))
+    assert total <= int(4096 * 0.85)

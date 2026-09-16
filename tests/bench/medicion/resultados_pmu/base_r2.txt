@@ -1,0 +1,13 @@
+base_r2 turno  0: prompt= 32610 cacheados=     0 nuevos=32610 TTFT=15.40s
+base_r2 turno  1: prompt= 34713 cacheados= 31616 nuevos= 3097 TTFT=2.61s
+base_r2 turno  2: prompt= 36849 cacheados= 33280 nuevos= 3569 TTFT=2.89s
+base_r2 turno  3: prompt= 38952 cacheados= 35776 nuevos= 3176 TTFT=2.39s
+base_r2 turno  4: prompt= 41021 cacheados= 37440 nuevos= 3581 TTFT=2.36s
+base_r2 turno  5: prompt= 43065 cacheados= 39936 nuevos= 3129 TTFT=2.45s
+base_r2 turno  6: prompt= 45123 cacheados= 41600 nuevos= 3523 TTFT=2.73s
+base_r2 turno  7: prompt= 47034 cacheados= 44096 nuevos= 2938 TTFT=2.40s
+base_r2 turno  8: prompt= 49078 cacheados= 45760 nuevos= 3318 TTFT=2.18s
+base_r2 turno  9: prompt= 50985 cacheados= 47424 nuevos= 3561 TTFT=2.31s
+base_r2 turno 10: prompt= 53094 cacheados= 49920 nuevos= 3174 TTFT=2.11s
+base_r2 turno 11: prompt= 55103 cacheados= 51584 nuevos= 3519 TTFT=2.37s
+TOTAL base_r2: TTFT sumado 42.2s en 12 turnos

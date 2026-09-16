@@ -1,0 +1,13 @@
+pmu16_r1 turno  0: prompt= 32613 cacheados=     0 nuevos=32613 TTFT=15.92s
+pmu16_r1 turno  1: prompt= 34703 cacheados= 31616 nuevos= 3087 TTFT=2.56s
+pmu16_r1 turno  2: prompt= 36853 cacheados= 33280 nuevos= 3573 TTFT=2.56s
+pmu16_r1 turno  3: prompt= 38971 cacheados= 35776 nuevos= 3195 TTFT=2.93s
+pmu16_r1 turno  4: prompt= 41035 cacheados= 37440 nuevos= 3595 TTFT=2.64s
+pmu16_r1 turno  5: prompt= 43093 cacheados= 39936 nuevos= 3157 TTFT=2.44s
+pmu16_r1 turno  6: prompt= 45152 cacheados= 41600 nuevos= 3552 TTFT=2.68s
+pmu16_r1 turno  7: prompt= 47075 cacheados= 43088 nuevos= 3987 TTFT=2.96s
+pmu16_r1 turno  8: prompt= 49112 cacheados= 44096 nuevos= 5016 TTFT=3.41s
+pmu16_r1 turno  9: prompt= 51025 cacheados= 48256 nuevos= 2769 TTFT=2.13s
+pmu16_r1 turno 10: prompt= 53144 cacheados= 49104 nuevos= 4040 TTFT=2.70s
+pmu16_r1 turno 11: prompt= 55163 cacheados= 51584 nuevos= 3579 TTFT=2.30s
+TOTAL pmu16_r1: TTFT sumado 45.2s en 12 turnos

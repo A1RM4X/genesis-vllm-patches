@@ -1,0 +1,23 @@
+
+fp8 contra fp16
+     profundidad    n top-1 igual  |dlogp real|  KL~ (top20)
+          0-4096   63       96.8%        0.0362       0.0045
+      4096-16384   42       97.6%        0.0352       0.0029
+     16384-50000   34      100.0%        0.0172       0.0019
+       50000-fin   21      100.0%        0.0264       0.0015
+           TOTAL  160       98.1%        0.0306       0.0031
+
+noon_w4a16 contra fp16
+     profundidad    n top-1 igual  |dlogp real|  KL~ (top20)
+          0-4096   63       87.3%        0.1170       0.0380
+      4096-16384   42       90.5%        0.1242       0.0206
+     16384-50000   34       97.1%        0.0264       0.0088
+       50000-fin   21       95.2%        0.0427       0.0122
+           TOTAL  160       91.2%        0.0899       0.0238
+Traceback (most recent call last):
+  File "/tmp/g115/sondeos.py", line 68, in <module>
+    comparar(sys.argv[2], sys.argv[3:])
+  File "/tmp/g115/sondeos.py", line 50, in comparar
+    B = json.load(open(f"/tmp/g115/sond_{o}.json"))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/g115/sond_noon_w4a8.json'

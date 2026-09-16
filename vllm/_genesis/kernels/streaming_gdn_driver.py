@@ -140,7 +140,11 @@ def streaming_chunk_gated_delta_rule_fwd(
     )
 
     window_nt = GdnScratchPool.get_window_nt()
-    threshold_T = window_nt * _FLA_CHUNK_SIZE * _BYPASS_T_MULTIPLIER
+    min_t_env = os.environ.get("GENESIS_PN59_MIN_T", "").strip()
+    if min_t_env.isdigit():
+        threshold_T = int(min_t_env)
+    else:
+        threshold_T = window_nt * _FLA_CHUNK_SIZE * _BYPASS_T_MULTIPLIER
 
     if (not GdnScratchPool.is_production_eligible()
             or not is_single_seq
@@ -264,6 +268,10 @@ def _vanilla_path(
     return g, o, A, final_state, w, h, v_new
 
 
+# Cache of per-window chunk metadata tensors (GPU-resident, immutable gather tables)
+_CHUNK_METADATA_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
 def _slice_chunk_metadata_for_window(
     cu_seqlens, chunk_indices, chunk_offsets,
     win_start: int, win_end: int, BT: int,
@@ -322,6 +330,11 @@ def _slice_chunk_metadata_for_window(
                     else torch.int32))
     )
 
+    cache_key = (T_w, cur_NT, md_dtype, device)
+    cached = _CHUNK_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     cu_seqlens_w = torch.tensor([0, T_w], dtype=md_dtype, device=device)
     chunk_indices_w = torch.stack(
         [
@@ -331,7 +344,10 @@ def _slice_chunk_metadata_for_window(
         dim=1,
     )
     chunk_offsets_w = torch.tensor([0, cur_NT], dtype=md_dtype, device=device)
-    return cu_seqlens_w, chunk_indices_w, chunk_offsets_w
+    val = (cu_seqlens_w, chunk_indices_w, chunk_offsets_w)
+    if len(_CHUNK_METADATA_CACHE) < 256:
+        _CHUNK_METADATA_CACHE[cache_key] = val
+    return val
 
 
 def _streaming_path(

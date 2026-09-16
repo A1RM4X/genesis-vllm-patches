@@ -1,0 +1,31 @@
+
+wush_gate_up contra fp16
+     profundidad    n top-1 igual  |dlogp real|  KL~ (top20)
+          0-4096   63       96.8%        0.0572       0.0134
+      4096-16384   42       92.9%        0.0921       0.0126
+     16384-50000   34       97.1%        0.0529       0.0086
+       50000-fin   21      100.0%        0.1228       0.0102
+           TOTAL  160       96.2%        0.0741       0.0118
+
+sim_had_g256 contra fp16
+     profundidad    n top-1 igual  |dlogp real|  KL~ (top20)
+          0-4096   63       93.7%        0.0762       0.0200
+      4096-16384   42       92.9%        0.0742       0.0203
+     16384-50000   34       94.1%        0.0523       0.0144
+       50000-fin   21      100.0%        0.1102       0.0188
+           TOTAL  160       94.4%        0.0750       0.0187
+
+sim_had_g0 contra fp16
+     profundidad    n top-1 igual  |dlogp real|  KL~ (top20)
+          0-4096   63       88.9%        0.3531       0.0371
+      4096-16384   42       92.9%        0.1088       0.0317
+     16384-50000   34       94.1%        0.0462       0.0198
+       50000-fin   21       95.2%        0.1256       0.0164
+           TOTAL  160       91.9%        0.1939       0.0293
+Traceback (most recent call last):
+  File "/tmp/g115/sondeos.py", line 68, in <module>
+    comparar(sys.argv[2], sys.argv[3:])
+  File "/tmp/g115/sondeos.py", line 50, in comparar
+    B = json.load(open(f"/tmp/g115/sond_{o}.json"))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/g115/sond_sim_densa_g0.json'

@@ -1,0 +1,51 @@
+# Laboratorio ox-alpha — trazado del circuito del token (vLLM v0.27.1)
+# Requisito: GPUs libres → bajar antes genesis-27b-qwen38-fp8 si corre.
+services:
+  lab:
+    image: vllm/vllm-openai:v0.27.1
+    container_name: oxalpha-lab
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      - LAB_TRACE=1
+      - LAB_RESULTS_DIR=/lab/results
+      - LAB_PROF_START=${LAB_PROF_START:-5}
+      - LAB_PROF_END=${LAB_PROF_END:-25}
+      - LAB_MODEL=${LAB_MODEL:-Qwen/Qwen3-0.6B}
+      - LAB_GMU=${LAB_GMU:-0.85}
+      - HF_HOME=/root/.cache/huggingface
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_LOGGING_LEVEL=INFO
+      # CK-0.2: ver qué elige NCCL por defecto (topología P2P PIX + ReBAR)
+      - NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+      - NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,TUNING,ENV}
+      # En run_small.sh se fuerza a 0 (EngineCore in-process, visibilidad total)
+      - VLLM_ENABLE_V1_MULTIPROCESSING=${VLLM_ENABLE_V1_MULTIPROCESSING:-1}
+    volumes:
+      - ./scripts:/lab/scripts:ro
+      - ./patch:/lab/patch:ro
+      - ./results:/lab/results
+      - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
+      - /home/usuario/Proyectos/models-cache:/models-cache:ro
+      # Árbol _genesis dentro del paquete vllm instalado (espejo de PROD):
+      # sin esto, la activación de parches PN desde sitecustomize falla con
+      # ModuleNotFoundError("No module named 'vllm._genesis'") — visto en el
+      # A/B de CK-1.1/PN108 el 2026-08-24.
+      - /home/usuario/Proyectos/genesis-vllm-patches/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      # Caches de compilación persistentes del LAB (propias, no las de PROD):
+      # aceleran boots 2..N del sweep (compile + cudagraphs cacheadas)
+      - /home/usuario/.cache/vllm/qwen38-27b-fp8:/root/.cache/vllm
+      - /home/usuario/.cache/triton/qwen38-27b-fp8:/root/.cache/triton
+      - /home/usuario/.cache/torchinductor/qwen38-27b-fp8:/root/.cache/torchinductor
+      - /home/usuario/Proyectos/kv-offload:/kv-offload
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - "export PYTHONPATH=/lab/patch:${PYTHONPATH:-} && bash /lab/scripts/${LAB_RUN:-run_small.sh}"

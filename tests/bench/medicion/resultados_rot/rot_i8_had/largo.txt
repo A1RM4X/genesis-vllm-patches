@@ -1,0 +1,1 @@
+rot_i8_had: prompt=57532 agujas=12/12 TTFT=36.7s decode=100.2 tok/s (137 tok)

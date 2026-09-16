@@ -31,16 +31,54 @@ _LOCK = threading.Lock()
 # Set of abort events for active streaming connections
 _ACTIVE_STREAMS: set[asyncio.Event] = set()
 
+# Prometheus metrics for request-level execution statistics
+try:
+    from prometheus_client import Counter, Gauge
+
+    PROM_LAST_PP_TPS = Gauge(
+        "vllm:request_last_pp_tokens_per_second",
+        "Genesis Prompt Processing (PP / prefill) tokens per second of the last completed request",
+    )
+    PROM_LAST_TG_TPS = Gauge(
+        "vllm:request_last_tg_tokens_per_second",
+        "Genesis Text Generation (TG / decode) tokens per second of the last completed request",
+    )
+    PROM_LAST_KV_HIT_RATE = Gauge(
+        "vllm:request_last_kv_hit_rate_pct",
+        "Genesis KV cache hit percentage of the last completed request",
+    )
+    PROM_REQS_BY_PRIORITY = Counter(
+        "vllm:requests_by_priority_total",
+        "Total completed requests partitioned by priority tier",
+        ["priority"],
+    )
+    PROM_REQS_BY_AGENT = Counter(
+        "vllm:requests_by_agent_total",
+        "Total completed requests partitioned by agent name",
+        ["agent"],
+    )
+except Exception as _prom_err:
+    logger.debug("Prometheus metrics not initialized in kv_offload_tracker: %s", _prom_err)
+    PROM_LAST_PP_TPS = None
+    PROM_LAST_TG_TPS = None
+    PROM_LAST_KV_HIT_RATE = None
+    PROM_REQS_BY_PRIORITY = None
+    PROM_REQS_BY_AGENT = None
+
 router = APIRouter()
 
 
 class RequestTrackerContext:
-    __slots__ = ("t0", "timestamp", "agent", "id", "ttft", "usage", "status")
+    __slots__ = ("t0", "timestamp", "agent", "name", "priority", "id", "ttft", "usage", "status", "prompt_chars", "stream_output_tokens")
 
-    def __init__(self, agent: Optional[str] = None):
+    def __init__(self, agent: Optional[str] = None, name: Optional[str] = None, priority: int = 0, prompt_chars: int = 0):
         self.t0 = time.perf_counter()
         self.timestamp = time.time()
         self.agent = agent
+        self.name = name or agent
+        self.priority = priority
+        self.prompt_chars = prompt_chars
+        self.stream_output_tokens = 0
         self.id: Optional[str] = None
         self.ttft: Optional[float] = None
         self.usage: Optional[dict[str, Any]] = None
@@ -49,18 +87,58 @@ class RequestTrackerContext:
 
 def create_tracker(req: Any) -> RequestTrackerContext:
     agent = None
+    name = None
+    priority = 0
+    prompt_chars = 0
     try:
+        if hasattr(req, "priority") and req.priority is not None:
+            priority = int(req.priority)
+        if hasattr(req, "user") and req.user:
+            name = str(req.user)
+
+        if hasattr(req, "messages") and req.messages:
+            for m in req.messages:
+                content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+                if isinstance(content, str):
+                    prompt_chars += len(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        part_text = part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+                        if isinstance(part_text, str):
+                            prompt_chars += len(part_text)
+        elif hasattr(req, "prompt") and req.prompt:
+            if isinstance(req.prompt, str):
+                prompt_chars = len(req.prompt)
+            elif isinstance(req.prompt, list):
+                prompt_chars = sum(len(str(p)) for p in req.prompt)
+
         if hasattr(req, "kv_transfer_params") and isinstance(req.kv_transfer_params, dict):
             agent = req.kv_transfer_params.get("genesis_agent") or req.kv_transfer_params.get("agent")
+            if not priority and "priority" in req.kv_transfer_params:
+                try:
+                    priority = int(req.kv_transfer_params["priority"])
+                except Exception:
+                    pass
+            if not name and "name" in req.kv_transfer_params:
+                name = req.kv_transfer_params["name"]
+
+        # Heuristic resolution if priority is 0 and agent is known
+        if priority == 0 and agent:
+            try:
+                from vllm._genesis.dynamic_pid_gating import AGENT_PRIORITY_MAP
+                priority = AGENT_PRIORITY_MAP.get(agent, 0)
+            except Exception:
+                pass
+
+        if not name:
+            name = agent or "direct"
     except Exception:
         pass
-    return RequestTrackerContext(agent=agent)
+    return RequestTrackerContext(agent=agent, name=name, priority=priority, prompt_chars=prompt_chars)
 
 
 def observe_chunk(ctx: RequestTrackerContext, chunk_data: Any) -> None:
     try:
-        if ctx.ttft is None:
-            ctx.ttft = time.perf_counter() - ctx.t0
         if isinstance(chunk_data, (str, bytes)):
             raw = chunk_data if isinstance(chunk_data, str) else chunk_data.decode("utf-8", "replace")
             if '"id"' in raw and ctx.id is None:
@@ -69,6 +147,27 @@ def observe_chunk(ctx: RequestTrackerContext, chunk_data: Any) -> None:
                     end_idx = raw.find('"', idx + 6)
                     if end_idx != -1:
                         ctx.id = raw[idx + 6:end_idx]
+
+            has_content_piece = False
+            if '"content":' in raw or '"reasoning_content":' in raw:
+                # Count stream tokens and mark TTFT on first real token
+                for line in raw.split("\n"):
+                    if line.startswith("data:") and line.strip() != "data: [DONE]":
+                        try:
+                            obj = json.loads(line[5:].strip())
+                            choices = obj.get("choices") or []
+                            if choices:
+                                delta = choices[0].get("delta") or {}
+                                piece = delta.get("content") or delta.get("reasoning_content")
+                                if piece:
+                                    has_content_piece = True
+                                    ctx.stream_output_tokens += 1
+                        except Exception:
+                            pass
+
+            if has_content_piece and ctx.ttft is None:
+                ctx.ttft = time.perf_counter() - ctx.t0
+
             if '"usage"' in raw and '"usage":null' not in raw.replace(" ", ""):
                 try:
                     for line in raw.split("\n"):
@@ -81,6 +180,8 @@ def observe_chunk(ctx: RequestTrackerContext, chunk_data: Any) -> None:
                                     ctx.id = obj.get("id")
                 except Exception:
                     pass
+        elif ctx.ttft is None:
+            ctx.ttft = time.perf_counter() - ctx.t0
     except Exception:
         pass
 
@@ -119,20 +220,67 @@ def finish_request(ctx: RequestTrackerContext, response_obj_or_dict: Any = None,
             det = u.get("prompt_tokens_details") or {}
             cached_tokens = det.get("cached_tokens")
 
+        # Fallbacks for streaming responses without explicit usage object
+        if output_tokens is None and ctx.stream_output_tokens > 0:
+            output_tokens = ctx.stream_output_tokens
+        if prompt_tokens is None:
+            if ctx.prompt_chars > 0:
+                prompt_tokens = max(1, int(ctx.prompt_chars / 3.5))
+            elif ttft_ms is not None and ttft_ms > 0:
+                prompt_tokens = max(1, int(ttft_ms * 1.5))
+            else:
+                prompt_tokens = 16
+        if ttft_ms is None and e2e_ms is not None:
+            ttft_ms = min(e2e_ms, 50.0)
+
+        # Calculate PP TPS (Prompt Processing)
+        pp_tps = None
+        if ttft_ms is not None and ttft_ms > 0 and prompt_tokens:
+            pp_tps = round(prompt_tokens / (ttft_ms / 1000.0), 1)
+
+        # Calculate TG TPS (Text Generation / decode)
+        tg_tps = None
+        if output_tokens is not None and output_tokens > 0 and e2e_ms is not None:
+            decode_ms = max(1.0, e2e_ms - (ttft_ms or 0.0))
+            tg_tps = round(output_tokens / (decode_ms / 1000.0), 1)
+
+        # Calculate KV Cache Hit Rate %
+        kv_hit_rate_pct = None
+        if prompt_tokens and prompt_tokens > 0 and cached_tokens is not None:
+            kv_hit_rate_pct = round((cached_tokens / prompt_tokens) * 100.0, 1)
+
         record = {
             "id": req_id,
             "timestamp": round(ctx.timestamp, 3),
+            "name": ctx.name,
             "agent": ctx.agent,
+            "priority": ctx.priority,
             "prompt_tokens": prompt_tokens,
             "cached_tokens": cached_tokens,
             "output_tokens": output_tokens,
             "ttft_ms": ttft_ms,
             "e2e_ms": e2e_ms,
+            "pp_tps": pp_tps,
+            "tg_tps": tg_tps,
+            "kv_hit_rate_pct": kv_hit_rate_pct,
             "status": status,
         }
 
         with _LOCK:
             _RING_BUFFER.append(record)
+
+        # Update Prometheus metrics
+        if pp_tps is not None and PROM_LAST_PP_TPS:
+            PROM_LAST_PP_TPS.set(pp_tps)
+        if tg_tps is not None and PROM_LAST_TG_TPS:
+            PROM_LAST_TG_TPS.set(tg_tps)
+        if kv_hit_rate_pct is not None and PROM_LAST_KV_HIT_RATE:
+            PROM_LAST_KV_HIT_RATE.set(kv_hit_rate_pct)
+        if PROM_REQS_BY_PRIORITY:
+            prio_tier = "vip" if ctx.priority < -5 else ("high" if ctx.priority < 0 else ("normal" if ctx.priority == 0 else "low"))
+            PROM_REQS_BY_PRIORITY.labels(priority=prio_tier).inc()
+        if ctx.agent and PROM_REQS_BY_AGENT:
+            PROM_REQS_BY_AGENT.labels(agent=ctx.agent).inc()
     except Exception as e:
         logger.debug("Error recording kv-offload request: %s", e)
 
@@ -330,3 +478,53 @@ async def reset_kv_cache_and_metrics(
             "timestamp": round(time.time(), 3),
         }
     )
+
+
+@router.get("/v1/genesis/pid")
+@router.get("/v1/kv-offload/pid")
+async def get_pid_status_endpoint():
+    """Returns current Genesis PN115 PID admission tuner status and metrics."""
+    try:
+        from vllm._genesis import dynamic_pid_gating as _g115
+        return JSONResponse(content=_g115.get_pid_status())
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.post("/v1/genesis/pid")
+@router.post("/v1/kv-offload/pid")
+async def update_pid_config_endpoint(
+    raw_request: Request,
+    enabled: Optional[bool] = Query(None),
+    target_step_ms: Optional[float] = Query(None),
+    max_kv_tokens: Optional[int] = Query(None),
+    max_concurrency: Optional[int] = Query(None),
+    min_concurrency: Optional[int] = Query(None),
+):
+    """Dynamically update Genesis PN115 PID admission tuner configuration in live execution."""
+    updates: dict[str, Any] = {}
+    if enabled is not None:
+        updates["enabled"] = enabled
+    if target_step_ms is not None:
+        updates["target_step_ms"] = target_step_ms
+    if max_kv_tokens is not None:
+        updates["max_kv_tokens"] = max_kv_tokens
+    if max_concurrency is not None:
+        updates["max_concurrency"] = max_concurrency
+    if min_concurrency is not None:
+        updates["min_concurrency"] = min_concurrency
+
+    try:
+        body = await raw_request.json()
+        if isinstance(body, dict):
+            updates.update(body)
+    except Exception:
+        pass
+
+    try:
+        from vllm._genesis import dynamic_pid_gating as _g115
+        res = _g115.set_pid_config(updates)
+        return JSONResponse(content={"status": "success", "config": res})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+

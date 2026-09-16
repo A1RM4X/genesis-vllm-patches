@@ -1,0 +1,7 @@
+[01:53:17] inicio: 1) escalas en un solo lado
+[02:04:00] sim_had_w256_a0: sim_had_w256_a0: 6/6 [] | logp medio del real -1.353
+[02:14:31] sim_had_w0_a256: sim_had_w0_a256: 6/6 [] | logp medio del real -1.397
+[02:14:31] 2) noon W4A8 + PN125: curva PP vs largo + estabilidad
+[02:25:37] curva PP:   corrida 2: 4089 tok en 1.46s = 2797 tok/s de prefill   corrida 2: 8051 tok en 2.98s = 2700 tok/s de prefill   corrida 2: 16061 tok en 6.26s = 2566 tok/s de prefill   corrida 2: 32036 tok en 13.65s = 2346 tok/s de prefill   corrida 2: 64032 tok en 32.47s = 1972 tok/s de prefill   corrida 2: 100032 tok en 59.04s = 1694 tok/s de prefill 
+[02:27:50] estabilidad: noon_final: prompt=57528 agujas=12/12 TTFT=28.8s decode=145.8 tok/s (137 tok) | TOTAL noon_final: TAR=64.3%  121 tok/s | bordes: turno 1: prompt=3681 gen=3000 (152 tok/s) numeros=622 errores=[] turno 2: prompt=6710 cacheados=2496 gen=1500 numeros=300 errores=[]  | bloques: tokens/832= 28  bloques por grupo=[4, 4, 4, 29]  (visto 10x) tokens/832= 29  bloques por grupo=[3, 3, 3, 30]  (visto 6x)  |   aciertos: 10/10
+[02:27:51] fin (queda arriba noon W4A8 + PN125 para opencode)

@@ -2298,6 +2298,312 @@ def apply_patch_B5_rejection_sampler() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN114 Mamba align bounds guard (vllm#35288 fix)")
+def apply_patch_N114_mamba_align_bounds_guard() -> PatchResult:
+    """PN114: bounds guard for mamba align copy to prevent CUDA illegal access at c>=4."""
+    name = "PN114 Mamba align bounds guard (vllm#35288 fix)"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.spec_decode import patch_PN114_mamba_align_bounds_guard
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN114_mamba_align_bounds_guard.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN124 triton ampere")
+def apply_patch_N124_triton_ampere() -> PatchResult:
+    """PN124: TRITON_ATTN afinado para Ampere + decode spec al kernel 3D."""
+    name = "PN124 triton ampere"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.hybrid import patch_PN124_triton_ampere
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN124_triton_ampere.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN123 volcado qkv")
+def apply_patch_N123_volcado_qkv() -> PatchResult:
+    """PN123: diagnostico, vuelca q/k/v de la atencion."""
+    name = "PN123 volcado qkv"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.hybrid import patch_PN123_volcado_qkv
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN123_volcado_qkv.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN122 rollback GDN con cinta")
+def apply_patch_N122_gdn_cinta() -> PatchResult:
+    """PN122: sin bloques especulativos GDN; rollback del MTP por cinta."""
+    name = "PN122 rollback GDN con cinta"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.hybrid import patch_PN122_gdn_cinta
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN122_gdn_cinta.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN130 Marlin W4A8 escalas con signo")
+def apply_patch_N130() -> PatchResult:
+    """PN130 Marlin W4A8 escalas con signo."""
+    name = "PN130 Marlin W4A8 escalas con signo"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kernels import patch_PN130_marlin_s16
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN130_marlin_s16.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN127 MambaManager drop_eagle_block")
+def apply_patch_N127() -> PatchResult:
+    """PN127 MambaManager drop_eagle_block."""
+    name = "PN127 MambaManager drop_eagle_block"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kv_cache import patch_PN127_mamba_drop_eagle_block
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN127_mamba_drop_eagle_block.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN128 orden async spec decode GDN/MTP")
+def apply_patch_N128() -> PatchResult:
+    """PN128 orden async spec decode GDN/MTP."""
+    name = "PN128 orden async spec decode GDN/MTP"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.spec_decode import patch_PN128_gdn_mtp_async_order
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN128_gdn_mtp_async_order.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN129 FlashInfer decode sin pin")
+def apply_patch_N129() -> PatchResult:
+    """PN129 FlashInfer decode sin pin."""
+    name = "PN129 FlashInfer decode sin pin"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kernels import patch_PN129_flashinfer_decode_unpin
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN129_flashinfer_decode_unpin.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN131 SK-18 decode entero")
+def apply_patch_N131_sk18_decode() -> PatchResult:
+    """PN131: decode de atencion entero SK-18h sobre KV int8_per_token_head."""
+    name = "PN131 SK-18 decode entero"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.hybrid import patch_PN131_sk18_decode
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN131_sk18_decode.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN126 rotacion qk")
+def apply_patch_N126_rot_qk() -> PatchResult:
+    """PN126: rotacion de q/k (Hadamard o WUSH) despues de RoPE."""
+    name = "PN126 rotacion qk"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.hybrid import patch_PN126_rot_qk
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN126_rot_qk.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN125 escalas positivas Marlin W4A8")
+def apply_patch_N125_marlin_w4a8_escalas() -> PatchResult:
+    """PN125: escalas negativas (AutoRound) corregidas para Marlin W4A8-INT8."""
+    name = "PN125 escalas positivas Marlin W4A8"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kernels import patch_PN125_marlin_w4a8_escalas
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN125_marlin_w4a8_escalas.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN121 guard de cascada de preempcion")
+def apply_patch_N121_preempt_cascade_guard() -> PatchResult:
+    """PN121: no preemptar en cascada mientras los frees van diferidos."""
+    name = "PN121 guard de cascada de preempcion"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kv_cache import patch_PN121_preempt_cascade_guard
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN121_preempt_cascade_guard.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN120 all-reduce de TP en INT8")
+def apply_patch_N120_ar_int8() -> PatchResult:
+    """PN120: los parciales del all-reduce de TP viajan en int8 en prefill."""
+    name = "PN120 all-reduce de TP en INT8"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.communication import patch_PN120_ar_int8
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN120_ar_int8.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN119 MLP de prefill por SK-12")
+def apply_patch_N119_sk12_mlp_forward() -> PatchResult:
+    """PN119: gate_up+SiLU fusionado por SK-12 en prefill."""
+    name = "PN119 MLP de prefill por SK-12"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.models import patch_PN119_sk12_mlp_forward
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN119_sk12_mlp_forward.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN118 MLP AWQ int4 -> INT8 per-canal en la carga")
+def apply_patch_N118_int8_mlp_boot_quant() -> PatchResult:
+    """PN118: cuantiza el MLP a INT8 per-canal una vez, en el arranque."""
+    name = "PN118 MLP AWQ int4 -> INT8 per-canal en la carga"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: monkeypatch ready")
+    try:
+        from vllm._genesis.wiring.quantization import patch_PN118_int8_mlp_boot_quant
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN118_int8_mlp_boot_quant.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN116 Super kernel de MLP aislado al prefill (SK-05)")
+def apply_patch_N116_prefill_mlp_superkernel() -> PatchResult:
+    """PN116: gate_up+SiLU por SK-05 solo en prefill grande, con A/B."""
+    name = "PN116 Super kernel de MLP aislado al prefill (SK-05)"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: monkeypatch ready")
+    try:
+        from vllm._genesis.wiring.models import patch_PN116_prefill_mlp_superkernel
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN116_prefill_mlp_superkernel.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN115 KV headroom gating & priority bypass")
+def apply_patch_N115_dynamic_pid_admission() -> PatchResult:
+    """PN115: admision por headroom de bloques KV + bypass por prioridad."""
+    name = "PN115 KV headroom gating & priority bypass"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.perf_hotfix import patch_N115_dynamic_pid_admission
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_N115_dynamic_pid_admission.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("P78 TurboQuant .tolist() capture-guard (adapted from noonghunna)")
 def apply_patch_78_tolist_capture_guard() -> PatchResult:
     """Patch 78: surgical safety-net for cudagraph capture in

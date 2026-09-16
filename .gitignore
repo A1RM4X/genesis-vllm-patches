@@ -74,3 +74,14 @@ compose/cache/
 
 # entorno virtual local
 .venv/
+
+# Artefactos pesados (trazas de profiler, checkouts, capturas): no van al repo
+workshop/ox_alpha/lab/results/
+workshop/ox_alpha/results/
+workshop/ox_alpha/tests/pn110_cudagraph/traces/
+tests/bench/medicion/trazas/
+assets/vllm/
+perf.data
+perf.data.old
+*.nsys-rep
+*.ncu-rep

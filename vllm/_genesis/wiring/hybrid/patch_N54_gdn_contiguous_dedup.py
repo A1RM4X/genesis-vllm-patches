@@ -122,6 +122,38 @@ LORA_BA_NEW = (
 )
 
 
+REARRANGE_QKV_OLD = (
+    "        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)\n"
+    "\n"
+    "        fused = torch.cat(\n"
+    "            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0\n"
+    "        )\n"
+    "\n"
+    "        q_size = seq_len * q_dim\n"
+    "        k_size = seq_len * k_dim\n"
+    "\n"
+    "        q_contig = fused[0:q_size]\n"
+    "        k_contig = fused[q_size : q_size + k_size]\n"
+    "        v_contig = fused[q_size + k_size :]\n"
+    "\n"
+    "        query = q_contig.view(1, seq_len, -1, self.head_k_dim)\n"
+    "        key = k_contig.view(1, seq_len, -1, self.head_k_dim)\n"
+    "        value = v_contig.view(1, seq_len, -1, self.head_v_dim)\n"
+    "\n"
+    "        return query, key, value"
+)
+
+REARRANGE_QKV_NEW = (
+    "        # [Genesis PN54 P0.8] Direct contiguous views instead of torch.cat flattening.\n"
+    "        # Eliminates 1D cat allocation + slicing, avoids VRAM allocator fragmentation.\n"
+    "        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)\n"
+    "        query = query.contiguous().view(1, seq_len, -1, self.head_k_dim)\n"
+    "        key = key.contiguous().view(1, seq_len, -1, self.head_k_dim)\n"
+    "        value = value.contiguous().view(1, seq_len, -1, self.head_v_dim)\n"
+    "        return query, key, value"
+)
+
+
 def _make_patcher() -> TextPatcher | None:
     target = resolve_vllm_file(
         "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
@@ -129,19 +161,20 @@ def _make_patcher() -> TextPatcher | None:
     if target is None:
         return None
     return TextPatcher(
-        patch_name="PN54 GDN contiguous dedup (P0.7 Cliff 2b)",
+        patch_name="PN54 GDN contiguous dedup (P0.8 Cliff 2b + rearrange_mixed_qkv)",
         target_file=str(target),
         marker=GENESIS_PN54_MARKER,
+        # Sub-A (ssm_state) y Sub-B (LoRA ba) quedaron OBSOLETOS en v0.27.1:
+        # upstream absorbio ambos y sus anchors ya no existen (ver docstring).
+        # Estaban como required=False bajo el mismo marker, que es justo la
+        # trampa de aplicacion parcial que prohibe A-19: el que calza escribe el
+        # marker y el otro no se reintenta nunca. Se quitan en vez de
+        # enmascararlos; el texto de los anchors queda arriba como registro.
         sub_patches=[
-            TextPatch(name="pn54_ssm_state", anchor=SSM_STATE_OLD,
-                      replacement=SSM_STATE_NEW, required=True),
-            TextPatch(name="pn54_lora_ba", anchor=LORA_BA_OLD,
-                      replacement=LORA_BA_NEW, required=False),
+            TextPatch(name="pn54_rearrange_mixed_qkv", anchor=REARRANGE_QKV_OLD,
+                      replacement=REARRANGE_QKV_NEW, required=True),
         ],
-        upstream_drift_markers=[
-            # Watch for upstream removing these calls or restructuring branch
-            "ssm_state[non_spec_state_indices_tensor]",
-        ],
+        upstream_drift_markers=[],
     )
 
 
@@ -158,15 +191,14 @@ def apply() -> tuple[str, str]:
 
     patcher = _make_patcher()
     if patcher is None:
-        return "skipped", "gdn_linear_attn.py not found"
+        return "skipped", "qwen_gdn_linear_attn.py not found"
 
     result, failure = patcher.apply()
     if result == TextPatchResult.APPLIED:
         return (
             "applied",
-            "PN54 applied: redundant .contiguous() calls removed in GDN "
-            "(ssm_state advanced-index + LoRA chunk halves); reduces per-turn "
-            "allocator fragmentation on Cliff 2b multi-turn",
+            "PN54 applied: direct contiguous views in rearrange_mixed_qkv (avoids "
+            "torch.cat + VRAM allocator fragmentation) and redundant contiguous dedup in GDN",
         )
     if result == TextPatchResult.IDEMPOTENT:
         return "applied", "already applied (idempotent)"

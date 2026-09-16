@@ -70,10 +70,8 @@ log = _get_logger("genesis.pn91.lazy_streaming")
 # ~30 ms (motor ocioso) y ~1,6 s (con un prefill largo en el batch), medido en
 # este rig: un presupuesto de "4 pasos" era en realidad entre 0,12 s y 6,4 s
 # segun la carga, o sea que no significaba nada.
-_DEFAULT_BUDGET_SECONDS = 2.0
-# Tope secundario por cantidad de pasos, para el caso patologico de pasos
-# instantaneos donde el reloj nunca llega al presupuesto.
-_DEFAULT_BUDGET_STEPS = 32
+_DEFAULT_BUDGET_SECONDS = 0.2
+_DEFAULT_BUDGET_STEPS = 4
 _MAX_TRACKED = 4096
 
 _LOCK = threading.RLock()

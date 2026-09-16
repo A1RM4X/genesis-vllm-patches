@@ -1,0 +1,1 @@
+rot_i8_wush: prompt=57532 agujas=12/12 TTFT=35.8s decode=99.9 tok/s (137 tok)

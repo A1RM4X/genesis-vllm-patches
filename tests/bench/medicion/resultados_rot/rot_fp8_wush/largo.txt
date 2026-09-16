@@ -1,0 +1,1 @@
+rot_fp8_wush: prompt=57531 agujas=12/12 TTFT=29.4s decode=148.4 tok/s (137 tok)

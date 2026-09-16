@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/tmp/g115/sondeos.py", line 68, in <module>
+    comparar(sys.argv[2], sys.argv[3:])
+  File "/tmp/g115/sondeos.py", line 50, in comparar
+    B = json.load(open(f"/tmp/g115/sond_{o}.json"))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/g115/sond_noon_w4a8.json'

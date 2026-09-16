@@ -1,0 +1,1 @@
+noon_final: prompt=57528 agujas=12/12 TTFT=28.8s decode=145.8 tok/s (137 tok)

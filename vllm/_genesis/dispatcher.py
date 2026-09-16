@@ -281,11 +281,11 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": 40819,
     },
     "B5": {
-        "title": "Rejection sampler vectorized early-exit + cache (CK-4.3 B5)",
+        "title": "Rejection sampler vectorized early-exit async (CK-4.3 B5 v1.1)",
         "env_flag": "GENESIS_ENABLE_B5_REJECTION_SAMPLER",
         "default_on": False,
         "category": "spec_decode",
-        "credit": "Genesis-original CK-4.3 B5 — optimiza rejection_sampler.py: early-exit para batch trivial (num_tokens==0/max_spec_len==0) evitando lanzamientos Triton (~5-15us), vectoriza expand_batch_to_tokens con torch.repeat_interleave para N<=16, y cache LRU de 32 entradas del patrón de expansión. Strict-superset, fallback a Triton en cualquier excepción.",
+        "credit": "Genesis-original CK-4.3 B5 v1.1 — optimiza rejection_sampler.py: early-exit para batch trivial (num_tokens==0/max_spec_len==0) evitando lanzamientos Triton (~5-15us), vectoriza expand_batch_to_tokens con torch.repeat_interleave para N<=16 (100% async GPU, sin sincronización D2H .tolist()). Strict-superset, fallback a Triton en cualquier excepción.",
         "upstream_pr": None,
     },
     "P74": {
@@ -1163,6 +1163,314 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
             "por cutlass_scaled_mm INT8 (~3x vs Marlin en Ampere) y el "
             "decode sigue en Marlin. Umbral GENESIS_PN110_W8A8_MIN_TOKENS, "
             "exclusion GENESIS_PN110_EXCLUDE_LAYERS."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN114": {
+        "title": "Mamba align bounds guard for spec-decode with concurrency >= 4 (vllm#35288 fix)",
+        "env_flag": "GENESIS_ENABLE_PN114_MAMBA_ALIGN_BOUNDS_GUARD",
+        "default_on": True,
+        "category": "spec_decode",
+        "credit": (
+            "Genesis-original 2026-08-30 (vllm#35288 fix). Guardas de limites "
+            "en mamba_utils.py para evitar illegal memory access y corrupcion "
+            "de estado en modelos hibridos GDN/Mamba con concurrencia >= 4 bajo "
+            "MTP. Por defecto SOLO aplica las guardas aritmeticas "
+            "(dest_block_idx = n // block_size - 1 puede ser -1 cuando no hay "
+            "frontera previa: saltear ahi es el caso fresh y es correcto). Las "
+            "guardas sobre el VALOR del block table (block_table[src] == -1 con "
+            "src >= 0) van aparte, detras de GENESIS_PN114_GUARD_BLOCK_TABLE=1: "
+            "no son el caso fresh sino una inconsistencia, y saltear ahi deja "
+            "estado recurrente rancio en el bloque destino, o sea cambia un "
+            "crash ruidoso por contaminacion silenciosa entre secuencias."
+        ),
+        "upstream_pr": 35288,
+        "applies_to": {},
+    },
+    "P113": {
+        "title": "MLP gate_up+SiLU fusionado en un solo GEMM (SK-05)",
+        "env_flag": "GENESIS_P113_MLP_FUSED_SILU",
+        "default_on": False,
+        "category": "perf_kernel",
+        "credit": (
+            "Genesis-original. Reemplaza `gate_up_proj` + `act_fn` de "
+            "Qwen2MoeMLP.forward (que qwen3_5.py importa como Qwen3NextMLP) por "
+            "una sola llamada a sk05_gateup_silu_gemm, que resuelve "
+            "SiLU(gate)*up en el epilogo del GEMM con las columnas "
+            "intercaladas. `down_proj` queda intacto, asi que la semantica de "
+            "TensorParallel (reduce_results, all_reduce) no se mueve."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN124": {
+        "title": "TRITON_ATTN rapido en Ampere head 256 (prefill afinado + decode spec al kernel 3D)",
+        "env_flag": "GENESIS_ENABLE_PN124_TRITON_AMPERE",
+        "default_on": False,
+        "category": "hybrid",
+        "credit": (
+            "Genesis-original 2026-09-14. Prefill: BLOCK_Q=2 y tiles de 32 en Ampere "
+            "(el afinado de upstream es solo Blackwell y excede la SRAM); BLOCK_M=64 "
+            "TILE=64 stages=1 da 2,84x y empata con FlashAttention paginada. Decode: "
+            "con MTP el kernel 3D paralelo no se usaba (max_seqlen_q>1); aplanar a "
+            "pseudo-secuencias de 1 query da 2,6-8,8x con error 3e-4."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN123": {
+        "title": "DIAGNOSTICO: volcado de q/k/v de la atencion para evaluar compresion de KV",
+        "env_flag": "GENESIS_ENABLE_PN123_VOLCADO_QKV",
+        "default_on": False,
+        "category": "hybrid",
+        "credit": "Genesis-original 2026-09-14. Solo diagnostico: escribe a disco.",
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN122": {
+        "title": "Rollback del MTP en GDN con cinta (sin bloques especulativos)",
+        "env_flag": "GENESIS_ENABLE_PN122_GDN_CINTA",
+        "default_on": False,
+        "category": "hybrid",
+        "credit": (
+            "Genesis-original 2026-09-14. Medido con opencode: con MTP K=3 cada "
+            "request ocupa 5-7 bloques en cada uno de los 3 grupos GDN (~18 "
+            "bloques, ~15k tokens de KV) porque num_speculative_blocks=K y el "
+            "kernel spec guarda el estado completo tras cada token. La cinta "
+            "guarda un solo estado + (k normalizada, v, g, beta) de los tokens "
+            "1..K y reproduce los aceptados; las copias align materializan desde "
+            "la cinta. Error 2,5e-4 contra upstream (redondeo fp16)."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN130": {
+        "title": "Marlin W4A8 propio con escalas int16 con signo (vllm#48905)",
+        "env_flag": "GENESIS_ENABLE_PN130_MARLIN_S16",
+        "default_on": False,
+        "category": "quantization",
+        "credit": (
+            "Genesis-original 2026-09-15. El kernel Marlin int8-act lee las escalas de grupo como uint16_t; AutoRound deja ~50% negativas. Se compila el Marlin de v0.27.1 con int16_t (solo s8 x uint4b8 x fp16) como extension propia. k_proj real: 0,87% de error contra 2,82% con PN125."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN127": {
+        "title": "MambaManager respeta drop_eagle_block (vllm#48375)",
+        "env_flag": "GENESIS_ENABLE_PN127_MAMBA_DROP_EAGLE",
+        "default_on": False,
+        "category": "kv_cache",
+        "credit": (
+            "Backport de vllm#48375 via club-3090. MTP x prefix caching en hibrido GDN: la ultima pagina puede reusar un estado recurrente tomado sobre tokens de borrador rechazados (vllm#43559). Extendido a la rama fina de prefix_match_unit."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN128": {
+        "title": "Input-prep async espera el postproceso del spec decode (GDN+MTP)",
+        "env_flag": "GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER",
+        "default_on": False,
+        "category": "spec_decode",
+        "credit": (
+            "Fix de club-3090 (#1052, vllm#52873): carrera async entre _update_states y el postproceso fused-align del spec decode -> Xid 31 VIRT_WRITE en gdn_attn a los 6-13k tokens generados."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN129": {
+        "title": "FlashInfer decode workspace sin pin (vllm#40756)",
+        "env_flag": "GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN",
+        "default_on": False,
+        "category": "kernels",
+        "credit": (
+            "Fix de club-3090: el drafter MTP re-planifica el decode wrapper sobre un buffer pinned copiado async -> Xid 31 VIRT_READ con >=4 requests MTP. Visto aca el 2026-09-13."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN131": {
+        "title": "Decode de atencion entero SK-18h (PTX) sobre KV int8_per_token_head",
+        "env_flag": "GENESIS_ENABLE_PN131_SK18",
+        "default_on": False,
+        "category": "hybrid",
+        "credit": (
+            "Genesis-original 2026-09-15. Q.K int8 + softmax entero en streaming "
+            "(2^-x cuadratica Q15, maximo corriente con mariposa, reescalado en "
+            "registros) + w.v int8 en un lanzamiento PTX por capa, paginas de 832 "
+            "tokens con layout propio. Bit-exacto contra emulador; 57k: 0,16 ms/capa "
+            "contra 0,20 de FlashInfer fp8 con la misma paginacion."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN126": {
+        "title": "Rotacion de q/k (Hadamard o WUSH) despues de RoPE",
+        "env_flag": "GENESIS_ENABLE_PN126_ROT_QK",
+        "default_on": False,
+        "category": "hybrid",
+        "credit": (
+            "Genesis-original 2026-09-14. q y k se rotan antes de la atencion "
+            "(q~.k~ = q.k exacto) para que la KV cuantizada no sufra los outliers "
+            "de canal: en q/k reales int8+Hadamard da 0,37/0,55% de error de "
+            "salida contra 1,82/2,40% de fp8 sin rotar. Modos hadamard, "
+            "captura y wush (arXiv 2512.00956, asignacion cruzada)."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN125": {
+        "title": "Escalas positivas para Marlin W4A8-INT8 (checkpoints AutoRound)",
+        "env_flag": "GENESIS_ENABLE_PN125_MARLIN_W4A8_ESCALAS",
+        "default_on": False,
+        "category": "quantization",
+        "credit": (
+            "Genesis-original 2026-09-14. VLLM_MARLIN_INPUT_DTYPE=int8 pasa las "
+            "escalas por grupo a int16 sin signo; AutoRound guarda el signo en "
+            "la escala (50,5% negativas en noon-at-cgn Qwen3.8-27B) y el modelo "
+            "responde basura sin aviso (3.754% de error en una capa real). Los "
+            "grupos negativos pasan a |s| con q -> 16-q antes del repack; el "
+            "unico caso no exacto (q=0) cuesta ~2,6% de error de peso."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN121": {
+        "title": "Guard de cascada de preempcion con frees diferidos",
+        "env_flag": "GENESIS_ENABLE_PN121_PREEMPT_GUARD",
+        "default_on": False,
+        "category": "kv_cache",
+        "credit": (
+            "Genesis-original 2026-09-13. Con KV connector consumidor + async "
+            "scheduling upstream difiere el free de los bloques preemptados; el "
+            "bucle de preempcion reintenta allocate_slots, falla igual y "
+            "preempta a la siguiente victima hasta vaciar la KV. Medido con "
+            "opencode: 3 preempciones en un paso llevaron la KV de 99% a 14%, "
+            "59 en un minuto. El guard corta tras la primera victima diferida."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN120": {
+        "title": "All-reduce de TP comprimido a INT8 en el prefill",
+        "env_flag": "GENESIS_ENABLE_PN120_AR_INT8",
+        "default_on": False,
+        "category": "communication",
+        "credit": (
+            "Genesis-original 2026-09-13. El perfil con nsys del prompt "
+            "processing (42k, TP=2 en dos 3090) dio que el all-reduce se lleva "
+            "el 24,4% del prefill: 6.538 llamadas de 6,3 ms moviendo 76,7 MB "
+            "cada una. No hay margen del lado del kernel — una copia P2P pura "
+            "de ese tamano tarda 6,06 ms, o sea que NCCL ya corre al 96% del "
+            "limite del PCIe 4.0 x8. Lo unico que queda es mandar menos bytes: "
+            "los parciales viajan en int8 con escala por token y se suman en el "
+            "dtype original (NO se puede all_reduce(int8,SUM): dos parciales de "
+            "+-127 desbordan). Medido: 6,49 ms -> 3,77 ms = 1,72x, contra un "
+            "piso de 3,42 ms que es solo la comunicacion. Va TRAZADO y no como "
+            "custom op opaco porque la fusion de inductor es lo que lo lleva de "
+            "1,16x a 1,72x. Error 0,88% relativo L2 por all-reduce y NO se "
+            "acumula: simulando 64 capas con residual y RMSNorm (128 "
+            "all-reduce) el error final es 0,0109 y cos_sim 0,999941. Descartados "
+            "antes, todos medidos: async TP + sequence parallelism (3-4% PEOR), "
+            "fusion allreduce+RMSNorm de FlashInfer (sin cambio), pipeline "
+            "parallel (NotImplementedError para este modelo) y DBO (solo soporta "
+            "backends all2all de MoE). Solo actua con M >= GENESIS_PN120_M_MIN "
+            "(default 512): en decode el all-reduce es de ~400 KB y esta "
+            "limitado por latencia, no por ancho de banda."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN119": {
+        "title": "MLP de prefill despachado por SK-12 (gate_up+SiLU fusionado)",
+        "env_flag": "GENESIS_ENABLE_PN119_SK12_MLP",
+        "default_on": False,
+        "category": "perf_kernel",
+        "credit": (
+            "Genesis-original 2026-09-12. SK-12 fusiona el GEMM de gate_up con "
+            "SiLU(gate)*up y devuelve [M, N], asi que NO encaja en la firma de un "
+            "Linear (que debe devolver [M, 2N] sin activar): por eso el despacho "
+            "va al nivel del modulo MLP y no donde engancha PN118. Reutiliza los "
+            "pesos INT8 que PN118 ya dejo en gate_up_proj, asi que no duplica "
+            "memoria ni trabajo de carga. Solo actua con M >= "
+            "GENESIS_PN119_M_MIN (default 512): SK-12 esta dimensionado para "
+            "prefill (tile 128x64) y en decode pierde. Text patch, no "
+            "monkeypatch: vLLM ejecuta el modelo en procesos worker donde "
+            "apply_all no corre."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN118": {
+        "title": "Cuantiza el MLP de AWQ int4 a INT8 per-canal en el arranque",
+        "env_flag": "GENESIS_ENABLE_PN118_INT8_MLP",
+        "default_on": False,
+        "category": "quantization",
+        "credit": (
+            "Genesis-original 2026-09-12. El bloque gate_up+SiLU del MLP es el "
+            "43% del chunk de prefill y hoy corre en fp16 por Marlin. Medido con "
+            "la GPU libre (M=2048 K=5120 N=8704x2): Marlin W4A16 6,330 ms / 57,7 "
+            "TOPS contra cutlass INT8 3,591 ms / 101,7 TOPS (1,76x) y SK-12 "
+            "fusionado 3,775 ms / 96,7 TOPS (1,68x). Las dos opciones rapidas "
+            "piden pesos INT8 per-canal que el checkpoint AWQ no trae, asi que "
+            "PN118 los produce en la carga enganchando "
+            "CompressedTensorsWNA16.process_weights_after_loading, que es donde "
+            "weight_packed/scale/zero_point estan juntos y sin repaquetar a "
+            "Marlin. Cae antes del profiling de memoria de vLLM, asi que el KV "
+            "cache se redimensiona solo. Delta medido del checkpoint: +3,330 GiB "
+            "por GPU al REEMPLAZAR (KV 701k -> ~566k tokens, working set 380k). "
+            "El error extra es ~1% (las escalas de grupo de un canal varian solo "
+            "1,7-2,0x); GENESIS_PN118_AUDIT=1 lo mide por capa. "
+            "GENESIS_PN118_FREE_INT4=1 libera los originales y cobra el delta, a "
+            "costa de quedarse sin fallback a Marlin. Inerte con un checkpoint "
+            "que ya venga en W8A8."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN116": {
+        "title": "Super kernel de MLP aislado al prefill (SK-05) con A/B incorporado",
+        "env_flag": "GENESIS_ENABLE_PN116_PREFILL_MLP_SK",
+        "default_on": False,
+        "category": "perf_kernel",
+        "credit": (
+            "Genesis-original 2026-09-12. El MLP es el 70,2% de los FLOPs de "
+            "GEMM del modelo (17,38 B de 24,76 B, contados del indice de "
+            "safetensors), asi que es el unico bloque que justifica un super "
+            "kernel. A diferencia de P113, que instala sk05_gateup_silu_gemm en "
+            "TODOS los M, PN116 dispatchea solo por encima de "
+            "GENESIS_PN116_M_MIN (default 4096): el propio docstring de P113 "
+            "mide que cutlass gana 1.55x a M=512 y 1.13x a M=1664 y recien "
+            "empatan a M=8000, o sea que con --long-prefill-token-threshold "
+            "2048 el super kernel se llamaba justo donde pierde. Debajo del "
+            "umbral el forward original queda intacto y decode no se toca "
+            "nunca. Trae A/B incorporado (GENESIS_PN116_AB=N) que corre los dos "
+            "caminos, compara numericamente y cronometra con eventos CUDA. "
+            "Depende del estado INT8 por capa de PN110 y es mutuamente "
+            "excluyente con P113."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN115": {
+        "title": "Admision por headroom de bloques KV + bypass por prioridad",
+        "env_flag": "GENESIS_ENABLE_PN115_PID_GATING",
+        "default_on": False,
+        "category": "perf_hotfix",
+        "credit": (
+            "Genesis-original 2026-08-30. Intercepta el bucle de waiting de "
+            "Scheduler.schedule: (a) difiere la admision de un request cuando "
+            "admitirlo dejaria al motor sin headroom fisico de bloques KV, lo "
+            "que evita fallos de allocate_slots y tormentas de preemption; (b) "
+            "deja que un request de prioridad alta desaloje a uno de prioridad "
+            "menor cuando el motor esta en max_num_seqs, con el MISMO rollback "
+            "de estado del paso que hace el camino de preemption de upstream, y "
+            "cortando el paso despues (upstream ya define que un paso que "
+            "preempta no admite trabajo nuevo). El PID de latencia es opcional "
+            "y va apagado por defecto (GENESIS_PN115_LATENCY_PID=1): cambia "
+            "throughput por latencia y con --async-scheduling no puede observar "
+            "la latencia del forward desde schedule(). Kill switch: "
+            "GENESIS_ENABLE_PN115_PID_GATING=0."
         ),
         "upstream_pr": None,
         "applies_to": {},

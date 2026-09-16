@@ -1,0 +1,7 @@
+grupos: ['MambaManager', 'MambaManager', 'MambaManager', 'FullAttentionManager']
+tokens/832=  9  bloques por grupo=[2, 2, 2, 10]  (visto 2x)
+tokens/832= 18  bloques por grupo=[2, 2, 2, 19]  (visto 9x)
+tokens/832= 27  bloques por grupo=[3, 3, 3, 28]  (visto 12x)
+tokens/832= 28  bloques por grupo=[3, 3, 3, 29]  (visto 53x)
+tokens/832= 28  bloques por grupo=[4, 4, 4, 29]  (visto 10x)
+tokens/832= 29  bloques por grupo=[3, 3, 3, 30]  (visto 6x)

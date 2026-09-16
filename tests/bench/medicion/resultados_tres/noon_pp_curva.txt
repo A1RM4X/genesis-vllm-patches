@@ -1,0 +1,24 @@
+== reps 90
+  corrida 0: 4089 tok en 2.83s = 1446 tok/s de prefill
+  corrida 1: 4089 tok en 1.50s = 2730 tok/s de prefill
+  corrida 2: 4089 tok en 1.46s = 2797 tok/s de prefill
+== reps 178
+  corrida 0: 8050 tok en 4.19s = 1920 tok/s de prefill
+  corrida 1: 8051 tok en 3.55s = 2266 tok/s de prefill
+  corrida 2: 8051 tok en 2.98s = 2700 tok/s de prefill
+== reps 356
+  corrida 0: 16061 tok en 7.26s = 2211 tok/s de prefill
+  corrida 1: 16060 tok en 6.80s = 2361 tok/s de prefill
+  corrida 2: 16061 tok en 6.26s = 2566 tok/s de prefill
+== reps 711
+  corrida 0: 32036 tok en 14.76s = 2170 tok/s de prefill
+  corrida 1: 32036 tok en 13.74s = 2331 tok/s de prefill
+  corrida 2: 32036 tok en 13.65s = 2346 tok/s de prefill
+== reps 1422
+  corrida 0: 64032 tok en 32.88s = 1948 tok/s de prefill
+  corrida 1: 64032 tok en 32.16s = 1991 tok/s de prefill
+  corrida 2: 64032 tok en 32.47s = 1972 tok/s de prefill
+== reps 2222
+  corrida 0: 100032 tok en 58.78s = 1702 tok/s de prefill
+  corrida 1: 100031 tok en 58.84s = 1700 tok/s de prefill
+  corrida 2: 100032 tok en 59.04s = 1694 tok/s de prefill

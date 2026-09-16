@@ -1,0 +1,8 @@
+[20:30:28] inicio
+[20:35:39] noon_w4a16 arriba
+[20:42:19] noon_w4a16:   corrida 2: 42793 tok en 27.61s = 1550 tok/s de prefill | noon_w4a16: prompt=57532 agujas=12/12 TTFT=40.0s decode=147.7 tok/s (137 tok) | TOTAL noon_w4a16: TAR=67.7%  129 tok/s | noon_w4a16: 6/6 []   aciertos: 10/10 
+[20:47:14] noon_w4a8 arriba
+[20:49:10] noon_w4a8:   corrida 2: 42792 tok en 16.60s = 2578 tok/s de prefill | noon_w4a8: prompt=57532 agujas=0/12 TTFT=24.8s decode=149.1 tok/s (400 tok) | TOTAL noon_w4a8: TAR=100.0%  163 tok/s | noon_w4a8: 0/6 ['!!!!!!!!!!!!!!!!!!!!!!!!!', '!!!!!!!!!!!!!!!!!!!!!!!!!', '!!!!!!!!!!!!!!!!!!!!!!!!!', '!!!!!!!!!!!!!!!!!!!!!!!!!', '!!!!!!!!!!!!!!!!!!!!!!!!!', '!!!!!!!!!!!!!!!!!!!!!!!!!']   aciertos: 0/10 
+[20:53:26] prod arriba
+[20:55:35] prod_ar4ikov:   corrida 2: 42791 tok en 19.13s = 2236 tok/s de prefill | prod_ar4ikov: prompt=57531 agujas=12/12 TTFT=28.6s decode=121.0 tok/s (137 tok) | TOTAL prod_ar4ikov: TAR=63.5%  95 tok/s | 
+[20:55:35] fin

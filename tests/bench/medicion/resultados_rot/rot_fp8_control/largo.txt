@@ -1,0 +1,1 @@
+rot_fp8_control: prompt=57531 agujas=12/12 TTFT=29.1s decode=114.5 tok/s (137 tok)

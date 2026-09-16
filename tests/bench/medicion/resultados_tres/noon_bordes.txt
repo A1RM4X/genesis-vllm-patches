@@ -1,0 +1,2 @@
+turno 1: prompt=3681 gen=3000 (152 tok/s) numeros=622 errores=[]
+turno 2: prompt=6710 cacheados=2496 gen=1500 numeros=300 errores=[]

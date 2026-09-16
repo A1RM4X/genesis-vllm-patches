@@ -63,6 +63,15 @@ def _collect_kernel_files() -> list[pathlib.Path]:
     que son los que tienen que ser monoliticos, usar las instrucciones rapidas
     de Ampere y respetar la lista de dtypes.
 
+    Se excluyen ademas los kernels cuyo cuerpo NO esta en Python: SK-12 y SK-13
+    se escriben en CUDA C (``kernels/cuda/<nombre>.cu``), se compilan con nvcc a
+    PTX y se lanzan por libcuda, sin Triton en ningun eslabon. El ``.py`` es
+    solo el lanzador, asi que exigirle "un unico @triton.jit con tl.load,
+    tl.dot y tl.store" o la lista de dtypes de Triton no tiene sentido: no hay
+    cuerpo de kernel que revisar. El discriminante es la existencia del ``.cu``
+    hermano, no una lista de nombres, para que valga tambien para los que
+    vengan.
+
     Con ``sk*.py`` se colaban tambien los auxiliares del mismo directorio cuyo
     nombre arranca igual por casualidad — ``sk_ops.py`` (registra los GEMM como
     custom ops de torch para que dynamo no trace dentro del lanzamiento de
@@ -76,7 +85,11 @@ def _collect_kernel_files() -> list[pathlib.Path]:
         for p in _KERNEL_DIR.glob(pat):
             if p.is_file():
                 found.add(p.resolve())
-    return sorted(found)
+    _todos = sorted(found)
+    # El cuerpo de SK-12/SK-13 vive en kernels/cuda/*.cu, no en
+    # Python: no hay @triton.jit que auditar.
+    return [f for f in _todos
+            if not (_KERNEL_DIR / "cuda" / f"{f.stem}.cu").is_file()]
 
 
 _KERNEL_FILES: list[pathlib.Path] = _collect_kernel_files()

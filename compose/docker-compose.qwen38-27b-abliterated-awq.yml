@@ -1,0 +1,241 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3.8-27B Abliterated AWQ Native MTP Preserved (W4A16 compressed-tensors)
+# Checkpoint: twolven/Qwen3.8-27B-abliterated-AWQ-MTP
+# Basado en la arquitectura y suite de parches Genesis vLLM
+#
+# CARACTERÍSTICAS DEL CHECKPOINT:
+# - Modelo base: JonathanColetti/Qwen3.8-27B-Uncensored / Qwen/Qwen3.8-27B (abliterado sin censura).
+# - Cuantización de pesos: AWQ W4A16 vía compressed-tensors (uint4 con activación float16/bfloat16).
+# - Ocupa ~8.5 - 9.0 GiB por GPU con TP=2 (~15.5 GiB totales).
+# - lm_head y DeltaNet linear attention preservados en precisión original.
+# - MTP (Speculative Decoding): Capa MTP nativa preservada en precisión nativa en model-mtp.safetensors.
+#   text_config.mtp_num_hidden_layers: 1 -> method: "qwen3_5_mtp", num_speculative_tokens: 1.
+# - Template: Froggeric v22.4 (soporte nativo Qwen 3.8, reasoning_effort='medium', paridad multi-tool).
+#
+# OPTIMIZACIONES GENESIS INCORPORADAS:
+# - PN81: Cuota y poda automática de KV en disco NVMe (/kv-offload).
+# - PN88: Métricas detalladas de tiers de KV (RAM L2 y NVMe L3).
+# - PN90: Gating de escritura SSD L3 por agente.
+# - PN91: Streaming diferido de KV para TTFT en prefijos largos.
+# - PN92: Codec hooks para lectura de bloques comprimidos.
+# - PN93: Sparse GDN checkpoints (stride 16) reduciendo escrituras y uso de KV en capas lineales.
+# - PN99: Compresión GPU L2 a 4 bits.
+# - PN100: Staging ring blocks (32) para subagentes efímeros.
+# - PN56: Fallback de parseo XML para qwen3_coder.
+# - P61b, P62, PN51, PN66: Estabilidad de streaming, timing de thinking y tags.
+# - PN77 & PN108: Cuantización FP8 del LM head y drafter MTP (ahorro ~1.2 GiB VRAM por GPU).
+# - B3: Custom all-reduce TP=2 fast path con fallback seguro.
+# - P66: Filtro de tamaños CUDA graph divisibles por K+1.
+# - P5b: Optimización de páginas KV.
+# - P69: Recordatorio de tool calling en contextos largos (>1000 caracteres).
+# - PN114: Guarda de alineación bounds en mamba_utils (fix vllm#35288).
+# - PN50, PN59, PN54, PN57, PN25, PN12, PN19: Fusión GDN, pools Silu/FFN y scoped max split.
+# - CuMem Allocator + TieringOffloadingSpec (6 GiB RAM ARC + NVMe SSD).
+# ─────────────────────────────────────────────────────────────────────────────
+version: '3.8'
+
+services:
+  vllm-server:
+    image: vllm/vllm-openai:v0.27.1
+    container_name: genesis-27b-qwen38-abliterated-awq
+    ports:
+      - "8320:8320"
+    networks:
+      lanbridge:
+        ipv4_address: 172.20.0.228
+        ipv6_address: fd00:172:20::13
+    volumes:
+      # Caché de modelos HuggingFace host
+      - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
+      # Tier 2 del cache de KV: NVMe
+      - /home/usuario/Proyectos/kv-offload:/kv-offload
+      # Persistencia de cachés JIT vLLM, PyTorch, Triton e Inductor dedicadas
+      - /home/usuario/.cache/vllm/qwen38-27b-abliterated-awq:/root/.cache/vllm
+      - /home/usuario/.cache/torch/qwen38-27b-abliterated-awq:/root/.cache/torch
+      - /home/usuario/.cache/triton/qwen38-27b-abliterated-awq:/root/.cache/triton
+      - /home/usuario/.cache/torchinductor/qwen38-27b-abliterated-awq:/root/.cache/torchinductor
+      # Montaje de la suite de parches Genesis en modo lectura
+      - ../vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      # Template de chat Froggeric v22.4 (soporte nativo Qwen 3.8, corrección de reasoning y tool-calling)
+      - ../templates/qwen-froggeric-chat-template.jinja:/etc/qwen-froggeric-chat-template.jinja:ro
+    environment:
+      # ── PARCHES GENESIS (ESTABILIDAD Y NAVEGACIÓN AGÉNTICA) ──────────────────────
+      - GENESIS_ENABLE_PN81_KV_DISK_QUOTA=1
+      - GENESIS_KV_DISK_MAX_GB=30
+      - GENESIS_KV_DISK_CHECK_SECS=60
+      - GENESIS_KV_DISK_ORPHAN_DAYS=3
+      - GENESIS_KV_DISK_ORPHAN_CHECK_SECS=3600
+      - GENESIS_KV_DISK_TARGET_RATIO=0.85
+      - GENESIS_ENABLE_PN88_KV_TIER_METRICS=1
+      - GENESIS_KV_AGENTS=coach,primary,primary_low,primary_high,primary_nothink,planner,planner_nothink,coder,verifier,utility,explorer,vision,art
+      - GENESIS_ENABLE_PN90_KV_DISK_WRITE_GATING=1
+      - GENESIS_PN90_MAX_PENDING_MB=256
+      - GENESIS_ENABLE_PN91_KV_LAZY_STREAMING=1
+      - GENESIS_PN91_MAX_DEFER_SECONDS=2.0
+      - GENESIS_PN91_MAX_DEFER_STEPS=32
+      - GENESIS_ENABLE_PN92_KV_FP4_COMPRESSION=1
+      - GENESIS_PN92_COMPRESS_ON_WRITE=0
+      - GENESIS_PN92_KV_DTYPE=fp8_e4m3
+      - GENESIS_PN92_CHUNK_ELEMS=1048576
+      - GENESIS_ENABLE_PN93_SPARSE_GDN=1
+      - GENESIS_PN93_GDN_CHECKPOINT_STRIDE=16
+      - GENESIS_ENABLE_PN99_GPU_COMPRESSED_L2=1
+      - GENESIS_PN100_RING_BLOCKS=32
+      - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1
+      - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1
+      - GENESIS_ENABLE_P62_STRUCT_OUT_SPEC_TIMING=1
+      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
+      - GENESIS_ENABLE_PN66=1
+      - GENESIS_ENABLE_PN77_FP8_LM_HEAD=1
+      - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=1
+      - GENESIS_ENABLE_B3_CUSTOM_AR=1
+      - GENESIS_ENABLE_B2_FULL_CG=0
+      - GENESIS_ENABLE_B5_REJECTION_SAMPLER=0
+      - GENESIS_ENABLE_B7_LM_HEAD=0
+      - GENESIS_ENABLE_PN8_MTP_DRAFT_ONLINE_QUANT=0
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
+      - GENESIS_ENABLE_P5B=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
+      - GENESIS_P68_P69_LONG_CTX_THRESHOLD_CHARS=1000
+      - GENESIS_P69_REMINDER_STYLE=qwen3_coder
+      - GENESIS_ENABLE_P107_MTP_TRUNCATION_DETECTOR=0
+      - GENESIS_ENABLE_PN114_MAMBA_ALIGN_BOUNDS_GUARD=1
+      - GENESIS_ENABLE_PN50_GDN_FUSED_PROJ=1
+      - GENESIS_ENABLE_PN59_STREAMING_GDN=1
+      - GENESIS_ENABLE_PN54_GDN_CONTIGUOUS_DEDUP=1
+      - GENESIS_ENABLE_PN57_TQ_CENTROIDS_DISK_CACHE=1
+      - GENESIS_ENABLE_PN80_GDN_H_BUDGET_PROBE=0
+      - GENESIS_ENABLE_PN25_SILU_INDUCTOR_SAFE=1
+      - GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1
+      - GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1
+      - GENESIS_PN80_EVERY=2000
+      - GENESIS_PN80_MIN_T=256
+      - GENESIS_PN80_TARGET_FREE_MIB=100
+
+      # ── OPTIMIZACIÓN DE KERNELS GEMM / TENSOR CORES (AWQ W4A16) ──────────────
+      - VLLM_FLOAT32_MATMUL_PRECISION=high
+      - VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=1024
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      - VLLM_USE_FUSED_MOE_GROUPED_TOPK=1
+      - VLLM_LOGGING_LEVEL=INFO
+      - GENESIS_VERBOSE=0
+      - GENESIS_LOG_LEVEL=INFO
+      - NVIDIA_VISIBLE_DEVICES=all
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_NO_USAGE_STATS=0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - OMP_NUM_THREADS=1
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+      - TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
+      - TRITON_CACHE_DIR=/root/.cache/triton
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - PYTHONHASHSEED=0
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        pip install pandas scipy xxhash -q
+        python3 -m vllm._genesis.patches.apply_all
+        exec vllm serve "$@"
+      - --
+    command:
+      # Checkpoint AWQ W4A16 con MTP nativo preservado
+      - twolven/Qwen3.8-27B-abliterated-AWQ-MTP
+      - --served-model-name
+      - qwen3.8
+      - qwen3.6
+      - qwen3.8-27b-abliterated
+      - twolven/Qwen3.8-27B-abliterated-AWQ-MTP
+      - --disable-access-log-for-endpoints
+      - "/metrics,/health"
+      - --enable-prompt-tokens-details
+      - --trust-remote-code
+      - --attention-backend
+      - FLASHINFER
+      - --moe-backend
+      - flashinfer_trtllm
+      - --generation-config
+      - vllm
+      - --quantization
+      - compressed-tensors
+      - --chat-template
+      - /etc/qwen-froggeric-chat-template.jinja
+      - --dtype
+      - float16
+      - --mamba-ssm-cache-dtype
+      - "float16"
+      - --kv-cache-dtype
+      - "fp8_e4m3"
+      - --max-num-seqs
+      - "10"
+      - --disable-custom-all-reduce
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "262144"
+      - --gpu-memory-utilization
+      - "0.76"
+      - --limit-mm-per-prompt
+      - '{"image":2,"video":0}'
+      - --mm-processor-kwargs
+      - '{"max_pixels":2000000,"min_pixels":65536}'
+      - --enable-flashinfer-autotune
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-cumem-allocator
+      - --kv-transfer-config
+      - '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"spec_name": "TieringOffloadingSpec", "cpu_bytes_to_use": 6442450944, "eviction_policy": "arc", "store_threshold": 1, "secondary_tiers": [{"type": "fs", "root_dir": "/kv-offload"}]}}'
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "1664"
+      - --long-prefill-token-threshold
+      - "832"
+      - --performance-mode
+      - "throughput"
+      # Tallas de CUDA Graph. Con MTP num_speculative_tokens=1 (K=1), cada secuencia
+      # aporta K+1 = 2 tokens por paso. Capturamos múltiplos de 2 hasta 40 (cubre hasta 20 seqs).
+      - --cudagraph-capture-sizes
+      - "2"
+      - "4"
+      - "6"
+      - "8"
+      - "10"
+      - "12"
+      - "14"
+      - "16"
+      - "18"
+      - "20"
+      - "24"
+      - "28"
+      - "32"
+      - "36"
+      - "40"
+      - --async-scheduling
+      # Decodificación especulativa MTP nativa con 1 token borrador (mtp_num_hidden_layers: 1)
+      - --speculative-config
+      - '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8320"
+      - --api-key
+      - "${VLLM_API_KEY:-}"
+
+networks:
+  lanbridge:
+    external: true

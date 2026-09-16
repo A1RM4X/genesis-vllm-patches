@@ -1,0 +1,8 @@
+      1 (Worker_TP0 pid=167) [PN125] 100 capas corregidas: 50.5% de escalas negativas, error de peso 2.587%
+      1 (Worker_TP0 pid=167) [PN125] 200 capas corregidas: 50.4% de escalas negativas, error de peso 2.597%
+      1 (Worker_TP0 pid=167) [PN125] 50 capas corregidas: 50.5% de escalas negativas, error de peso 2.584%
+      1 (Worker_TP1 pid=168) INFO 09-15 00:48:17 [gpu_worker.py:605] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9000 is equivalent to --gpu-memory-utilization=0.8818 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9182. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+      1 (Worker_TP1 pid=168) [PN125] 1 capas corregidas: 50.7% de escalas negativas, error de peso 2.577%
+      1 (Worker_TP1 pid=168) [PN125] 100 capas corregidas: 50.4% de escalas negativas, error de peso 2.587%
+      1 (Worker_TP1 pid=168) [PN125] 200 capas corregidas: 50.4% de escalas negativas, error de peso 2.597%
+      1 (Worker_TP1 pid=168) [PN125] 50 capas corregidas: 50.4% de escalas negativas, error de peso 2.584%

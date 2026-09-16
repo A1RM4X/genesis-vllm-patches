@@ -1,0 +1,16 @@
+  M=7488 cutlass W8A8 total                   9.64 ms
+  M=7488 W4A4 g256 (PTX act + SK-15)         93.14 ms
+  M=7488 W4A4 token (PTX act + SK-14)        11.57 ms
+  M=7488 solo act PTX (Q8b+SK17+Q4)           3.73 ms
+  M=7488 Hadamard bloques SK-16               0.58 ms
+  M=7488 Hadamard bloques cuBLAS              0.40 ms
+  M=2048 cutlass W8A8 total                   2.55 ms
+  M=2048 W4A4 g256 (PTX act + SK-15)         23.72 ms
+  M=2048 W4A4 token (PTX act + SK-14)         2.84 ms
+  M=2048 solo act PTX (Q8b+SK17+Q4)           1.18 ms
+  M=2048 Hadamard bloques SK-16               0.21 ms
+  M=2048 Hadamard bloques cuBLAS              0.17 ms
+  Hadamard bloques: SK-16          0.53 ms
+  Hadamard bloques: cuBLAS         0.36 ms
+  densa 5120: SK-16                8.99 ms
+  densa 5120: cuBLAS               6.66 ms
