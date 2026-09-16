@@ -18,6 +18,7 @@ host.
 
 Este banco mide las dos cosas contra el mismo trabajo de computo.
 """
+import ctypes
 import os
 import pickle
 import warnings
@@ -79,6 +80,19 @@ def main():
     from vllm import _custom_ops as vops
 
     comm = torch.cuda.Stream(device=dev)
+    cudart = ctypes.CDLL("libcudart.so")
+
+    def peer(dst, dst_dev, src, src_dev, nbytes, stream):
+        """cudaMemcpyPeerAsync a mano.
+
+        OJO: el ``copy_`` de torch toma un camino LENTO cuando el destino es un tensor importado
+        por IPC (5,9 GB/s contra 11,4 de esta llamada). Tirar con copy_ (destino local, origen
+        remoto) si va rapido: 12,9 GB/s, por encima de NCCL. Medido en p2p_ancho.py.
+        """
+        cudart.cudaMemcpyPeerAsync(ctypes.c_void_p(dst), ctypes.c_int(dst_dev),
+                                   ctypes.c_void_p(src), ctypes.c_int(src_dev),
+                                   ctypes.c_size_t(nbytes),
+                                   ctypes.c_void_p(stream.cuda_stream))
 
     def p(*a):
         if rank == 0:
@@ -111,10 +125,11 @@ def main():
             dist.all_gather_into_tensor(qg, mio)
 
         def dma():
-            """Cada rank ESCRIBE su parcial en el buzon del otro: una sola copia P2P por rank."""
+            """Cada rank TIRA el parcial del otro a su propio buzon: una copia P2P por rank."""
             for i in range(w):
                 if i != rank:
-                    buzones[i].copy_(mio, non_blocking=True)
+                    peer(buzon.data_ptr(), rank, vistas[i].data_ptr(), i,
+                         mio.numel(), torch.cuda.current_stream())
 
         def juntos(red):
             def f():
@@ -179,7 +194,7 @@ def main():
             paso = (M + n - 1) // n
             mios = [torch.zeros(paso, H, dtype=torch.int8, device=dev) for _ in range(n)]
             recs = [torch.zeros(paso * w, H, dtype=torch.int8, device=dev) for _ in range(n)]
-            bz[n] = (mios, [compartir(r, gcpu, rank, w) for r in recs], recs)
+            bz[n] = (mios, [compartir(m, gcpu, rank, w) for m in mios], recs)
 
         def serie_n():
             y = bloque_mlp(xq, sx)
@@ -206,8 +221,12 @@ def main():
                         mios[i].record_stream(comm)
                         if dma:
                             for r in range(w):
-                                vis[i][r][rank * paso:rank * paso + (hi - lo)].copy_(
-                                    mios[i][:hi - lo], non_blocking=True)
+                                if r == rank:
+                                    continue
+                                # tira el trozo del otro rank a la ranura que le toca
+                                # vis[i][r] es el buffer 'mios[i]' del rank r, visto desde aca
+                                peer(recs[i].data_ptr() + r * paso * H, rank,
+                                     vis[i][r].data_ptr(), r, paso * H, comm)
                         else:
                             dist.all_gather_into_tensor(recs[i], mios[i])
                         ec = torch.cuda.Event(); ec.record(comm)

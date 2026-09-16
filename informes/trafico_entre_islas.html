@@ -203,11 +203,12 @@
     </thead>
     <tbody>
       <tr>
-        <td>GEMM → all-reduce → GEMM<br><span class="m" style="color:var(--tinta-3)">serie pura</span></td>
-        <td>Solapar: partir el chunk en dos mitades y mandar la primera mientras se calcula la
-            segunda. Los tokens son independientes dentro del bloque MLP.</td>
+        <td>MLP → all-reduce → MLP<br><span class="m" style="color:var(--tinta-3)">serie pura</span></td>
+        <td>Solapar: partir el bloque MLP en trozos de tokens y mandar el trozo <em>i</em> por
+            <strong>copia P2P (DMA)</strong> mientras se calcula el <em>i+1</em>. Medido 1,19×
+            sobre el bloque. Detalle abajo: con NCCL no funciona.</td>
         <td class="n">—</td>
-        <td class="n">~700 ms<br>30%</td>
+        <td class="n">~200 ms<br>9%</td>
         <td><span class="chip duro">alto</span></td>
       </tr>
       <tr>
@@ -269,6 +270,38 @@
   </table>
   </div>
 
+  <h2>El all-reduce sí se puede esconder — pero no con NCCL</h2>
+  <p>La comunicación puede pasar mientras el SM calcula, porque el bloque MLP es por token: se lo
+  parte en trozos y el trozo <em>i</em> viaja mientras se calcula el <em>i+1</em>. Lo medí con dos
+  procesos reales sobre las dos placas. La sorpresa está en el transporte.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Transporte y nivel</th><th class="n">Solape</th><th class="n">Ganancia</th><th>Por qué</th></tr></thead>
+    <tbody>
+      <tr><td>NCCL, sin dependencia ninguna</td><td class="n">23%</td><td class="n">—</td><td>sus kernels compiten por SM</td></tr>
+      <tr><td>NCCL con <span class="m">MAX_NCHANNELS=2</span></td><td class="n">42-58%</td><td class="n">—</td><td>menos canales, menos contención</td></tr>
+      <tr><td>NCCL, pipeline en <span class="m">down_proj</span></td><td class="n">—</td><td class="n">1,09×</td><td>poco detrás de qué esconderse</td></tr>
+      <tr class="calor"><td>NCCL, pipeline en el bloque MLP</td><td class="n">0%</td><td class="n">1,00×</td><td>el MLP llena los 82 SM y NCCL no consigue lugar; darle prioridad al stream no cambia nada</td></tr>
+      <tr><td><strong>DMA P2P, pipeline en el bloque MLP</strong></td><td class="n"><strong>98-101%</strong></td><td class="n"><strong>1,27-1,34×</strong></td><td>lo ejecuta el motor de copia: no usa SM, solapa por construcción</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="nota">
+    <p><strong>La trampa que casi me hace descartar la idea:</strong> el <span class="m">copy_</span>
+    de torch toma un camino lento cuando el <em>destino</em> es un tensor importado por IPC —
+    5,9 GB/s contra 11,0 de NCCL. Parecía que el DMA era la mitad de rápido. No lo es: llamando
+    <span class="m">cudaMemcpyPeerAsync</span> a mano da 11,4 GB/s, y <em>tirando</em> (destino
+    local, origen remoto) da <strong>12,9 GB/s</strong>, por encima de NCCL. Con el transporte
+    corregido el solape pasó de 83% a 100% y la ganancia de 1,19× a 1,34×.</p>
+  </div>
+  <p>Las dos placas están en el mismo puente PCIe con P2P habilitado, así que la copia va directa
+  de una memoria a la otra, sin pasar por la RAM del host. El enlace es x8 (límite del slot) y
+  entrena a gen4 bajo carga: 15,8 GB/s teóricos, 12,9 medidos.</p>
+  <p>Partir el MLP es <strong>exacto</strong> (verificado: diferencia 0), porque cada token pasa
+  por gate_up, SiLU×gate y down sin mirar a los demás. Lo que falta para cablearlo: buzones IPC
+  persistentes (vLLM ya tiene esa maquinaria en su all-reduce propio), que el bloque partido sea
+  un custom op para sobrevivir a torch.compile, y la sincronización entre ranks.</p>
+
   <h2>El all-reduce no puede bajar de int8</h2>
   <p>Era el candidato de 16%, así que lo medí con las condiciones reales (outliers dispersos, dos
   parciales de 4096×5120). La frontera de bytes contra error es <strong>toda int8</strong>: no hay
@@ -308,9 +341,14 @@
     y se puede meter <em>dentro</em> del kernel que produce el dato (el epílogo de Marlin, o el
     SiLU×gate). Eso borra la sección "cuantización int8" entera: 560 µs de decode y 29 ms de
     prefill. Hay que medir cuánto cuesta en calidad.</li>
-    <li><strong>El residual viaja en fp16 y se vuelve a convertir en cada norma.</strong> Con el
-    residual en int32 con exponente compartido, la suma es un <span class="m">add</span> entero y
-    SK-20 se vuelve casi gratis. Es el cambio grande y toca todo el bus.</li>
+    <li><s><strong>El residual en int32 con exponente compartido.</strong></s>
+    <strong>Medido y descartado.</strong> El costo del residuo dentro de SK-20 es 4-5% en decode y
+    32-35% en prefill, pero ahí el kernel corre a 557-590 GB/s: contra el techo de DRAM. O sea que
+    el costo es <em>tráfico</em> (leer <span class="m">res</span> y escribir
+    <span class="m">res_out</span> son 4 de los 7 bytes por elemento), no aritmética — y en int32
+    serían 8 bytes, el doble. La aritmética tampoco mejora: <span class="m">add.f16x2</span> hace
+    dos elementos por instrucción y un add de int32 hace uno. Si algún día se toca ese bus, la
+    dirección es la contraria (menos bytes), y aun así el premio es ~0,5%.</li>
   </ul>
 
   <h2>Lo que ya se descartó con números</h2>
