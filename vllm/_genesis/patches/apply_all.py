@@ -2442,6 +2442,24 @@ def apply_patch_N129() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN134 quant int8 con factor global")
+def apply_patch_N134_quant_int8() -> PatchResult:
+    """PN134: cuantizacion de activacion int8 con el factor global fusionado."""
+    name = "PN134 quant int8 con factor global"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kernels import patch_PN134_quant_int8
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN134_quant_int8.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN133 MTP en int8")
 def apply_patch_N133_mtp_int8() -> PatchResult:
     """PN133: las lineales del modulo MTP en W8A8."""

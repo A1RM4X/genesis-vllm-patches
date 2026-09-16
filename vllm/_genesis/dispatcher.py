@@ -1289,6 +1289,24 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN134": {
+        "title": "Cuantizacion int8 de activacion con el factor global fusionado",
+        "env_flag": "GENESIS_ENABLE_PN134_QUANT",
+        "default_on": False,
+        "category": "kernels",
+        "credit": (
+            "Genesis-original 2026-09-16. El camino W4A8 cuantiza la activacion y "
+            "en un SEGUNDO kernel multiplica las escalas por el factor global de la "
+            "capa: 208 lanzamientos por paso para multiplicar M floats, 272 us de "
+            "pura latencia. sk19_quant hace las dos cosas en uno y sin punto "
+            "flotante (maximo desde los bits del fp16, reciproco con division "
+            "entera, escala armada como bits de fp32 con clz). Medido: 9,3 us "
+            "contra 11,2 con M=5 K=5120. Arriba de GENESIS_PN134_MMAX (256) se usa "
+            "el kernel de vLLM, que con M grande sigue siendo mas rapido."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN133": {
         "title": "Lineales del modulo MTP en W8A8",
         "env_flag": "GENESIS_ENABLE_PN133_MTP_INT8",

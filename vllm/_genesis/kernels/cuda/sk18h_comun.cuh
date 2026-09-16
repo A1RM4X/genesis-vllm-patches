@@ -57,6 +57,31 @@ __device__ __forceinline__ unsigned q_a_fp16(unsigned long long u, int E0, int n
     return r | ((unsigned)neg << 15);
 }
 
+// u (>= 0) * 2^E0 -> bits fp32 (redondeo al par aproximado por medio punto). Mismo truco que
+// q_a_fp16 pero con 23 bits de mantisa y sesgo 127: sirve para devolver escalas sin usar la FPU.
+__device__ __forceinline__ unsigned q_a_fp32(unsigned long long u, int E0) {
+    if (u == 0ull) return 0u;
+    const int p = 63 - (int)__builtin_clzll(u);
+    int e = p + E0 + 127;
+    long long mant;
+    const int sh = p - 23;
+    if (sh > 0) mant = (long long)((u + (1ull << (sh - 1))) >> sh);
+    else mant = (long long)(u << (-sh));
+    if (mant >= (1 << 24)) { mant >>= 1; e += 1; }
+    if (e >= 255) return 0x7f7fffffu;                 // satura al maximo finito
+    if (e <= 0) return 0u;
+    return ((unsigned)e << 23) | ((unsigned)mant & 0x7fffffu);
+}
+
+// bits de un fp32 -> mantisa de 24 bits y exponente (u = m * 2^e). Solo positivos.
+__device__ __forceinline__ unsigned long long fp32_a_mant(unsigned bits, int* e) {
+    const unsigned ee = (bits >> 23) & 255u;
+    const unsigned m = bits & 0x7fffffu;
+    if (ee == 0) { *e = -149; return (unsigned long long)m; }
+    *e = (int)ee - 127 - 23;
+    return (unsigned long long)(m | (1u << 23));
+}
+
 // 2^-(t/256) en Q15 con 32768 = 1 (t en medios-log Q8), 0 si t >= 16*256.
 #ifndef QA
 #define QA 22474
