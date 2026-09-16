@@ -614,14 +614,13 @@ _register(Preset(
             "expandable_segments:True,max_split_size_mb:512"
         ),
         "NCCL_CUMEM_ENABLE": "0",
-        "NCCL_P2P_DISABLE": "1",
     },
     verified_on=[
         "noonghunna/2x-3090: ~116 tok/s wall_TPS",
     ],
     expected_tps_ref="~116 tok/s wall_TPS (~12% over A5000 reference)",
     notes=[
-        "ℹ NCCL_P2P_DISABLE=1 porque se verifico con el driver de fabrica, donde las GeForce no tienen P2P. Con el fork aikitoria/open-gpu-kernel-modules instalado (y iommu=pt) SACALO: el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. `genesis doctor` lo avisa.",
+        "ℹ Sin NCCL_P2P_DISABLE a proposito: con el fork aikitoria/open-gpu-kernel-modules (y iommu=pt) las 3090 SI tienen P2P, y el intercambio directo entre placas da 13 GB/s contra pasar por la RAM del host. Si corres con el driver de fabrica, donde las GeForce no tienen P2P, agregalo: `genesis doctor` detecta cual es tu caso y lo dice.",
         "ℹ TP=2 splits GDN state — Cliff 2 single-card concern doesn't "
         "apply here. P103 / PN32 still available if you push past 200K.",
     ],

@@ -1289,6 +1289,23 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN136": {
+        "title": "All-reduce del MLP solapado con el computo (P2P directo)",
+        "env_flag": "GENESIS_ENABLE_PN136_MLP_SOLAPADO",
+        "default_on": False,
+        "category": "kernels",
+        "credit": (
+            "Genesis-original 2026-09-16. El bloque MLP es por token, asi que "
+            "se parte en trozos de filas y el trozo i sale a la otra placa "
+            "mientras se calcula el i+1. El transporte es cudaMemcpyPeerAsync "
+            "sobre memoria compartida con IPC hecho a mano: 13,0 GB/s contra "
+            "11,0 de NCCL, y solapa 105% porque lo hace el motor de copia sin "
+            "gastar un SM (NCCL copia con los SM y por eso solapa 25%, y 0% "
+            "contra un bloque que llena la placa). Partir el MLP es exacto."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN135": {
         "title": "Residual + RMSNorm + cuantizacion int8 en un kernel",
         "env_flag": "GENESIS_ENABLE_PN135_NORM_QUANT",

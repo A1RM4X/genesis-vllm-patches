@@ -1,10 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """PN136 — el all-reduce del MLP viaja MIENTRAS se calcula el resto del bloque.
 
-MEDIDO Y APAGADO: en estas 3090 no paga (1,00x). Es correcto — da el mismo resultado bit a bit —
-pero el motor de copia de la placa topea en 5,6 GB/s contra los 11,2 de NCCL, asi que lo que el
-solape ahorra el transporte mas lento lo devuelve. El detalle esta al final del docstring. El
-codigo queda porque en placas con P2P sin capar (Tesla/Quadro, o NVLink) la cuenta da distinto.
+CABLEADO, CORRIENDO Y EXACTO — PERO NO GANA NADA, asi que queda APAGADO por omision.
+
+Medido en el servidor real (prefill de 42k tokens, 3 corridas x 3 repeticiones cada una):
+
+    PN136 apagado      2.383 tok/s
+    PN136, 4 trozos    2.390 tok/s   (+0,3%)
+    PN136, 2 trozos    2.392 tok/s   (+0,4%)
+
+O sea, ruido. El camino solapado corre de verdad (lo dice el log "MLP partido en N trozos") y sin
+un solo error. Por que no gana: con PN120 los parciales ya viajan en int8 (la mitad de los bytes)
+y, despues de emparejar las placas por potencia, lo que queda de intercambio es chico al lado del
+computo del bloque MLP. NCCL en ese regimen ya no molesta.
+
+Donde SI valdria: si el intercambio volviera a pesar — mas ranks, activaciones sin cuantizar,
+o un enlace mas lento — porque el transporte esta medido en 13,0 GB/s con 105% de solape contra
+los 11,0 GB/s y 25% de NCCL.
 
 El problema
 -----------
@@ -223,6 +235,28 @@ def _pn136_mlp_fake(x: torch.Tensor, capa: int):
     return torch.empty_like(x)
 
 
+def _capas_del_modelo(model):
+    """Encuentra la lista de capas del decoder sin depender de como se llame el envoltorio.
+
+    El modelo que entrega el cargador puede venir envuelto (torch.compile, LoRA, etc.), asi que en
+    vez de asumir ``model.model.layers`` se baja por los hijos hasta encontrar un ``layers`` que
+    tenga modulos con ``mlp``.
+    """
+    vistos = set()
+    pila = [model]
+    while pila:
+        m = pila.pop(0)
+        if id(m) in vistos:
+            continue
+        vistos.add(id(m))
+        capas = getattr(m, "layers", None)
+        if capas is not None and len(capas) and any(hasattr(c, "mlp") for c in capas):
+            return list(capas)
+        for _, hijo in m.named_children():
+            pila.append(hijo)
+    return []
+
+
 def preparar(model, cap_filas: int | None = None) -> int:
     """Registra los MLP, reserva los buzones y devuelve cuantas capas quedaron cableadas.
 
@@ -240,7 +274,10 @@ def preparar(model, cap_filas: int | None = None) -> int:
         log.warning("PN136: TP=%d, no hay nada que solapar", w)
         return 0
 
-    capas = getattr(getattr(model, "model", model), "layers", None) or []
+    capas = _capas_del_modelo(model)
+    if not capas:
+        log.warning("PN136: no se encontraron capas en %s (hijos: %s)", type(model).__name__,
+                    [n for n, _ in model.named_children()][:6])
     mlps = []
     for capa in capas:
         mlp = getattr(capa, "mlp", None)

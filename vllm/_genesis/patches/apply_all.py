@@ -2442,6 +2442,24 @@ def apply_patch_N129() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN136 MLP solapado")
+def apply_patch_N136_mlp_solapado() -> PatchResult:
+    """PN136: el all-reduce del MLP viaja mientras se calcula el resto del bloque."""
+    name = "PN136 MLP solapado"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.communication import patch_PN136_mlp_solapado
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN136_mlp_solapado.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN134 quant int8 con factor global")
 def apply_patch_N134_quant_int8() -> PatchResult:
     """PN134: cuantizacion de activacion int8 con el factor global fusionado."""

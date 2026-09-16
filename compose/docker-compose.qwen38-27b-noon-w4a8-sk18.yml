@@ -258,6 +258,12 @@ services:
       # PN130: Marlin W4A8 propio con escalas int16 CON signo (exacto; con PN130 cargado PN125 no toca pesos).
       - GENESIS_ENABLE_PN130_MARLIN_S16=1
       - GENESIS_ENABLE_PN124_TRITON_AMPERE=1  # Triton afinado para Ampere (prefill con KV int8)
+      # PN136: parte el bloque MLP en trozos y manda el all-reduce de cada trozo por copia
+      # P2P directa (13 GB/s, la hace el motor de copia y no gasta SM) mientras se calcula
+      # el siguiente. Necesita el driver con P2P y iommu=pt.
+      - GENESIS_ENABLE_PN136_MLP_SOLAPADO=${PN136:-0}
+      - GENESIS_PN136_TROZOS=${PN136_TROZOS:-4}
+      - GENESIS_PN136_M_MIN=${PN136_MMIN:-1024}
       - GENESIS_ENABLE_PN134_QUANT=${PN134:-0}
       - GENESIS_PN134_HILOS=${PN134_HILOS:-256}   # quant int8 + factor global en un kernel
       - GENESIS_ENABLE_PN133_MTP_INT8=${PN133:-0}  # lineales del borrador MTP en W8A8
