@@ -81,6 +81,7 @@ workshop/ox_alpha/results/
 workshop/ox_alpha/tests/pn110_cudagraph/traces/
 tests/bench/medicion/trazas/
 assets/vllm/
+assets/vllm
 perf.data
 perf.data.old
 *.nsys-rep
