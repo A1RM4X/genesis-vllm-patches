@@ -27,7 +27,7 @@ for M, K in ((5,5120), (40,5120), (8192,5120)):
     es = torch.empty(M,dtype=torch.float32,device=dev)
     ref = None
     out = []
-    for etiqueta, defs in (("entero", []), ("add.f16", ["-DFPADD=1"])):
+    for etiqueta, defs in (("entero", ["-DENTSUMA=1"]), ("add.f16x2", [])):
         mejor=None
         for h in (256, 512, 1024):
             k = Kernel("sk20_norm_quant.cu","sk20_norm_quant",defs=[f"-DHILOS={h}"]+defs,warps=h//32)
@@ -36,15 +36,15 @@ for M, K in ((5,5120), (40,5120), (8192,5120)):
                   ro.view(torch.int16),qo,es.view(torch.int32),K,x.stride(0),1]
             t=medir(lambda: k.lanzar((M,1),args,4*K))
             if mejor is None or t<mejor[0]: mejor=(t,h)
-            if etiqueta=="add.f16" and h==256:
+            if etiqueta=="add.f16x2" and h==256:
                 k.lanzar((M,1),args,4*K); torch.cuda.synchronize()
                 ref=(ro.clone(),qo.clone())
         out.append(mejor)
     # comprobar que dan lo mismo
-    k = Kernel("sk20_norm_quant.cu","sk20_norm_quant",defs=["-DHILOS=256"],warps=8); k.cargar()
+    k = Kernel("sk20_norm_quant.cu","sk20_norm_quant",defs=["-DHILOS=256","-DENTSUMA=1"],warps=8); k.cargar()
     args=[x.view(torch.int16),res.view(torch.int16),w.view(torch.int16),g_.view(torch.int32),
           ro.view(torch.int16),qo,es.view(torch.int32),K,x.stride(0),1]
     k.lanzar((M,1),args,4*K); torch.cuda.synchronize()
     igual = bool((ro.view(torch.int16)==ref[0].view(torch.int16)).all()) and bool((qo==ref[1]).all())
-    print(f"M={M:5d}: entero {out[0][0]:7.2f}us (h={out[0][1]})  add.f16 {out[1][0]:7.2f}us "
+    print(f"M={M:5d}: entero {out[0][0]:7.2f}us (h={out[0][1]})  add.f16x2 {out[1][0]:7.2f}us "
           f"(h={out[1][1]})  sobrecosto {out[0][0]-out[1][0]:5.2f}us  bits iguales={igual}")

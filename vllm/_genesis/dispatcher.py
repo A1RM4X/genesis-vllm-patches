@@ -1289,6 +1289,24 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN135": {
+        "title": "Residual + RMSNorm + cuantizacion int8 en un kernel",
+        "env_flag": "GENESIS_ENABLE_PN135_NORM_QUANT",
+        "default_on": False,
+        "category": "kernels",
+        "credit": (
+            "Genesis-original 2026-09-16. Cada sitio de norma dispara tres kernels "
+            "(norma, cuantizacion y la multiplicacion de la escala por el factor "
+            "global) y recorre la activacion tres veces. sk20_norm_quant hace las "
+            "tres cosas de una: la normalizacion se cancela en los enteros, asi que "
+            "q = round(r*w*127/max|r*w|) y el inv_rms solo hace falta una vez por "
+            "fila, para la escala. El kernel no escribe la activacion normalizada: "
+            "entrega el int8 directo al lineal Marlin. Medido con grafos CUDA: 6,0 "
+            "-> 5,76 us con M=5, y 642 -> 528 us (1,22x) con M=8192."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN134": {
         "title": "Cuantizacion int8 de activacion con el factor global fusionado",
         "env_flag": "GENESIS_ENABLE_PN134_QUANT",

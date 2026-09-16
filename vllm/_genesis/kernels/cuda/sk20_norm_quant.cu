@@ -80,16 +80,19 @@ __device__ __forceinline__ unsigned mant16(unsigned b, int* e) {
 // El pegajoso vale para el redondeo exacto: con resto == mitad hay empate SOLO si no quedo nada
 // abajo. Y en la resta, A - B - eps = (A - B - 1) + (1 - eps), asi que restar uno y prender el
 // pegajoso deja la parte fraccionaria otra vez en (0,1), que es lo que el redondeo necesita.
-#ifdef FPADD
-// Variante de control (apagada): la misma suma con el sumador fp16 del hardware. Sirve para
-// medir cuanto cuesta la regla de "todo entero" en esta operacion puntual; el resultado en bits
-// es el mismo, porque el sumador entero de abajo reproduce exactamente el redondeo IEEE.
-__device__ __forceinline__ unsigned suma_fp16(unsigned a, unsigned b) {
+#ifndef ENTSUMA
+// EXCEPCION medida a la regla de "todo entero", acotada a ESTA suma: el sumador fp16 del
+// hardware da EXACTAMENTE los mismos bits que el sumador entero de abajo (verificado elemento a
+// elemento a M=5/40/8192), porque aquel reproduce el redondeo IEEE al par. O sea que aca el
+// entero no compra ni precision ni determinismo: solo cuesta ~40 instrucciones por elemento
+// contra 1 (y add.f16x2 hace DOS elementos de una), el 44% del kernel.
+// Con -DENTSUMA=1 se compila el camino entero, que queda como referencia y para verificar.
+__device__ __forceinline__ unsigned suma_fp16x2(unsigned a, unsigned b) {
     unsigned r;
-    asm("add.f16 %0, %1, %2;" : "=h"(*(unsigned short*)&r) : "h"((unsigned short)a),
-        "h"((unsigned short)b));
-    return r & 0xffffu;
+    asm("add.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
 }
+#define HAY_SUMA2 1
 #else
 __device__ __forceinline__ unsigned suma_fp16(unsigned a, unsigned b) {
     // ordenar por magnitud es gratis: el patron de bits de |fp16| ya esta ordenado
@@ -172,10 +175,9 @@ __device__ __forceinline__ void unir_cuad(unsigned long long a, int ea, unsigned
 // una posicion de la pasada A: r = x + residual, clave del maximo |r*w|, cuadrado acumulado.
 // Devuelve, ademas de r, la clave del elemento (con su signo) para que la pasada B no tenga que
 // volver a abrir mantisas ni a multiplicar: se la deja en shared.
-__device__ __forceinline__ unsigned paso_a(unsigned xb, unsigned resb, int hay_res, unsigned wb,
-                                           unsigned* clave, unsigned* cel,
-                                           unsigned long long* acc, int* eref) {
-    const unsigned rb = hay_res ? suma_fp16(xb, resb) : xb;
+__device__ __forceinline__ void paso_a(unsigned rb, unsigned wb,
+                                       unsigned* clave, unsigned* cel,
+                                       unsigned long long* acc, int* eref) {
     int er, ew;
     const unsigned mr = mant16(rb, &er), mw = mant16(wb, &ew);
     acum_cuad(mr, er, acc, eref);
@@ -185,7 +187,15 @@ __device__ __forceinline__ unsigned paso_a(unsigned xb, unsigned resb, int hay_r
     const unsigned c = ((unsigned)E << 21) | p;             // monotona en |r*w|
     *clave = *clave > c ? *clave : c;
     *cel = c | (((rb ^ wb) & 0x8000u) << 16);               // el signo, en el bit 31
-    return rb;
+}
+
+// suma de dos fp16 empaquetados en una palabra de 32 bits
+__device__ __forceinline__ unsigned suma_par(unsigned xp, unsigned rp) {
+#ifdef HAY_SUMA2
+    return suma_fp16x2(xp, rp);
+#else
+    return suma_fp16(xp & 0xffffu, rp & 0xffffu) | (suma_fp16(xp >> 16, rp >> 16) << 16);
+#endif
 }
 
 // una posicion de la pasada B: de la clave guardada al byte int8. Sin mantisas ni productos.
@@ -242,11 +252,10 @@ sk20_norm_quant(
             unsigned cel[8];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const unsigned lo = paso_a(px[j] & 0xffffu, pr[j] & 0xffffu, HAY_RES,
-                                           pw[j] & 0xffffu, &clave, &cel[2 * j], &acc, &eref);
-                const unsigned hi = paso_a(px[j] >> 16, pr[j] >> 16, HAY_RES,
-                                           pw[j] >> 16, &clave, &cel[2 * j + 1], &acc, &eref);
-                po[j] = lo | (hi << 16);
+                const unsigned rp = HAY_RES ? suma_par(px[j], pr[j]) : px[j];
+                po[j] = rp;
+                paso_a(rp & 0xffffu, pw[j] & 0xffffu, &clave, &cel[2 * j], &acc, &eref);
+                paso_a(rp >> 16, pw[j] >> 16, &clave, &cel[2 * j + 1], &acc, &eref);
             }
             if (HAY_RES) o4[c] = ov;
 #pragma unroll
@@ -255,8 +264,9 @@ sk20_norm_quant(
     } else {
         for (int i = tid; i < K; i += HILOS) {
             unsigned cel;
-            const unsigned rb = paso_a(x[base + i], HAY_RES ? res[base + i] : 0u, HAY_RES,
-                                       w[i], &clave, &cel, &acc, &eref);
+            const unsigned rb = HAY_RES ? (suma_par(x[base + i], res[base + i]) & 0xffffu)
+                                        : (unsigned)x[base + i];
+            paso_a(rb, w[i], &clave, &cel, &acc, &eref);
             if (HAY_RES) res_out[bo + i] = (unsigned short)rb;
             s_cel[i] = cel;
         }
