@@ -1,0 +1,25 @@
+[Unit]
+Description=NVIDIA GPU Power Limit Configuration
+After=syslog.target systemd-modules-load.service nvidia-persistenced.service
+PartOf=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Reparto ASIMETRICO, mismo total que antes (440 W).
+#
+# Las dos placas no son iguales: la GPU 1 (0000:11:00.0, VBIOS 94.02.42.40.B7) es peor bin que la
+# GPU 0 (0000:0F:00.0, VBIOS 94.02.42.80.9F). Bajo carga la 1 saca 615-1080 MHz consumiendo 218 W
+# mientras la 0 saca 930-1485 MHz con 210 W, y ademas la 1 corre MAS FRIA (52 vs 63 C): no es
+# temperatura, es silicio.
+#
+# Con TP=2 el paso lo fija la placa lenta: la 0 se queda esperando adentro del all-reduce. Medido
+# en la traza de prefill, esa espera es 542 ms de un paso de 2.340 ms (23%).
+#
+# Moviendo 8 W de la 0 a la 1, sin cambiar el total, el prefill sube 3,5% (2.003 -> 2.073 tok/s,
+# A/B alternado de 3 rondas x 3 corridas para descontar la deriva termica). Mas de 8 W empeora:
+# a 204/236 baja a 1.928.
+ExecStart=/bin/bash -c 'for i in $(seq 1 30); do /usr/bin/nvidia-smi -i 0 -pl 212 && /usr/bin/nvidia-smi -i 1 -pl 228 && exit 0; sleep 2; done; echo "NVIDIA SMI failed to set power limit after retries" >&2; exit 1'
+
+[Install]
+WantedBy=multi-user.target
