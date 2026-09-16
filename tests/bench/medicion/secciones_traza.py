@@ -9,10 +9,12 @@ lanzamientos por paso, y los kernels mas pesados de cada lado.
 import collections, glob, gzip, json, os, sys
 
 SECCIONES = [
-    ("atencion: kernel", ("sk18h_batch", "sk18h_union", "sk18h_prep", "sk18h_salida", "batchprefill",
+    ("atencion: kernel", ("sk18h_batch", "sk18h_union", "sk18h_prep", "sk18h_salida",
+                          "sk18i_batch", "sk18i_prep", "sk18i_salida", "batchprefill",
                           "batchdecode", "flashinfer", "unified_attention", "prefillwithkvcache",
                           "decodewithkvcache", "mergestates")),
-    ("atencion: escritura KV", ("sk18h_escribir", "reshape_and_cache", "concat_and_cache")),
+    ("atencion: escritura KV", ("sk18h_escribir", "sk18i_escribir", "sk18i_lado",
+                                "reshape_and_cache", "concat_and_cache")),
     ("GDN (recurrente+conv+cinta)", ("gated_delta", "fused_recurrent", "causal_conv1d", "conv1d", "fla_", "chunk_",
                                "l2norm", "gdn", "mamba", "ssm", "sigmoid", "wmma_tensorop_f16_s161616gemm",
                                "_k_escribir", "_k_spec", "_k_materializar")),

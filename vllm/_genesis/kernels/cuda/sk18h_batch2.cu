@@ -62,6 +62,12 @@
 #ifndef ESC8
 #define ESC8 3
 #endif
+// Trozos por pagina espejada: con 4 bloques (2 paginas x 2 cabezas) el kernel queda limitado por
+// latencia (114 us por capa). Cada trozo toma CHK/SCH keys y escribe en una ranura de salida
+// propia al final del espacio de paginas (las reserva el runtime).
+#ifndef SCH
+#define SCH 8
+#endif
 #ifndef WCAPW
 #define WCAPW 32639
 #endif
@@ -138,9 +144,11 @@ sk18h_batch2(
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-#if HIB   // la grilla del espejo tiene solo PAGS paginas: son las ULTIMAS de cada secuencia
+#if HIB   // la grilla del espejo tiene PAGS paginas x SCH trozos: son las ULTIMAS de cada secuencia
     const int sq_ = blockIdx.y / (NH * SUB);
-    const int tramo = ((nseq[sq_] - 1) / CHK) - (PAGS - 1) + blockIdx.x;
+    const int trozo = blockIdx.x % SCH;
+    const int tramo = ((nseq[sq_] - 1) / CHK) - (PAGS - 1) + (blockIdx.x / SCH);
+    const int ranura_out = NCH + blockIdx.x;      // ranuras extra, despues de las paginas reales
     if (tramo < 0 || tramo >= NCH) return;
 #else
     const int tramo = blockIdx.x;
@@ -151,15 +159,46 @@ sk18h_batch2(
     const int bq = blockIdx.y * BQ;                         // primera fila de (secuencia, cabeza)
     const int N = nseq[sq_];
     const int wq = warp * NQW;                             // primera query del warp (en el bloque)
-    const int kini = tramo * CHK;
+    const int kbase = tramo * CHK;          // inicio de la PAGINA (los offsets del bloque van con esto)
+#if HIB
+    // El trozo se redondea a multiplo de BK (y por lo tanto de 16): los cp.async de V leen
+    // bytes consecutivos dentro del bloque y tienen que quedar alineados a 16.
+    const int CH_ = ((CHK / SCH + BK - 1) / BK) * BK;
+    const int kini = kbase + trozo * CH_;
+    int lim_ = kbase + (trozo + 1) * CH_;
+    lim_ = lim_ < kbase + CHK ? lim_ : kbase + CHK;
+    const int kfin = lim_ < N ? lim_ : N;
+#else
+    const int kini = kbase;
     const int kfin = (kini + CHK) < N ? (kini + CHK) : N;
+#endif
     const size_t KOFF = (size_t)CHK * NH * QD;
     const size_t EOFF = 2 * KOFF;
     const int hlim = bq + BQ;
     // Pagina sin tokens de esta secuencia: m = MINIT, S = 0 (la union la ignora).
+#if HIB
+    // Trozo vacio (mas alla del final de la pagina o de la secuencia): ranura vacia y chau.
+    // Sin esto el maximo MINIT pasaba por la conversion de unidades y la union lo tomaba como
+    // una pagina real con O basura.
+    if (kini >= kfin) {
+        if (lane == 0 && warp == 0)
+            for (int r = 0; r < BQ; ++r) {
+                out_m[(size_t)ranura_out * R + bq + r] = MINIT;
+                out_s[(size_t)ranura_out * R + bq + r] = 0;
+                out_c[(size_t)ranura_out * R + bq + r] = 0;
+            }
+        return;
+    }
+#endif
     if (kini >= N) {
 #if HIB
-        return;                       // las paginas vacias las marca el kernel int4
+        if (lane == 0 && warp == 0)   // trozo sin tokens: ranura vacia
+            for (int r = 0; r < BQ; ++r) {
+                out_m[(size_t)ranura_out * R + bq + r] = MINIT;
+                out_s[(size_t)ranura_out * R + bq + r] = 0;
+                out_c[(size_t)ranura_out * R + bq + r] = 0;
+            }
+        return;
 #endif
         if (lane == 0 && warp == 0)
             for (int r = 0; r < BQ; ++r) { out_m[(size_t)tramo * R + bq + r] = MINIT; out_s[(size_t)tramo * R + bq + r] = 0; }
@@ -168,7 +207,15 @@ sk18h_batch2(
 #if HIB
     // Espejo: solo las paginas cuya ranura sigue siendo de este bloque (si no, las hace el int4)
     const int ranura = sq_ * PAGS + (tramo % PAGS);
-    if (dueno[ranura] != bt[(size_t)sq_ * BTS + tramo]) return;
+    if (dueno[ranura] != bt[(size_t)sq_ * BTS + tramo]) {
+        if (lane == 0 && warp == 0)   // no espejada: la hace el int4, esta ranura queda vacia
+            for (int r = 0; r < BQ; ++r) {
+                out_m[(size_t)ranura_out * R + bq + r] = MINIT;
+                out_s[(size_t)ranura_out * R + bq + r] = 0;
+                out_c[(size_t)ranura_out * R + bq + r] = 0;
+            }
+        return;
+    }
     const signed char* base = pool + (size_t)ranura * (size_t)BLK;
 #else
     // Pagina fisica: UNA carga de la tabla de bloques.
@@ -234,12 +281,12 @@ sk18h_batch2(
             const int ok = key < kfin;                                         \
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"     \
                          :: "r"(sdir(&sK[ET][r][swz(r, c, CHQ)])),             \
-                            "l"(base + ((size_t)((ok ? key : (K0)) - kini) * NH + hh) * QD + c), "r"(ok ? 16 : 0)); \
+                            "l"(base + ((size_t)((ok ? key : (K0)) - kbase) * NH + hh) * QD + c), "r"(ok ? 16 : 0)); \
         }                                                                      \
         for (int v = tid; v < BK * NH * 4 / 16; v += nthreads) {               \
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"     \
                          :: "r"(sdir(&sE[ET][v * 16])),                        \
-                            "l"(base + EOFF + (size_t)((K0) - kini) * NH * 4 + v * 16), "r"(16)); \
+                            "l"(base + EOFF + (size_t)((K0) - kbase) * NH * 4 + v * 16), "r"(16)); \
         }                                                                      \
         __pipeline_commit();                                                   \
     } while (0)
@@ -280,7 +327,7 @@ sk18h_batch2(
             if (DIAG != 5)                                                     \
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"     \
                          :: "r"(sdir(&sK[ET][r][swz(r, c, CHQ)])),             \
-                            "l"(base + ((size_t)((ok ? key : (K0)) - kini) * NH + hh) * QD + c), "r"(ok ? 16 : 0)); \
+                            "l"(base + ((size_t)((ok ? key : (K0)) - kbase) * NH + hh) * QD + c), "r"(ok ? 16 : 0)); \
         }                                                                      \
         for (int v = tid; v < QD * CHV; v += nthreads) {                       \
             const int r = v / CHV, c = (v % CHV) * 16;                         \
@@ -289,12 +336,12 @@ sk18h_batch2(
             if (DIAG != 4)                                                     \
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"     \
                          :: "r"(sdir(&sV[ET][r][swz(r, c, CHV)])),             \
-                            "l"(base + KOFF + ((size_t)hh * QD + r) * CHK + ((K0) - kini) + c), "r"(sz)); \
+                            "l"(base + KOFF + ((size_t)hh * QD + r) * CHK + ((K0) - kbase) + c), "r"(sz)); \
         }                                                                      \
         for (int v = tid; v < BK * NH * 4 / 16; v += nthreads) {               \
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"     \
                          :: "r"(sdir(&sE[ET][v * 16])),                        \
-                            "l"(base + EOFF + (size_t)((K0) - kini) * NH * 4 + v * 16), "r"(16)); \
+                            "l"(base + EOFF + (size_t)((K0) - kbase) * NH * 4 + v * 16), "r"(16)); \
         }                                                                      \
         __pipeline_commit();                                                   \
     } while (0)
@@ -403,12 +450,13 @@ sk18h_batch2(
         if (gid == 0 && r < hlim) {
 #if HIB   // maximo en unidades de z del int4: m * mqb8 / mqb4
             const long long q4 = mqb4[r] > 0 ? mqb4[r] : 1;
-            out_m[(size_t)tramo * R + r] = (int)(((long long)m[e] * mq[e] + q4 / 2) / q4);
-            out_c[(size_t)tramo * R + r] = 0;
+            out_m[(size_t)ranura_out * R + r] = (int)(((long long)m[e] * mq[e] + q4 / 2) / q4);
+            out_c[(size_t)ranura_out * R + r] = 0;
+            out_s[(size_t)ranura_out * R + r] = S[e];
 #else
             out_m[(size_t)tramo * R + r] = m[e];
-#endif
             out_s[(size_t)tramo * R + r] = S[e];
+#endif
         }
     }
 #pragma unroll
@@ -419,7 +467,11 @@ sk18h_batch2(
             for (int e = 0; e < 2; ++e) {
                 const int r = qr[e];
                 if (r < hlim) {
+#if HIB
+                    size_t o = ((size_t)ranura_out * R + r) * QD + i * 16 + gid + hr * 8;
+#else
                     size_t o = ((size_t)tramo * R + r) * QD + i * 16 + gid + hr * 8;
+#endif
 #if HIB   // el espejo usa una referencia 2^ESC8 mas chica: O baja ESC8 bits
                     const long long O = ((long long)oh[i][hr * 2 + e] * 256 + ol[i][hr * 2 + e]) >> ESC8;
                     const int hi2 = (int)(O >> 8);

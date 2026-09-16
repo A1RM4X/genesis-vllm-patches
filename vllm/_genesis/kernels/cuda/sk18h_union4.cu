@@ -25,7 +25,7 @@ sk18h_union4(
     const int* __restrict__ seq,      // [B]
     long long* __restrict__ Og,       // [NG, R, 256]
     long long* __restrict__ Sg,       // [NG, R]
-    int R, int NCH, int CPG, int RB, int BS)
+    int R, int NCH, int CPG, int RB, int BS, int EXTRA)
 {
     const int r = blockIdx.x;
     const int g = blockIdx.y;
@@ -39,9 +39,11 @@ sk18h_union4(
 
     // Maximo global sobre las paginas activas, repartido entre los 32 lanes (antes lo recorria
     // lane 0 en serie: con 69 paginas eran 69 cargas dependientes por bloque).
+    // EXTRA ranuras al final: son los trozos de las paginas espejadas en int8 (camino hibrido)
     unsigned mgu = 0u;                                   // max en orden sin signo (+2^31)
-    for (int c = tid; c < np; c += 32) {
-        const unsigned u = (unsigned)om[(size_t)c * R + r] ^ 0x80000000u;
+    for (int c = tid; c < np + EXTRA; c += 32) {
+        const int cc = c < np ? c : (NCH + (c - np));
+        const unsigned u = (unsigned)om[(size_t)cc * R + r] ^ 0x80000000u;
         mgu = mgu > u ? mgu : u;
     }
     mgu = max_lanes(mgu);
@@ -50,7 +52,10 @@ sk18h_union4(
 
     long long acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     long long sacc = 0;
-    for (int c = c0; c < c1; ++c) {
+    const int nreal = c1 > c0 ? c1 - c0 : 0;
+    const int nc = nreal + (g == 0 ? EXTRA : 0);        // el grupo 0 suma tambien las extra
+    for (int i = 0; i < nc; ++i) {
+        const int c = (i < nreal) ? (c0 + i) : (NCH + (i - nreal));
         const int mc = om[(size_t)c * R + r];
         if (mc <= -(1 << 29)) continue;
         int dm = mg - mc;

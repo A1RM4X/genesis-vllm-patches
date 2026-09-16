@@ -61,6 +61,7 @@ ESPERA4 = int(os.environ.get("GENESIS_PN131_ESPERA", 1))
 # aparte. La atencion se concentra ahi (39-49% de la masa en las ultimas 832 posiciones), y
 # dejarla exacta baja el error de 6,5% a 4,0% (capa 35) y de 5,6% a 0,9% (capa 3).
 VENT = int(os.environ.get("GENESIS_PN131_VENTANA", 2))     # paginas espejadas (0 = sin espejo)
+SCH = int(os.environ.get("GENESIS_PN131_SCH", 8))           # trozos por pagina espejada
 ESC8 = 3               # el espejo usa refs 2^ESC8 mas chicas (mas precision de escala)   # grupos cp.async pendientes (0 = esperar todo)  # planos en la pasada del maximo
 NIV4 = int(os.environ.get("GENESIS_PN131_NIV", 119 if QPLANOS == 2 else 7))
 # escala del logit int4: q = mx*rq/(255*NIV4), k = KM*r/16 * 2^ek/32767, y 16 = sqrt(256)
@@ -173,7 +174,7 @@ def _kernels(md="int8"):
         qa, qb = _coef()
         defs = [f"-DQA={qa}", f"-DQB={qb}"]
         if md == "int4":
-            d4 = [f"-DWCAP={WCAP}", f"-DQPLANOS={QPLANOS}", f"-DPLANOS_A={PLANOS_A}", f"-DESPERA={ESPERA4}", f"-DDIAG={int(os.environ.get('GENESIS_PN131_DIAG4', 0))}"]
+            d4 = [f"-DWCAP={WCAP}", f"-DQPLANOS={QPLANOS}", f"-DPLANOS_A={PLANOS_A}", f"-DESPERA={ESPERA4}", f"-DSCH={SCH}", f"-DDIAG={int(os.environ.get('GENESIS_PN131_DIAG4', 0))}"]
             ks = dict(main=Kernel("sk18i_batch.cu", "sk18i_batch", defs=defs + d4, warps=4),
                       escribir=Kernel("sk18i_escribir.cu", "sk18i_escribir", defs=[f"-DCLIP={CLIP4}"], warps=1),
                       prep=Kernel("sk18i_prep.cu", "sk18i_prep", defs=[f"-DMQ4={MQ4}", f"-DQPLANOS={QPLANOS}", f"-DNIV={NIV4}"], warps=1),
@@ -185,7 +186,7 @@ def _kernels(md="int8"):
                 ks["escribir8"] = Kernel("sk18h_escribir2.cu", "sk18h_escribir2", defs=["-DROTV=1"], warps=1)
                 ks["prep8"] = Kernel("sk18h_prep2.cu", "sk18h_prep2", warps=1)
                 ks["espejo"] = Kernel("sk18h_batch2.cu", "sk18h_batch2",
-                                      defs=defs + [f"-DHIB=1", f"-DESC8={ESC8}", f"-DWCAPW={WCAP}"], warps=4)
+                                      defs=defs + [f"-DHIB=1", f"-DESC8={ESC8}", f"-DWCAPW={WCAP}", f"-DSCH={SCH}"], warps=4)
             for x in ks.values():
                 x.cargar()
             _k[dev] = ks
@@ -252,7 +253,7 @@ class _Bufs:
         self.Q = z(bmax * nh * MB * QD, dt=torch.int8)
         self.rq = z(R * 4, dt=torch.int32)
         self.sq = z(R * 2 * 4, dt=torch.int32)        # sumas de q por grupo (int4, hasta 2 planos)
-        self.oc = z(nchmax * R, dt=torch.int32)       # correccion del cero de V (int4)
+        self.oc = z((nchmax + (VENT * SCH if VENT > 0 else 0)) * R, dt=torch.int32)       # correccion del cero de V (int4)
         if VENT > 0:                                  # espejo int8 de la ventana reciente
             self.dueno = torch.full((bmax * VENT,), -1, dtype=torch.int32, device=dev)
             self.slot2 = z(16384, dt=torch.int64)
@@ -263,10 +264,12 @@ class _Bufs:
         self.lim = z(R, dt=torch.int32)
         self.mqb = z(R, dt=torch.int32)
         self.dcap = z(R, dt=torch.int32)
-        self.oh = z(nchmax * R * QD, dt=torch.int32)
-        self.ol = z(nchmax * R * QD, dt=torch.int32)
-        self.om = z(nchmax * R, dt=torch.int32)
-        self.os = z(nchmax * R, dt=torch.int32)
+        self.nx = VENT * SCH if VENT > 0 else 0       # ranuras extra para los trozos del espejo
+        nchx = nchmax + self.nx
+        self.oh = z(nchx * R * QD, dt=torch.int32)
+        self.ol = z(nchx * R * QD, dt=torch.int32)
+        self.om = z(nchx * R, dt=torch.int32)
+        self.os = z(nchx * R, dt=torch.int32)
         self.Og = z(NG * R * QD, dt=torch.int64)
         self.Sg = z(NG * R, dt=torch.int64)
         self.ar = torch.arange(MAX_TOK_DECODE, device=dev, dtype=torch.int32)
@@ -481,18 +484,19 @@ def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
     else:
         ks["prep"].lanzar((nt, nh * G), [q16, seq, c.refs, Qb, lim, mqb, dcap, L, nh, G, MB, ZSH, q16.stride(0)])
     bt = md.block_table
-    oh = bf.oh[: NCH * R * QD]
-    ol = bf.ol[: NCH * R * QD]
-    om = bf.om[: NCH * R]
-    os_ = bf.os[: NCH * R]
+    NX = bf.nx if (mo == "int4" and VENT > 0) else 0      # ranuras extra del espejo
+    oh = bf.oh[: (NCH + NX) * R * QD]
+    ol = bf.ol[: (NCH + NX) * R * QD]
+    om = bf.om[: (NCH + NX) * R]
+    os_ = bf.os[: (NCH + NX) * R]
     if mo == "int4":
-        oc = bf.oc[: NCH * R]
+        oc = bf.oc[: (NCH + NX) * R]
         ks["main"].lanzar((NCH, B * nh * (MB // 32)), [Qb, rq, sqb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_, oc,
                                           blk, bt.stride(0), bs, NCH, nh, MB // 32, ZSH4, VSH,
                                           bf.dueno if VENT > 0 else oc, VENT], shared=SH_I)
         if VENT > 0 and c.lado is not None:
             blk8 = bs * nh * 520
-            ks["espejo"].lanzar((VENT, B * nh * (MB // 32)), [bf.Q8[: R * QD], _lado(c, dev, bf.bmax, nh, bs), bt, seq, bf.lim8[:R],
+            ks["espejo"].lanzar((VENT * SCH, B * nh * (MB // 32)), [bf.Q8[: R * QD], _lado(c, dev, bf.bmax, nh, bs), bt, seq, bf.lim8[:R],
                                                 bf.mqb8[:R], bf.dcap8[:R], oh, ol, om, os_,
                                                 blk8, bt.stride(0), bs, NCH, nh, MB // 32, ZSH, VSH,
                                                 bf.dueno, mqb, oc, VENT], shared=SH_H)
@@ -502,9 +506,9 @@ def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
     Og = bf.Og[: NG * R * QD]
     Sg = bf.Sg[: NG * R]
     if mo == "int4":
-        ks["union"].lanzar((R, NG), [oh, ol, om, os_, oc, mqb, dcap, seq, Og, Sg, R, NCH, CPG, nh * MB, bs])
+        ks["union"].lanzar((R, NG), [oh, ol, om, os_, oc, mqb, dcap, seq, Og, Sg, R, NCH, CPG, nh * MB, bs, NX])
     else:
-        ks["union"].lanzar((R, NG), [oh, ol, om, os_, mqb, dcap, seq, Og, Sg, R, NCH, CPG, nh * MB, bs])
+        ks["union"].lanzar((R, NG), [oh, ol, om, os_, mqb, dcap, seq, Og, Sg, R, NCH, CPG, nh * MB, bs, 0])
     o16 = output[:nt].view(torch.int16)
     if mo == "int4":
         ks["salida"].lanzar((nt, nh * G), [Og, Sg, c.refs, _signos_dev(dev), o16, NG, R, L, nh, G, MB, VSH])

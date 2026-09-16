@@ -140,8 +140,17 @@ sk18i_batch(
         return;
     }
     const int fis = bt[(size_t)sq_ * BTS + tramo];
-    // Ventana reciente: si la pagina esta espejada en int8, la hace sk18h_batch2 (HIB)
-    if (PAGS > 0 && dueno[sq_ * PAGS + (tramo % PAGS)] == fis) return;
+    // Ventana reciente: si la pagina esta espejada en int8, la hace sk18h_batch2 (HIB), que
+    // escribe en ranuras extra; esta queda marcada vacia para que la union la saltee.
+    if (PAGS > 0 && dueno[sq_ * PAGS + (tramo % PAGS)] == fis) {
+        if (lane == 0 && warp == 0)
+            for (int r = 0; r < BQ; ++r) {
+                out_m[(size_t)tramo * R + bq + r] = MINIT;
+                out_s[(size_t)tramo * R + bq + r] = 0;
+                out_c[(size_t)tramo * R + bq + r] = 0;
+            }
+        return;
+    }
     const unsigned char* base = pool + (size_t)fis * (size_t)BLK;
 
     const int gid = lane >> 2;
