@@ -6,20 +6,33 @@ PartOf=nvidia-persistenced.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Reparto ASIMETRICO, mismo total que antes (440 W).
+# Reparto ASIMETRICO para emparejar dos placas que NO son iguales.
 #
-# Las dos placas no son iguales: la GPU 1 (0000:11:00.0, VBIOS 94.02.42.40.B7) es peor bin que la
-# GPU 0 (0000:0F:00.0, VBIOS 94.02.42.80.9F). Bajo carga la 1 saca 615-1080 MHz consumiendo 218 W
-# mientras la 0 saca 930-1485 MHz con 210 W, y ademas la 1 corre MAS FRIA (52 vs 63 C): no es
-# temperatura, es silicio.
+# GPU 0 = 0000:0F:00.0, VBIOS 94.02.42.80.9F   (mejor bin, peor refrigerada: 72 C)
+# GPU 1 = 0000:11:00.0, VBIOS 94.02.42.40.B7   (peor bin, mejor refrigerada: 60 C)
 #
-# Con TP=2 el paso lo fija la placa lenta: la 0 se queda esperando adentro del all-reduce. Medido
-# en la traza de prefill, esa espera es 542 ms de un paso de 2.340 ms (23%).
+# Con las dos a 220 W la GPU1 sacaba 615-1080 MHz consumiendo 218 W mientras la GPU0 sacaba
+# 930-1485 MHz con 210 W. Con TP=2 el paso lo fija la placa lenta, asi que la GPU0 se quedaba
+# esperando adentro del all-reduce: 542 ms de un paso de prefill de 2.340 ms (23%).
 #
-# Moviendo 8 W de la 0 a la 1, sin cambiar el total, el prefill sube 3,5% (2.003 -> 2.073 tok/s,
-# A/B alternado de 3 rondas x 3 corridas para descontar la deriva termica). Mas de 8 W empeora:
-# a 204/236 baja a 1.928.
-ExecStart=/bin/bash -c 'for i in $(seq 1 30); do /usr/bin/nvidia-smi -i 0 -pl 212 && /usr/bin/nvidia-smi -i 1 -pl 228 && exit 0; sleep 2; done; echo "NVIDIA SMI failed to set power limit after retries" >&2; exit 1'
+# El optimo se busco a total CONSTANTE (472 W) moviendo el reparto, midiendo el reloj de cada
+# placa durante un prefill real. El punto donde los relojes se igualan es tambien el mas rapido,
+# que es lo esperable: si el paso lo fija la lenta, balance == velocidad.
+#
+#   240/232 -> 1478 vs 1110 MHz (-368)  2205 tok/s
+#   236/236 -> 1425 vs 1170 MHz (-255)  2278
+#   232/240 -> 1320 vs 1185 MHz (-135)  2344
+#   229/243 -> relojes parejos          2366   <- este
+#   224/248 -> 1162 vs 1358 MHz (+195)  2303
+#
+# Contra el reparto parejo anterior, medido en el servidor real (2 rondas x 3 corridas):
+#   212/228 (440 W) -> 2.086 tok/s de prefill, TTFT 30,0 s a 57k
+#   229/243 (472 W) -> 2.366 tok/s (+13,4%),   TTFT 26,2-26,8 s
+# Decode sin cambio (156-171 tok/s en las dos, 12/12 agujas). Temperaturas 72 y 60 C.
+# Subir mas no compra nada: 484 W da lo mismo que 472.
+#
+# Si se cambia una placa o se mueve de slot, rehacer el barrido: el balance es de ESTE par.
+ExecStart=/bin/bash -c 'for i in $(seq 1 30); do /usr/bin/nvidia-smi -i 0 -pl 229 && /usr/bin/nvidia-smi -i 1 -pl 243 && exit 0; sleep 2; done; echo "NVIDIA SMI failed to set power limit after retries" >&2; exit 1'
 
 [Install]
 WantedBy=multi-user.target
