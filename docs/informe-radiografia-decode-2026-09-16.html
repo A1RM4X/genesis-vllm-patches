@@ -1,0 +1,365 @@
+<title>Radiografía del decode</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>
+  :root {
+    --fondo: #f7f6f3; --panel: #ffffff; --panel2: #f1efea; --tinta: #15181c; --tinta2: #5b6169;
+    --linea: #ddd9d1; --acento: #b25419; --frio: #2b6b78; --ok: #4a7c3f; --aviso: #9a6b12;
+    --violeta: #6b4a86; --sombra: 0 1px 2px rgba(20,23,28,.06), 0 8px 24px -16px rgba(20,23,28,.25);
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --cuerpo: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --dato: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fondo: #0e1114; --panel: #161a1f; --panel2: #1b2027; --tinta: #e8ecf1; --tinta2: #9aa3ad;
+      --linea: #252b33; --acento: #e08a4e; --frio: #5fb3c4; --ok: #82c06f; --aviso: #d9ad4a;
+      --violeta: #b394cf; --sombra: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --fondo: #0e1114; --panel: #161a1f; --panel2: #1b2027; --tinta: #e8ecf1; --tinta2: #9aa3ad;
+    --linea: #252b33; --acento: #e08a4e; --frio: #5fb3c4; --ok: #82c06f; --aviso: #d9ad4a;
+    --violeta: #b394cf; --sombra: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--fondo); color: var(--tinta); font-family: var(--cuerpo);
+         font-size: 16px; line-height: 1.6; padding: 0 20px; padding-block: 0 72px; }
+  .marco { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+  header { padding-block: 48px 0; display: flex; flex-direction: column; gap: 18px; }
+  .ojo { font-family: var(--dato); font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+         color: var(--acento); font-weight: 500; }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(34px, 6vw, 52px);
+       line-height: 1.04; margin: 0; letter-spacing: -.02em; text-wrap: balance; }
+  .bajada { font-size: 19px; color: var(--tinta2); max-width: 62ch; margin: 0; }
+  .ficha { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px;
+           background: var(--linea); border: 1px solid var(--linea); border-radius: 3px; overflow: hidden; }
+  .ficha div { background: var(--panel); padding: 12px 14px; }
+  .ficha dt { font-family: var(--dato); font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+              color: var(--tinta2); margin: 0 0 4px; }
+  .ficha dd { margin: 0; font-family: var(--dato); font-size: 14px; font-weight: 500; }
+  h2 { font-family: var(--display); font-weight: 600; font-size: 24px; margin: 0 0 6px;
+       letter-spacing: -.01em; }
+  h2 .num { font-family: var(--dato); font-size: 13px; color: var(--acento); margin-right: 10px;
+            font-weight: 500; }
+  section { display: flex; flex-direction: column; gap: 16px; }
+  p { margin: 0; max-width: 68ch; }
+  .barra { display: flex; width: 100%; height: 46px; border-radius: 3px; overflow: hidden;
+           border: 1px solid var(--linea); }
+  .barra span { display: block; height: 100%; position: relative; }
+  .leyenda { display: flex; flex-wrap: wrap; gap: 8px 22px; font-family: var(--dato); font-size: 12.5px; }
+  .leyenda i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 7px;
+               vertical-align: -1px; }
+  .tabla-caja { overflow-x: auto; border: 1px solid var(--linea); border-radius: 3px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 900px; font-size: 14px; }
+  thead th { font-family: var(--dato); font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+             color: var(--tinta2); text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--linea);
+             background: var(--panel2); white-space: nowrap; font-weight: 500; }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--linea); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  .k { font-family: var(--dato); font-size: 13px; font-weight: 500; white-space: nowrap; }
+  .n { font-family: var(--dato); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .pat { color: var(--tinta2); font-size: 13.5px; }
+  .chip { font-family: var(--dato); font-size: 11px; padding: 2px 7px; border-radius: 2px;
+          white-space: nowrap; border: 1px solid; font-weight: 500; }
+  .ptx { color: var(--acento); border-color: color-mix(in srgb, var(--acento) 45%, transparent);
+         background: color-mix(in srgb, var(--acento) 10%, transparent); }
+  .tri { color: var(--violeta); border-color: color-mix(in srgb, var(--violeta) 45%, transparent);
+         background: color-mix(in srgb, var(--violeta) 10%, transparent); }
+  .aje { color: var(--frio); border-color: color-mix(in srgb, var(--frio) 40%, transparent);
+         background: color-mix(in srgb, var(--frio) 8%, transparent); }
+  tr.propio td { background: color-mix(in srgb, var(--acento) 3.5%, transparent); }
+  tfoot td { font-family: var(--dato); font-weight: 600; background: var(--panel2); }
+  .nota { font-size: 14px; color: var(--tinta2); max-width: 78ch; }
+  .nota code, code { font-family: var(--dato); font-size: .92em;
+         background: var(--panel2); padding: 1px 5px; border-radius: 2px; }
+  .dos { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 20px; }
+  .caja { background: var(--panel); border: 1px solid var(--linea); border-radius: 3px; padding: 18px 20px;
+          box-shadow: var(--sombra); display: flex; flex-direction: column; gap: 8px; }
+  .caja h3 { font-family: var(--display); font-size: 16px; margin: 0; font-weight: 600; }
+  .caja p { font-size: 14.5px; color: var(--tinta2); }
+  .cifra { font-family: var(--dato); font-size: 30px; font-weight: 600; line-height: 1; }
+  .cifra small { font-size: 14px; color: var(--tinta2); font-weight: 400; margin-left: 4px; }
+  hr { border: none; border-top: 1px solid var(--linea); margin: 0; }
+  footer { font-size: 13.5px; color: var(--tinta2); font-family: var(--dato); }
+  @media (max-width: 640px) { header { padding-block: 32px 0; } body { font-size: 15.5px; } }
+</style>
+
+<div class="marco">
+<header>
+  <div class="ojo">Genesis · vLLM 0.27.1 · Qwen3.8-27B W4A8 · 2×RTX 3090 @220 W</div>
+  <h1>Radiografía del decode</h1>
+  <p class="bajada">Un paso de decode con 57 k tokens de contexto dura <strong>29,6 ms</strong> de GPU.
+  Esto es qué kernel corre en cada tramo, cuánto cuesta, quién lo escribió y con qué patrón está armado.
+  Todos los números salen del mismo perfil (torch profiler, rank 0, 60 pasos).</p>
+  <dl class="ficha">
+    <div><dt>KV</dt><dd>int4 por token-cabeza</dd></div>
+    <div><dt>Contexto</dt><dd>57.530 tokens</dd></div>
+    <div><dt>MTP</dt><dd>K=4 · 86-90 % acept.</dd></div>
+    <div><dt>Decode</dt><dd>158,5 tok/s</dd></div>
+    <div><dt>KV total</dt><dd>1.182.002 tokens</dd></div>
+    <div><dt>Agujas 57k</dt><dd>12/12</dd></div>
+  </dl>
+</header>
+
+<section>
+  <h2><span class="num">01</span>Cómo se reparten los 29,6 ms</h2>
+  <div class="barra" role="img" aria-label="Composición del paso: lineales 43%, atención propia 19%, all-reduce 11%, GDN 9%, borrador fp16 8%, resto 10%">
+    <span style="width:43.0%;background:var(--frio)"></span>
+    <span style="width:19.2%;background:var(--acento)"></span>
+    <span style="width:11.2%;background:color-mix(in srgb, var(--frio) 60%, var(--fondo))"></span>
+    <span style="width:9.0%;background:var(--violeta)"></span>
+    <span style="width:7.6%;background:color-mix(in srgb, var(--frio) 35%, var(--fondo))"></span>
+    <span style="width:10.0%;background:var(--tinta2)"></span>
+  </div>
+  <div class="leyenda">
+    <span><i style="background:var(--frio)"></i>Lineales W4A8 Marlin 43,0 %</span>
+    <span><i style="background:var(--acento)"></i>Atención propia en PTX 19,2 %</span>
+    <span><i style="background:color-mix(in srgb, var(--frio) 60%, var(--fondo))"></i>All-reduce TP 11,2 %</span>
+    <span><i style="background:var(--violeta)"></i>GDN recurrente 9,0 %</span>
+    <span><i style="background:color-mix(in srgb, var(--frio) 35%, var(--fondo))"></i>Borrador MTP en fp16 7,6 %</span>
+    <span><i style="background:var(--tinta2)"></i>Norm, quant, copias 10,0 %</span>
+  </div>
+  <div class="dos">
+    <div class="caja">
+      <div class="cifra" style="color:var(--acento)">19,2 %<small>5.689 µs</small></div>
+      <h3>Nuestro, en PTX</h3>
+      <p>Nueve kernels escritos a mano: toda la atención del decode (Q·K, softmax entero, w·V, unión de
+      páginas, escritura y lectura de la KV, rotación Hadamard). Ni una instrucción de punto flotante.</p>
+    </div>
+    <div class="caja">
+      <div class="cifra" style="color:var(--violeta)">4,6 %<small>1.355 µs</small></div>
+      <h3>Nuestro, en Triton</h3>
+      <p>La cinta de rollback del MTP en GDN (PN122): <code>_k_escribir</code> y <code>_k_spec</code>.
+      Es el único código propio que todavía no está en PTX.</p>
+    </div>
+    <div class="caja">
+      <div class="cifra" style="color:var(--frio)">76,2 %<small>22.604 µs</small></div>
+      <h3>Ajeno</h3>
+      <p>Marlin, cuBLAS, CUTLASS, NCCL y los kernels de vLLM e Inductor. Ahí está el 43 % de las
+      lineales y el 12,6 % del <code>lm_head</code>, que es donde queda margen.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">02</span>Kernel por kernel</h2>
+  <p class="nota">Ordenado por costo. <span class="chip ptx">PTX propio</span> es código nuestro escrito
+  en PTX/CUDA inline y lanzado con <code>cuLaunchKernel</code>; <span class="chip tri">Triton propio</span>
+  es código nuestro en Triton; <span class="chip aje">ajeno</span> es upstream (vLLM, Marlin, NCCL,
+  cuBLAS, Inductor).</p>
+  <div class="tabla-caja">
+  <table>
+    <thead><tr>
+      <th>Kernel</th><th>Dónde vive</th><th class="n">µs/paso</th><th class="n">%</th>
+      <th class="n">lanz.</th><th>Qué hace</th><th>Patrón de diseño</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td class="k">marlin::Marlin<br><span style="color:var(--tinta2)">(256 lanz. modelo)</span></td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">9.009</td><td class="n">30,4</td><td class="n">256</td>
+        <td>Todas las lineales del modelo en W4A8: desempaqueta nibbles a registros, los multiplica
+        contra activaciones int8 y acumula en int32.</td>
+        <td class="pat">GEMM por tiles con doble buffer (productor-consumidor) y dequant fusionado en el
+        prólogo. Está al 98-103 % del techo de DRAM.</td>
+      </tr>
+      <tr>
+        <td class="k">marlin::Marlin<br><span style="color:var(--tinta2)">(lm_head)</span></td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">3.742</td><td class="n">12,6</td><td class="n">5</td>
+        <td>Proyección a vocabulario de 248.320 × 5.120 en W4: 318 MB de pesos por GPU y por llamada,
+        una por el modelo y cuatro por los pasos del borrador MTP.</td>
+        <td class="pat">El mismo GEMM, pero con M=1..5: memoria pura. 749 µs contra 497 de techo → corre
+        al 66 % del ancho de banda sostenido.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_batch</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">4.022</td><td class="n">13,6</td><td class="n">20</td>
+        <td>Atención int4: Q·K con <code>mma.m16n8k64.s4.s4</code>, softmax entero (potencia de dos por
+        tramos), pesos en tres planos de nibbles y w·V con el mismo mma. Dos pasadas por página: la
+        primera saca el máximo exacto, la segunda usa pesos ya fijos.</td>
+        <td class="pat">FlashAttention por tiles, pero con reducción en <em>dos pasadas</em> en vez de
+        softmax en streaming — reescalar acumuladores del mma mientras el pipe tensorial acumula es una
+        carrera. Carga con <code>cp.async</code> en dos etapas.</td>
+      </tr>
+      <tr>
+        <td class="k">cross_device_reduce</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">2.876</td><td class="n">9,7</td><td class="n">141</td>
+        <td>All-reduce de tensor parallel: 141 colectivas de ~40 KB por paso, dos por capa.</td>
+        <td class="pat">Colectiva one-shot P2P dentro del grafo CUDA. 25,7 µs cada una: es latencia de
+        PCIe, no ancho de banda (NCCL da exactamente lo mismo).</td>
+      </tr>
+      <tr>
+        <td class="k">ampere_fp16_s16816gemm</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">2.257</td><td class="n">7,6</td><td class="n">20</td>
+        <td>Las lineales del módulo MTP (el borrador), que el checkpoint dejó <strong>sin cuantizar</strong>:
+        corren en fp16 por cuBLAS, cuatro veces por paso.</td>
+        <td class="pat">GEMM fp16 genérico de cuBLAS. No hay nada especial: sobra porque el resto del
+        modelo sí está en W4A8.</td>
+      </tr>
+      <tr>
+        <td class="k">cutlass_80_wmma</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">1.295</td><td class="n">4,4</td><td class="n">48</td>
+        <td>El núcleo recurrente del GDN (gated delta): actualización del estado por capa.</td>
+        <td class="pat">Scan recurrente con estado persistente, resuelto como GEMM chico de 16×16.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">_k_escribir · _k_spec</td>
+        <td><span class="chip tri">Triton propio</span></td><td class="n">1.355</td><td class="n">4,6</td><td class="n">96</td>
+        <td>Cinta de rollback del MTP en GDN (PN122): en vez de copiar K veces el estado recurrente,
+        escribe una cinta y la rebobina cuando el MTP rechaza tokens.</td>
+        <td class="pat">Journal / write-ahead log: registrar el delta y deshacerlo, en vez de snapshot.</td>
+      </tr>
+      <tr>
+        <td class="k">_per_token_quant_int8</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">561</td><td class="n">1,9</td><td class="n">256</td>
+        <td>Cuantiza la activación a int8 antes de cada lineal Marlin (una por GEMM).</td>
+        <td class="pat">Map + reducción por fila. Es el caso de libro de un epílogo fusionable: 256
+        lanzamientos que podrían vivir dentro del kernel anterior.</td>
+      </tr>
+      <tr>
+        <td class="k">elementwise_kernel</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">522</td><td class="n">1,8</td><td class="n">244</td>
+        <td>Copias, slices y casts que quedan entre operadores de PyTorch.</td>
+        <td class="pat">Map elementwise. Cada uno es corto; lo que pesa es la cantidad.</td>
+      </tr>
+      <tr>
+        <td class="k">triton_red_fused</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">501</td><td class="n">1,7</td><td class="n">165</td>
+        <td>RMSNorm y sumas de residual fusionadas por Inductor.</td>
+        <td class="pat">Reducción por fila + map, generada por el compilador.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_union4</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">490</td><td class="n">1,7</td><td class="n">20</td>
+        <td>Une los resultados parciales de todas las páginas: toma el máximo global por consulta,
+        reescala cada página con una potencia de dos entera y suma O y S.</td>
+        <td class="pat">Merge de log-sum-exp = reducción con combinador asociativo (map-reduce). Es el
+        mismo patrón que <code>merge_states</code> de FlashInfer, pero entero.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_batch2 <span style="color:var(--tinta2)">(espejo)</span></td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">467</td><td class="n">1,6</td><td class="n">20</td>
+        <td>La misma atención pero en int8, solo sobre las dos páginas más recientes, que se guardan
+        también en un pool espejo aparte. Ahí se concentra el 39-49 % de la masa de atención.</td>
+        <td class="pat">Caché por niveles con etiqueta: <code>dueno[ranura]</code> valida que el espejo
+        siga siendo de ese bloque, como una caché de mapeo directo. Cada página se parte en trozos para
+        que no quede limitada por latencia.</td>
+      </tr>
+      <tr>
+        <td class="k">triton_poi_fused</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">457</td><td class="n">1,5</td><td class="n">282</td>
+        <td>RoPE, activaciones y casts fusionados por Inductor.</td>
+        <td class="pat">Map elementwise generado; 282 lanzamientos por paso.</td>
+      </tr>
+      <tr>
+        <td class="k">ncclDevKernel_AllGather</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">451</td><td class="n">1,5</td><td class="n">9</td>
+        <td>Los pocos colectivos que no entran en el camino rápido (MoE y logits).</td>
+        <td class="pat">Ring LL de NCCL.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_escribir</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">264</td><td class="n">0,9</td><td class="n">40</td>
+        <td>Escribe la KV en int4: rota k y v con Hadamard entero, saca mínimo, máximo y media por grupo
+        de 64 dimensiones, recorta la escala al 95 % y guarda nibbles con cero por grupo.</td>
+        <td class="pat">Scatter con cambio de layout (K por token, V por dimensión) y cuantización
+        asimétrica en el mismo paso. Se lanza dos veces, una por paridad, porque dos tokens vecinos
+        comparten byte en V.</td>
+      </tr>
+      <tr>
+        <td class="k">act_and_mul</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">271</td><td class="n">0,9</td><td class="n">68</td>
+        <td>SiLU × gate del MLP.</td><td class="pat">Map elementwise con dos entradas.</td>
+      </tr>
+      <tr>
+        <td class="k">triton_poi_fused_marlin</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">271</td><td class="n">0,9</td><td class="n">208</td>
+        <td>Epílogo de Marlin: multiplica por las escalas de salida.</td>
+        <td class="pat">Map elementwise; otro candidato natural a fusionarse en el GEMM.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_salida</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">191</td><td class="n">0,6</td><td class="n">20</td>
+        <td>Divide O entre S, des-rota la V con Walsh-Hadamard entero y arma los bits fp16 a mano
+        (con <code>clz</code> y desplazamientos).</td>
+        <td class="pat">Red de mariposas entre lanes (FWHT) + conversión de punto fijo a fp16 sin FPU.</td>
+      </tr>
+      <tr>
+        <td class="k">_causal_conv1d_update</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">166</td><td class="n">0,6</td><td class="n">48</td>
+        <td>La convolución causal corta del GDN.</td><td class="pat">Stencil 1-D sobre estado en anillo.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_escribir2 <span style="color:var(--tinta2)">(espejo)</span></td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">77</td><td class="n">0,3</td><td class="n">20</td>
+        <td>La misma escritura pero en int8 y hacia el pool espejo de la ventana reciente.</td>
+        <td class="pat">Scatter con rotación; comparte código con el camino int8 vía defines.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_prep</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">72</td><td class="n">0,2</td><td class="n">20</td>
+        <td>Prepara las consultas: rotación Hadamard entera, cuantización a int8 partido en dos planos
+        de nibbles, y las constantes del softmax entero por fila.</td>
+        <td class="pat">Map por fila + FWHT en mariposa. Un bloque por token-cabeza, 32 lanes = 32 grupos
+        de 8 dimensiones.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_prep2 <span style="color:var(--tinta2)">(espejo)</span></td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">59</td><td class="n">0,2</td><td class="n">20</td>
+        <td>Lo mismo para el camino int8 del espejo (q int8 entero, escalas propias).</td>
+        <td class="pat">Idéntico; cambia solo la referencia de escala.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_lado</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">47</td><td class="n">0,2</td><td class="n">20</td>
+        <td>Decide qué tokens entran al espejo: calcula la posición absoluta de cada uno, se queda con
+        las dos últimas páginas y escribe la etiqueta <code>dueno</code>.</td>
+        <td class="pat">Indexación / mapeo de direcciones, un hilo por token. Es el "planificador" del
+        nivel de caché.</td>
+      </tr>
+      <tr>
+        <td class="k">resto</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">~350</td><td class="n">1,2</td><td class="n">~110</td>
+        <td>Reducciones del muestreo, gathers de índices, memcpy de estado y kernels sueltos.</td>
+        <td class="pat">Varios.</td>
+      </tr>
+    </tbody>
+    <tfoot><tr><td>Total GPU</td><td></td><td class="n">29.648</td><td class="n">100</td><td class="n">2.166</td>
+      <td colspan="2">Pared por paso: 30.396 µs — quedan ~750 µs de huecos entre kernels.</td></tr></tfoot>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">03</span>El prefill es otro animal</h2>
+  <p>En una ventana de prefill de ~17 k tokens (2,25 s de GPU) el reparto se da vuelta: la comunicación
+  pasa a mandar y la atención casi no se nota.</p>
+  <div class="tabla-caja">
+  <table style="min-width:560px">
+    <thead><tr><th>Sección</th><th class="n">ms</th><th class="n">%</th><th>Comentario</th></tr></thead>
+    <tbody>
+      <tr><td>All-reduce / AllGather</td><td class="n">894,5</td><td class="n">39,8</td>
+          <td>Ya viaja en int8 (PN120, solo con M ≥ 512). Mensajes grandes: acá sí manda el ancho de banda del PCIe.</td></tr>
+      <tr><td>Lineales W4A8 Marlin</td><td class="n">848,9</td><td class="n">37,7</td><td>Ahora sí con M grande: cómputo real.</td></tr>
+      <tr><td>Inductor (norm/rope/act)</td><td class="n">93,8</td><td class="n">4,2</td><td>685 lanzamientos.</td></tr>
+      <tr><td>GDN</td><td class="n">61,7</td><td class="n">2,7</td><td>2.342 lanzamientos, todos chicos.</td></tr>
+      <tr class="propio"><td>Atención (FlashInfer sobre KV decuantizada)</td><td class="n">192,4</td><td class="n">8,6</td>
+          <td>El único tramo del prefill que no es nuestro: decuantizamos las páginas a fp16 con un kernel PTX y llamamos al prefill paginado de FlashInfer.</td></tr>
+      <tr class="propio"><td>Escritura de KV (nuestra, PTX)</td><td class="n">7,4</td><td class="n">0,3</td><td>80 lanzamientos.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">04</span>Cómo se midió</h2>
+  <p class="nota">Perfil con el torch profiler de vLLM (<code>tests/bench/medicion/perfil_stack.sh</code>),
+  rank 0, 60 pasos de decode con prefijo cacheado de 57.530 tokens y una ventana de prefill en frío de
+  17 k. Los µs/paso son la suma de duraciones de kernel dividida por la cantidad de pasos (un paso =
+  un <code>eagle_prepare_inputs_padded_kernel</code>). El porcentaje es contra el total de GPU, no contra
+  la pared. Configuración: <code>KVDTYPE=int4_per_token_head</code>, ventana espejo de 2 páginas,
+  MTP K=4, custom all-reduce dentro de los grafos CUDA, TP=2 con las placas capadas a 220 W (techo
+  sostenido de DRAM ≈ 640 GB/s, no 730).</p>
+  <hr>
+  <footer>Genesis · PN131 / SK-18 · perfil <code>int4_sch8</code> · 16 de septiembre de 2026</footer>
+</section>
+</div>

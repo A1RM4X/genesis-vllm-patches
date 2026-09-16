@@ -1,0 +1,291 @@
+<title>Dónde queda margen</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>
+  :root {
+    --fondo: #f7f6f3; --panel: #ffffff; --panel2: #f1efea; --tinta: #15181c; --tinta2: #5b6169;
+    --linea: #ddd9d1; --acento: #b25419; --frio: #2b6b78; --ok: #4a7c3f; --aviso: #9a6b12;
+    --violeta: #6b4a86; --sombra: 0 1px 2px rgba(20,23,28,.06), 0 8px 24px -16px rgba(20,23,28,.25);
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --cuerpo: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --dato: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fondo: #0e1114; --panel: #161a1f; --panel2: #1b2027; --tinta: #e8ecf1; --tinta2: #9aa3ad;
+      --linea: #252b33; --acento: #e08a4e; --frio: #5fb3c4; --ok: #82c06f; --aviso: #d9ad4a;
+      --violeta: #b394cf; --sombra: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --fondo: #0e1114; --panel: #161a1f; --panel2: #1b2027; --tinta: #e8ecf1; --tinta2: #9aa3ad;
+    --linea: #252b33; --acento: #e08a4e; --frio: #5fb3c4; --ok: #82c06f; --aviso: #d9ad4a;
+    --violeta: #b394cf; --sombra: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--fondo); color: var(--tinta); font-family: var(--cuerpo);
+         font-size: 16px; line-height: 1.62; padding: 0 20px; padding-block: 0 72px; }
+  .marco { max-width: 1060px; margin: 0 auto; display: flex; flex-direction: column; gap: 44px; }
+  header { padding-block: 48px 0; display: flex; flex-direction: column; gap: 16px; }
+  .ojo { font-family: var(--dato); font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+         color: var(--acento); font-weight: 500; }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(34px, 6vw, 52px);
+       line-height: 1.04; margin: 0; letter-spacing: -.02em; text-wrap: balance; }
+  .bajada { font-size: 19px; color: var(--tinta2); max-width: 64ch; margin: 0; }
+  h2 { font-family: var(--display); font-weight: 600; font-size: 24px; margin: 0;
+       letter-spacing: -.01em; }
+  section { display: flex; flex-direction: column; gap: 18px; }
+  p { margin: 0; max-width: 70ch; }
+  .tabla-caja { overflow-x: auto; border: 1px solid var(--linea); border-radius: 3px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 14px; }
+  thead th { font-family: var(--dato); font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+             color: var(--tinta2); text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--linea);
+             background: var(--panel2); font-weight: 500; white-space: nowrap; }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--linea); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  .n { font-family: var(--dato); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .k { font-family: var(--dato); font-size: 13px; }
+  code { font-family: var(--dato); font-size: .92em; background: var(--panel2); padding: 1px 5px; border-radius: 2px; }
+  .ficha { display: flex; flex-direction: column; gap: 14px; background: var(--panel);
+           border: 1px solid var(--linea); border-left: 3px solid var(--acento);
+           border-radius: 3px; padding: 22px 24px; box-shadow: var(--sombra); }
+  .ficha.tibia { border-left-color: var(--aviso); }
+  .ficha.fria { border-left-color: var(--tinta2); }
+  .cab { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px; }
+  .cab h3 { font-family: var(--display); font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -.01em; }
+  .hoy { font-family: var(--dato); font-size: 12.5px; color: var(--tinta2); }
+  .gana { margin-left: auto; font-family: var(--dato); font-size: 13px; font-weight: 600;
+          color: var(--acento); white-space: nowrap; }
+  .ficha.tibia .gana { color: var(--aviso); }
+  .ficha.fria .gana { color: var(--tinta2); }
+  .ficha p { font-size: 15.5px; }
+  .fuentes { display: flex; flex-direction: column; gap: 6px; font-size: 13.5px; font-family: var(--dato);
+             border-top: 1px dashed var(--linea); padding-top: 12px; }
+  .fuentes a { color: var(--frio); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--frio) 35%, transparent); }
+  .fuentes a:hover, .fuentes a:focus-visible { border-bottom-color: var(--frio); }
+  a:focus-visible { outline: 2px solid var(--acento); outline-offset: 2px; }
+  .riesgo { font-size: 13.5px; color: var(--tinta2); font-family: var(--dato); }
+  .lista { display: flex; flex-direction: column; gap: 20px; }
+  ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; max-width: 70ch; }
+  li { font-size: 15.5px; }
+  footer { font-size: 13.5px; color: var(--tinta2); font-family: var(--dato); border-top: 1px solid var(--linea);
+           padding-top: 16px; }
+  @media (max-width: 640px) { header { padding-block: 32px 0; } .gana { margin-left: 0; } }
+</style>
+
+<div class="marco">
+<header>
+  <div class="ojo">Genesis · continuación de la radiografía del decode</div>
+  <h1>Dónde queda margen</h1>
+  <p class="bajada">El paso de decode son 29,6 ms. Esto es qué se le puede sacar a cada tramo, qué dice
+  la literatura reciente sobre cada uno, cuánto esperaríamos ganar y qué tan riesgoso es. Ordenado por
+  premio, no por tamaño del tramo.</p>
+</header>
+
+<section>
+  <h2>El orden que propongo</h2>
+  <div class="tabla-caja">
+  <table>
+    <thead><tr><th>#</th><th>Frente</th><th class="n">Hoy</th><th class="n">Ganancia est.</th><th>Esfuerzo / riesgo</th></tr></thead>
+    <tbody>
+      <tr><td class="n">1</td><td>Vocabulario recortado en el borrador MTP</td><td class="n">3,0 ms</td><td class="n">2,2–2,6 ms</td><td>Medio · baja la aceptación si se recorta de más</td></tr>
+      <tr><td class="n">2</td><td>Cuantizar el módulo MTP (hoy fp16)</td><td class="n">2,26 ms</td><td class="n">1,5–1,7 ms</td><td>Medio · hay que recalibrar y medir aceptación</td></tr>
+      <tr><td class="n">3</td><td>Fusionar la unión dentro del kernel de atención</td><td class="n">0,49 ms</td><td class="n">0,4–0,5 ms</td><td>Medio · es nuestro código, sin riesgo de calidad</td></tr>
+      <tr><td class="n">4</td><td>Epílogo del kernel int4 (ALU por par key-query)</td><td class="n">4,02 ms</td><td class="n">0,4–0,8 ms</td><td>Alto · registros al límite (255, con derrame)</td></tr>
+      <tr><td class="n">5</td><td>Fusionar norm+quant y epílogos de Marlin</td><td class="n">1,33 ms</td><td class="n">0,4–0,7 ms</td><td>Bajo · ya existe en vLLM, hay que habilitarlo y medir</td></tr>
+      <tr><td class="n">6</td><td>GDN: estado recurrente diferido</td><td class="n">2,85 ms</td><td class="n">0,5–1,0 ms</td><td>Alto · toca el camino recurrente, delicado</td></tr>
+      <tr><td class="n">7</td><td>All-reduce fusionado con RMSNorm</td><td class="n">2,88 ms</td><td class="n">0–1,0 ms</td><td>Alto · en PCIe sin NVLink puede no dar nada</td></tr>
+      <tr><td class="n">8</td><td>Lineales del modelo (Marlin)</td><td class="n">9,01 ms</td><td class="n">~0</td><td>Ya está al 98–103 % del techo de DRAM</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="riesgo">Sumando 1 a 5 sin tocar lo riesgoso: entre 4,9 y 6,3 ms de los 29,6 → 17–21 % más
+  de decode, que sobre 158 tok/s serían ~185–190 tok/s.</p>
+</section>
+
+<section>
+  <h2>Frente por frente</h2>
+  <div class="lista">
+
+    <article class="ficha">
+      <div class="cab"><h3>1 · El borrador no necesita 248.320 tokens</h3>
+        <span class="hoy">lm_head · 3,74 ms/paso (12,6 %), 4 de 5 llamadas son del borrador</span>
+        <span class="gana">−2,2 a −2,6 ms</span></div>
+      <p>Cada paso del borrador MTP proyecta el estado contra el vocabulario entero: 318 MB de pesos por
+      GPU y por llamada, cuatro veces por paso. La literatura de 2025-2026 converge en lo mismo: el
+      borrador solo necesita los tokens frecuentes. <strong>FR-Spec</strong> restringe el espacio de
+      propuesta a un subconjunto ordenado por frecuencia y reporta <strong>75 % menos de cómputo en el
+      lm_head</strong> sin perder equivalencia de distribución (la verificación sigue usando el
+      vocabulario completo, así que la salida no cambia). <strong>VocabTrim</strong> hace lo mismo sin
+      entrenar nada: corre el modelo grande sobre un set de calibración y se queda con los tokens que
+      aparecen. <strong>SlimSpec</strong> ataca por el otro lado, con una cabeza de bajo rango.</p>
+      <p>Para nosotros es directo: el verificador es el modelo grande y no se toca; solo hay que armar la
+      tabla de frecuencia (con el corpus de calibración que ya usamos) y recortar la proyección del
+      borrador a, digamos, 32 k entradas. Con eso las cuatro llamadas de 749 µs bajan a ~100 µs.</p>
+      <div class="riesgo">Riesgo: si el token correcto queda fuera del subconjunto, el borrador falla y
+      baja la aceptación. VocabTrim reporta caídas chicas con vocabularios grandes; hay que barrer el
+      tamaño del recorte contra nuestra aceptación de 90 %.</div>
+      <div class="fuentes">
+        <a href="https://arxiv.org/pdf/2502.14856">FR-Spec: Frequency-Ranked Speculative Sampling</a>
+        <a href="https://arxiv.org/pdf/2506.22694">VocabTrim: Vocabulary Pruning for Efficient Speculative Decoding</a>
+        <a href="https://arxiv.org/pdf/2605.10453">SlimSpec: Low-Rank Draft LM-Head</a>
+        <a href="https://github.com/ggml-org/llama.cpp/issues/25187">llama.cpp #25187 — FR-Spec para MTP nativo</a>
+      </div>
+    </article>
+
+    <article class="ficha">
+      <div class="cab"><h3>2 · El módulo MTP corre en fp16</h3>
+        <span class="hoy">ampere_fp16_s16816gemm · 2,26 ms/paso (7,6 %)</span>
+        <span class="gana">−1,5 a −1,7 ms</span></div>
+      <p>El checkpoint dejó el módulo MTP fuera de la cuantización (es el mismo lugar donde ya nos mordió
+      el bug de aceptación 0 %). Resultado: mientras todo el modelo corre en W4A8 por Marlin, las
+      lineales del borrador van en fp16 por cuBLAS, cuatro veces por paso. Cuantizarlas al mismo formato
+      que el resto es la misma receta que ya aplicamos al modelo, y el costo caería a un cuarto.</p>
+      <p>Hay un detalle que conviene mirar juntos con el frente 1: si además se recorta el vocabulario,
+      el borrador entero (lineales + cabeza) pasa de ~5,3 ms a menos de 1 ms por paso.</p>
+      <div class="riesgo">Riesgo: el borrador es más sensible que el modelo grande — su única métrica es
+      la aceptación. Hay que medirla antes y después con la misma batería.</div>
+      <div class="fuentes">
+        <a href="https://arxiv.org/pdf/2508.15601">TurboMind: mixed-precision LLM inference (LMDeploy)</a>
+        <a href="https://arxiv.org/pdf/2505.15909">¿Alcanza con round-to-nearest selectivo?</a>
+      </div>
+    </article>
+
+    <article class="ficha">
+      <div class="cab"><h3>3 · La unión puede vivir adentro del kernel</h3>
+        <span class="hoy">sk18h_union4 · 0,49 ms/paso (1,7 %)</span>
+        <span class="gana">−0,4 a −0,5 ms</span></div>
+      <p>Hoy el kernel principal escribe un resultado parcial por página (máximo, suma y acumuladores de
+      256 dimensiones) y un segundo kernel los une. Son 9 MB por capa que salen a memoria y vuelven a
+      entrar. La alternativa: que cada bloque procese un <em>grupo</em> de páginas en vez de una,
+      haciendo las dos pasadas sobre todo el grupo — la primera saca el máximo del grupo, la segunda usa
+      pesos ya fijos. Eso elimina la unión y divide por 16 el tráfico intermedio, sin reintroducir la
+      carrera de reescalado que ya nos costó cara (los acumuladores del mma no se tocan).</p>
+      <div class="riesgo">Riesgo: bajo. Es código propio, y el test contra el emulador entero ya está
+      escrito. El único cuidado es la ocupación: hoy el kernel usa 255 registros y 78 KB de shared.</div>
+      <div class="fuentes">
+        <a href="https://arxiv.org/html/2603.05451v1">FlashAttention-4: co-diseño de pipeline (el patrón, aunque apunte a Blackwell)</a>
+      </div>
+    </article>
+
+    <article class="ficha">
+      <div class="cab"><h3>4 · El epílogo del int4 hace 2,5× más cuentas que el del int8</h3>
+        <span class="hoy">sk18i_batch · 4,02 ms/paso (13,6 %)</span>
+        <span class="gana">−0,4 a −0,8 ms</span></div>
+      <p>El int4 lee la mitad de bytes que el int8 y usa la mitad de instrucciones de mma, pero igual
+      tarda más: el costo está en el epílogo por cada par (key, query), donde hay que combinar cuatro
+      grupos de 64 dimensiones con su ratio, su cero y la escala del token. Ya bajamos los productos
+      internos a 32 bits y dejamos una sola multiplicación de 64. Lo que queda: precalcular
+      <code>ratio × cero</code> por key una sola vez en vez de por par, y bajar el derrame de registros
+      (584 bytes hoy) repartiendo las dimensiones entre más warps.</p>
+      <p>La referencia más cercana a lo que hicimos es <strong>SAW-INT4</strong> (abril 2026): int4
+      asimétrica por token con rotación Hadamard por bloques, y la rotación fusionada dentro del kernel
+      de decode — exactamente nuestro diseño. Su crítica a la "ventana residual" tipo KIVI es que rompe
+      el layout uniforme de las páginas; nuestra respuesta es el pool espejo con etiqueta, que mantiene
+      la página paginada intacta y valida la vigencia del espejo con un <code>dueno[ranura]</code>.
+      Vale la pena escribirlo: es una solución al problema que ese paper declara abierto.</p>
+      <div class="riesgo">Riesgo: alto para la parte de registros (el kernel ya está en el límite), bajo
+      para el precálculo por key.</div>
+      <div class="fuentes">
+        <a href="https://arxiv.org/html/2604.19157v1">SAW-INT4: 4-bit KV-cache para serving real</a>
+        <a href="https://arxiv.org/pdf/2510.05373">KVLinC: rotación Hadamard + corrección lineal</a>
+        <a href="https://arxiv.org/pdf/2603.00040">Attn-QAT: atención de 4 bits con entrenamiento consciente</a>
+      </div>
+    </article>
+
+    <article class="ficha tibia">
+      <div class="cab"><h3>5 · Norm, quant y epílogos sueltos</h3>
+        <span class="hoy">quant int8 0,56 + epílogo Marlin 0,27 + poi/red fusionados 0,96 ms</span>
+        <span class="gana">−0,4 a −0,7 ms</span></div>
+      <p>Hay 256 lanzamientos por paso que solo cuantizan la activación a int8 antes de cada Marlin, y
+      otros 208 que multiplican por las escalas de salida. vLLM ya trae pases de fusión para esto
+      (<code>rms_quant_fusion</code>, <code>fused_add_rms_norm</code>, <code>fused_qk_norm_rope</code>),
+      y la línea de investigación de 2026 va más lejos: meter toda la cadena de corrección dentro del
+      epílogo del GEMM de baja precisión, aprovechando que en decode el GEMM está limitado por memoria y
+      el tensor core está ocioso.</p>
+      <div class="riesgo">Riesgo: bajo. Es configuración y medición, no kernels nuevos. Ojo con las
+      guardas de elegibilidad: varias fusiones solo se activan por debajo de cierto número de tokens.</div>
+      <div class="fuentes">
+        <a href="https://docs.vllm.ai/en/stable/design/fusions/">vLLM · pases de fusión de torch.compile</a>
+        <a href="https://arxiv.org/pdf/2606.11244">SPEAR: recuperación de error fusionada en el epílogo</a>
+      </div>
+    </article>
+
+    <article class="ficha tibia">
+      <div class="cab"><h3>6 · GDN: no materializar el estado en cada token</h3>
+        <span class="hoy">cutlass 1,30 + cinta propia 1,36 + conv 0,17 ms</span>
+        <span class="gana">−0,5 a −1,0 ms</span></div>
+      <p><strong>DeltaLog</strong> (agosto 2026) le pone nombre a lo que pagamos: el "impuesto de
+      actualización de estado", el costo por token de materializar el estado recurrente denso. Propone
+      diferir la materialización. En paralelo, la línea de Gated DeltaNet-2 muestra un paso fusionado
+      <em>in place</em> que carga el estado, hace la escritura rango-1 y lo devuelve, con 3× menos
+      tráfico de memoria. Nuestra cinta de rollback (PN122) es complementaria: resuelve el rebobinado del
+      MTP, no el costo del paso.</p>
+      <div class="riesgo">Riesgo: alto. El estado recurrente es la parte del modelo donde un error no se
+      nota hasta miles de tokens después.</div>
+      <div class="fuentes">
+        <a href="https://arxiv.org/html/2608.15533">DeltaLog: materialización diferida del estado recurrente</a>
+        <a href="https://arxiv.org/html/2605.22791v1">Gated DeltaNet-2 (NVIDIA)</a>
+      </div>
+    </article>
+
+    <article class="ficha tibia">
+      <div class="cab"><h3>7 · All-reduce: el problema es la cantidad, no el tamaño</h3>
+        <span class="hoy">141 colectivas × 25,7 µs = 2,88 ms/paso (9,7 %)</span>
+        <span class="gana">0 a −1,0 ms</span></div>
+      <p>Ya medimos las dos vías obvias y las dos dieron cero: comprimir a int8 no sirve (los mensajes
+      son de 40 KB, manda la latencia) y el custom all-reduce de vLLM dentro del grafo cuesta
+      exactamente lo mismo que NCCL (25,7 µs) porque es PCIe sin NVLink. Lo único que queda es hacer
+      <em>menos</em> colectivas o taparlas con cómputo. <strong>TokenWeave</strong> fusiona
+      AllReduce+RMSNorm en un kernel que usa 2-8 SMs y solapa con el resto; vLLM tiene su propia versión
+      de esa fusión para pocos tokens. <strong>SiFAR</strong> ataca la sincronización misma.</p>
+      <div class="riesgo">Riesgo: alto, y con techo. En decode hay poco cómputo con qué tapar la
+      comunicación, que es justo lo que TokenWeave señala como el caso difícil.</div>
+      <div class="fuentes">
+        <a href="https://arxiv.org/pdf/2505.11329">TokenWeave: solape cómputo-comunicación</a>
+        <a href="https://arxiv.org/html/2607.08973v1">SiFAR: all-reduce sin sincronización</a>
+        <a href="https://arxiv.org/pdf/2511.09557">Comunicación en inferencia multi-nodo: por qué NCCL sufre con mensajes chicos</a>
+      </div>
+    </article>
+
+    <article class="ficha fria">
+      <div class="cab"><h3>8 · Las lineales ya están en el techo</h3>
+        <span class="hoy">marlin::Marlin · 9,01 ms/paso (30,4 %)</span>
+        <span class="gana">~0</span></div>
+      <p>Medido: 98-103 % del techo de DRAM sostenido de las placas capadas a 220 W. No hay kernel que
+      lo mejore, solo menos bytes. Las opciones de menos bytes ya las probamos y fallaron: 2:4 en pesos
+      (inservible sin mma disperso en esta arquitectura), relayout por bloques (0,65-0,93×), W4A4
+      (los errores se componen). Machete apunta a Hopper. Lo que sí queda anotado para el futuro es que
+      el desempaque de nibbles pierde <code>ldmatrix</code>: ahí hay un 2× teórico que nadie cobró todavía
+      en Ampere.</p>
+      <div class="fuentes">
+        <a href="https://developers.redhat.com/articles/2024/10/14/introducing-machete-mixed-input-gemm-kernel">Machete (Hopper)</a>
+        <a href="https://github.com/vllm-project/vllm/pull/54965">vLLM #54965 — zero-points empaquetados en GEMM flaco</a>
+        <a href="https://arxiv.org/pdf/2402.00025">SplitK para W4A16 en Triton</a>
+      </div>
+    </article>
+
+  </div>
+</section>
+
+<section>
+  <h2>Lo que ya probamos y no va</h2>
+  <ul>
+    <li><strong>All-reduce int8 en decode</strong>: los mensajes son de 40 KB; es latencia, no ancho de banda.</li>
+    <li><strong>Custom all-reduce en vez de NCCL</strong>: 25,7 µs por llamada, idéntico. Queda activado igual porque ahorra ~300 µs/paso de NCCL residual.</li>
+    <li><strong>MTP K=5</strong>: la aceptación cae a 82,8 % y la atención cuesta el doble (36 filas no entran en bloques de 32). K=4 es el punto.</li>
+    <li><strong>Rotación aprendida tipo SpinQuant</strong> para la KV int4: ±0,3 puntos, a veces peor que Hadamard.</li>
+    <li><strong>Grupos más finos en K (g32)</strong>: 0,6 puntos de error, y duplica el mma. La asimetría con cero por grupo da más por menos.</li>
+    <li><strong>Pesos de la softmax con más bits</strong>: de 12 a 9 bits el error no se mueve. No es por ahí.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Método y fechas</h2>
+  <p class="riesgo">Las ganancias estimadas salen de aplicar el factor que reporta cada trabajo al tiempo
+  que ya medimos en nuestro perfil (decode 57 k, int4, MTP K=4, 60 pasos, rank 0), no de correr esos
+  trabajos. Las búsquedas son de septiembre de 2026; los papers citados van de 2024 a agosto de 2026.
+  Todo lo de "ya probamos" está medido en este mismo servidor con la misma batería
+  (pocas, suite de calidad, 12 agujas a 57 k, aceptación MTP, PP a 42 k).</p>
+  <footer>Genesis · PN131 / SK-18 · informe de mejoras · 16 de septiembre de 2026</footer>
+</section>
+</div>
