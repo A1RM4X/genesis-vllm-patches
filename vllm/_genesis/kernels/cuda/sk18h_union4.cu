@@ -37,12 +37,13 @@ sk18h_union4(
     int c1 = c0 + CPG;
     c1 = c1 < np ? c1 : np;
 
+    // Maximo global sobre las paginas activas, repartido entre los 32 lanes (antes lo recorria
+    // lane 0 en serie: con 69 paginas eran 69 cargas dependientes por bloque).
     unsigned mgu = 0u;                                   // max en orden sin signo (+2^31)
-    if (tid == 0)
-        for (int c = 0; c < np; ++c) {
-            const unsigned u = (unsigned)om[(size_t)c * R + r] ^ 0x80000000u;
-            mgu = mgu > u ? mgu : u;
-        }
+    for (int c = tid; c < np; c += 32) {
+        const unsigned u = (unsigned)om[(size_t)c * R + r] ^ 0x80000000u;
+        mgu = mgu > u ? mgu : u;
+    }
     mgu = max_lanes(mgu);
     const int mg = (int)(mgu ^ 0x80000000u);
     const int mq = mqb[r], dc = dcap[r];

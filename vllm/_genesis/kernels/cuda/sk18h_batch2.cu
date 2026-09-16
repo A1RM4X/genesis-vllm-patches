@@ -115,7 +115,7 @@ sk18h_batch2(
     int* __restrict__ out_lo,
     int* __restrict__ out_m,                // [NCH, R]
     int* __restrict__ out_s,
-    int BLK, int BTS, int CHK, int NCH, int NH, int ZSH, int VSH   // CHK = BS; BLK = bytes por bloque
+    int BLK, int BTS, int CHK, int NCH, int NH, int SUB, int ZSH, int VSH   // CHK = BS; BLK = bytes por bloque
 #if HIB
     , const int* __restrict__ dueno         // [B * PAGS] bloque fisico que ocupa cada ranura
     , const int* __restrict__ mqb4          // [R] mqb del camino int4 (para igualar unidades)
@@ -139,14 +139,14 @@ sk18h_batch2(
     const int warp = tid >> 5;
     const int lane = tid & 31;
 #if HIB   // la grilla del espejo tiene solo PAGS paginas: son las ULTIMAS de cada secuencia
-    const int sq_ = blockIdx.y / NH;
+    const int sq_ = blockIdx.y / (NH * SUB);
     const int tramo = ((nseq[sq_] - 1) / CHK) - (PAGS - 1) + blockIdx.x;
     if (tramo < 0 || tramo >= NCH) return;
 #else
     const int tramo = blockIdx.x;
-    const int sq_ = blockIdx.y / NH;
+    const int sq_ = blockIdx.y / (NH * SUB);
 #endif                        // secuencia
-    const int hh = blockIdx.y % NH;
+    const int hh = (blockIdx.y / SUB) % NH;
     const int R = gridDim.y * BQ;
     const int bq = blockIdx.y * BQ;                         // primera fila de (secuencia, cabeza)
     const int N = nseq[sq_];

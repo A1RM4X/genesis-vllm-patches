@@ -46,6 +46,10 @@ import torch
 log = logging.getLogger("genesis.pn131")
 
 QD = 256
+# Filas por (secuencia, cabeza KV): multiplo de 32 (BQ del kernel) que entre los L*G queries
+# del decode. Con MTP K=3 y 6 cabezas Q por KV son 24; K=4 -> 30; K=5 -> 36, y ahi hace falta 64
+# (dos bloques por secuencia-cabeza, la grilla sale sola de R = gridDim.y * BQ).
+MAX_TOK_DECODE = int(os.environ.get("GENESIS_PN131_MAXTOK", 5))
 MB = 32
 ZSH = 13
 ZSH4 = int(os.environ.get("GENESIS_PN131_ZSH4", 16))   # int4: z = (sum_g acc_g*rq_g*rk_g*kmax) >> ZSH4
@@ -67,8 +71,7 @@ MARGEN4 = float(os.environ.get("GENESIS_PN131_MARGEN4", 16))    # int4: svf <= 2
 VSH = 11
 MARGEN = 64.0          # V: svf <= 2^VSH -> hasta 4x el maximo inicial
 MARGEN_K = 16.0        # K: skf con ~11 bits; satura recien a 16x (k rotada/normalizada no crece tanto)
-MAX_TOK_DECODE = 5
-CPG = 16
+CPG = int(os.environ.get("GENESIS_PN131_CPG", 16))
 LN2 = math.log(2)
 SH_H = 32 * (256 + 128) + 2 * 64 * 256 + 2 * 256 * 64 + 2 * 64 * 2 * 4
 SH_I = 32 * QPLANOS * 128 + 2 * 128 * 128 + 2 * 256 * 64 + 2 * 32 * 128 + 2 * 128 * 2 * 8
@@ -225,7 +228,11 @@ def _capa(impl, dev) -> _Capa:
 
 
 def _lado(c, dev, bmax, nh, bs):
-    """Pool espejo de la capa (una sola reserva; 1,7 MB por secuencia y pagina)."""
+    """Pool espejo de la capa (una sola reserva; 1,7 MB por secuencia y pagina).
+    OJO: reservar esto DENTRO de la captura de un CUDA graph da memoria del pool privado de la
+    captura, que no vale en el replay. Se reserva siempre en modo eager."""
+    if c.lado is None and torch.cuda.is_current_stream_capturing():
+        return None
     if c.lado is None:
         c.lado = torch.zeros(bmax * VENT * bs * nh * 520, dtype=torch.int8, device=dev)
         log.warning("PN131 espejo int8: %d paginas de %d tokens (%.1f MiB por capa)",
@@ -235,8 +242,10 @@ def _lado(c, dev, bmax, nh, bs):
 
 # ─────────────────────── buffers estaticos compartidos ─────────────────────
 class _Bufs:
-    def __init__(self, dev, bmax, nchmax, nh, bs=832):
+    def __init__(self, dev, bmax, nchmax, nh, bs=832, G=6):
         self.bmax, self.nchmax, self.nh, self.bs = bmax, nchmax, nh, bs
+        self.MB = ((MAX_TOK_DECODE * G + 31) // 32) * 32
+        MB = self.MB
         R = bmax * nh * MB
         NG = (nchmax + CPG - 1) // CPG
         z = lambda *s, dt: torch.zeros(*s, dtype=dt, device=dev)
@@ -262,13 +271,13 @@ class _Bufs:
         self.Sg = z(NG * R, dt=torch.int64)
         self.ar = torch.arange(MAX_TOK_DECODE, device=dev, dtype=torch.int32)
         mb = (self.oh.numel() + self.ol.numel()) * 4 / 2**20
-        log.info("PN131 buffers: bmax=%d nchmax=%d (%.0f MiB de acumuladores)", bmax, nchmax, mb)
+        log.info("PN131 buffers: bmax=%d nchmax=%d MB=%d (%.0f MiB de acumuladores)", bmax, nchmax, MB, mb)
 
 
 _bufs: dict[int, _Bufs] = {}
 
 
-def _get_bufs(dev, nh, bs):
+def _get_bufs(dev, nh, bs, G=6):
     b = _bufs.get(dev.index)
     if b is None:
         try:
@@ -280,7 +289,7 @@ def _get_bufs(dev, nh, bs):
             maxlen, bmax = 262144, 10
         bmax = int(os.environ.get("GENESIS_PN131_BMAX", bmax))
         nchmax = (maxlen + bs - 1) // bs
-        b = _bufs[dev.index] = _Bufs(dev, bmax, nchmax, nh, bs)
+        b = _bufs[dev.index] = _Bufs(dev, bmax, nchmax, nh, bs, G)
     return b
 
 
@@ -348,7 +357,7 @@ def escribir(impl, layer, key, value, kv_cache, slot_mapping):
             ks["escribir"].lanzar((n, nh), [k16, v16, slot, raw, c.refs, _signos_dev(dev),
                                             nh, bs, blk, VSH, k16.stride(0), v16.stride(0), par])
         if VENT > 0:
-            _espejar(impl, ks, k16, v16, slot, n, dev, nh, bs, c)
+            _espejar(impl, layer, ks, k16, v16, slot, n, dev, nh, bs, c)
     elif ROT_PTX:
         ks["escribir"].lanzar((n, nh), [k16, v16, slot, raw, c.refs, _signos_dev(dev), nh, bs, blk, VSH, k16.stride(0), v16.stride(0)])
     else:
@@ -372,12 +381,15 @@ def _md_actual(impl, layer=None):
     return md if md is not None and getattr(md, "seq_lens", None) is not None else None
 
 
-def _espejar(impl, ks, k16, v16, slot, n, dev, nh, bs, c):
+def _espejar(impl, layer, ks, k16, v16, slot, n, dev, nh, bs, c):
     """Copia los tokens del paso al pool int8 de la ventana reciente (ranura b*VENT + p%VENT)."""
-    md = _md_actual(impl)
+    md = _md_actual(impl, layer)
     if md is None:
         return
-    bf = _get_bufs(dev, nh, bs)
+    lado = _lado(c, dev, _get_bufs(dev, nh, bs, max(1, impl.num_heads // nh)).bmax, nh, bs)
+    if lado is None:
+        return
+    bf = _get_bufs(dev, nh, bs, max(1, impl.num_heads // nh))
     B = int(md.query_start_loc.shape[0]) - 1
     if B > bf.bmax:
         return
@@ -385,7 +397,7 @@ def _espejar(impl, ks, k16, v16, slot, n, dev, nh, bs, c):
     blk8 = bs * nh * 520
     ks["lado"].lanzar(((n + 127) // 128, 1), [slot, md.query_start_loc, md.seq_lens, slot2,
                                               bf.dueno, n, B, bs, VENT])
-    ks["escribir8"].lanzar((n, nh), [k16, v16, slot2, _lado(c, dev, bf.bmax, nh, bs), c.refs8, _signos_dev(dev),
+    ks["escribir8"].lanzar((n, nh), [k16, v16, slot2, lado, c.refs8, _signos_dev(dev),
                                      nh, bs, blk8, VSH, k16.stride(0), v16.stride(0)])
 
 
@@ -415,6 +427,9 @@ def _diag(impl, layer, query, kv_cache, md, output, B, L, capturando):
     nombre = getattr(layer, "layer_name", "")
     if not _DIAG or capturando or _DIAG not in nombre:
         return
+    c_ = _capa(impl, query.device)
+    if not c_.fija or int(md.seq_lens[:B].max()) < 1000:   # nada de pasos de calentamiento
+        return
     k = _diag_n.get(nombre, 0)
     if k >= 40:
         return
@@ -435,7 +450,8 @@ def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
     dev = query.device
     nb, nh, bs, blk, raw = _geom(kv_cache)
     G = impl.num_heads // nh
-    bf = _get_bufs(dev, nh, bs)
+    bf = _get_bufs(dev, nh, bs, G)
+    MB = bf.MB
     if B > bf.bmax:
         raise RuntimeError(f"PN131: lote {B} > GENESIS_PN131_BMAX {bf.bmax}")
     c = _capa(impl, dev)
@@ -471,18 +487,18 @@ def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
     os_ = bf.os[: NCH * R]
     if mo == "int4":
         oc = bf.oc[: NCH * R]
-        ks["main"].lanzar((NCH, B * nh), [Qb, rq, sqb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_, oc,
-                                          blk, bt.stride(0), bs, NCH, nh, ZSH4, VSH,
+        ks["main"].lanzar((NCH, B * nh * (MB // 32)), [Qb, rq, sqb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_, oc,
+                                          blk, bt.stride(0), bs, NCH, nh, MB // 32, ZSH4, VSH,
                                           bf.dueno if VENT > 0 else oc, VENT], shared=SH_I)
-        if VENT > 0:
+        if VENT > 0 and c.lado is not None:
             blk8 = bs * nh * 520
-            ks["espejo"].lanzar((VENT, B * nh), [bf.Q8[: R * QD], _lado(c, dev, bf.bmax, nh, bs), bt, seq, bf.lim8[:R],
+            ks["espejo"].lanzar((VENT, B * nh * (MB // 32)), [bf.Q8[: R * QD], _lado(c, dev, bf.bmax, nh, bs), bt, seq, bf.lim8[:R],
                                                 bf.mqb8[:R], bf.dcap8[:R], oh, ol, om, os_,
-                                                blk8, bt.stride(0), bs, NCH, nh, ZSH, VSH,
+                                                blk8, bt.stride(0), bs, NCH, nh, MB // 32, ZSH, VSH,
                                                 bf.dueno, mqb, oc, VENT], shared=SH_H)
     else:
-        ks["main"].lanzar((NCH, B * nh), [Qb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_,
-                                          blk, bt.stride(0), bs, NCH, nh, ZSH, VSH], shared=SH_H)
+        ks["main"].lanzar((NCH, B * nh * (MB // 32)), [Qb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_,
+                                          blk, bt.stride(0), bs, NCH, nh, MB // 32, ZSH, VSH], shared=SH_H)
     Og = bf.Og[: NG * R * QD]
     Sg = bf.Sg[: NG * R]
     if mo == "int4":

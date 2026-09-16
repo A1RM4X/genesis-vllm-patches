@@ -95,6 +95,7 @@ services:
       - GENESIS_ENABLE_PN77_FP8_LM_HEAD=1
       - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=1
       - GENESIS_ENABLE_B3_CUSTOM_AR=1
+      - GENESIS_B3_CAPTURA=${B3CAP:-0}   # 1 = custom all-reduce TAMBIEN dentro de los grafos (sin cumem)
       - GENESIS_ENABLE_B2_FULL_CG=0
       - GENESIS_ENABLE_P100=1
       # PN115: admision por headroom de bloques KV + bypass por prioridad.
@@ -261,6 +262,7 @@ services:
       - GENESIS_PN131_QPLANOS=${PN131_QPLANOS:-2}   # int4: q int8 en dos planos de nibbles
       - GENESIS_PN131_PLANOSA=${PN131_PLANOSA:-1}   # int4: planos en la pasada del maximo
       - GENESIS_PN131_VENTANA=${PN131_VENTANA:-2}   # int4: paginas de la ventana reciente en int8
+      - GENESIS_PN131_MAXTOK=${PN131_MAXTOK:-5}     # tokens por pedido en el decode uniforme (MTP K+1)
       - GENESIS_ENABLE_PN126_ROT_QK=${PN126:-0}  # rotacion Hadamard de q/k antes de la atencion
       - GENESIS_PN126_ROT=${PN126_ROT:-hadamard}
       - VLLM_USE_FUSED_MOE_GROUPED_TOPK=1
@@ -270,7 +272,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - VLLM_NO_USAGE_STATS=0
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - PYTORCH_CUDA_ALLOC_CONF=${ALLOCCONF:-expandable_segments:True,max_split_size_mb:512}
       - CUDA_DEVICE_SCHEDULE=1
       - OMP_NUM_THREADS=1
       - VLLM_API_KEY=${VLLM_API_KEY:-}
@@ -348,7 +350,7 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser
       - qwen3_coder
-      - --enable-cumem-allocator
+      # - --enable-cumem-allocator   # apagado: bloquea el custom all-reduce dentro de los grafos
       # REACTIVADO 2026-09-14 con el dimensionamiento CORRECTO.
       #
       # Estuvo apagado porque medi CERO hits, pero ese test tenia un error de
@@ -423,7 +425,7 @@ services:
       - --scheduling-policy
       - priority
       - --speculative-config
-      - '{"method":"mtp","num_speculative_tokens":3}'
+      - '{"method":"mtp","num_speculative_tokens":${MTPK:-4}}'
       - --host
       - "0.0.0.0"
       - --port

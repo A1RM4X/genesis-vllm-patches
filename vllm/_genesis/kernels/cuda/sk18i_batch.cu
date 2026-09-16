@@ -101,7 +101,7 @@ sk18i_batch(
     int* __restrict__ out_m,                // [NCH, R]
     int* __restrict__ out_s,
     int* __restrict__ out_c,                // [NCH, R] correccion del cero de V: sum_k wp * vzp
-    int BLK, int BTS, int CHK, int NCH, int NH, int ZSH4, int VSH,
+    int BLK, int BTS, int CHK, int NCH, int NH, int SUB, int ZSH4, int VSH,
     const int* __restrict__ dueno,          // [B * PAGS] ranuras del espejo int8 (VENT > 0)
     int PAGS)
 {
@@ -119,8 +119,8 @@ sk18i_batch(
     const int warp = tid >> 5;
     const int lane = tid & 31;
     const int tramo = blockIdx.x;
-    const int sq_ = blockIdx.y / NH;
-    const int hh = blockIdx.y % NH;
+    const int sq_ = blockIdx.y / (NH * SUB);
+    const int hh = (blockIdx.y / SUB) % NH;
     const int R = gridDim.y * BQ;
     const int bq = blockIdx.y * BQ;
     const int N = nseq[sq_];
