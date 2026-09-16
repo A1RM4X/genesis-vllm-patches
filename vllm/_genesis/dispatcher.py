@@ -1289,6 +1289,26 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN132": {
+        "title": "Vocabulario recortado para el borrador MTP (FR-Spec)",
+        "env_flag": "GENESIS_ENABLE_PN132_VOCAB",
+        "default_on": False,
+        "category": "spec_decode",
+        "credit": (
+            "Genesis-original 2026-09-16. El vocabulario del modelo tiene 248.320 "
+            "entradas y el borrador MTP proyecta contra todas una vez por token "
+            "propuesto: medido, 3,74 ms de los 29,6 ms del paso de decode (12,6%). "
+            "Con el vocabulario recortado a los mas frecuentes de un corpus de "
+            "calibracion (mas los especiales) el borrador propone igual y la "
+            "verificacion la sigue haciendo el modelo grande con el vocabulario "
+            "completo, asi que la distribucion de salida no cambia (q' es otra "
+            "propuesta valida para el muestreo por rechazo). Linea: FR-Spec "
+            "(arXiv 2502.14856) y VocabTrim (arXiv 2506.22694). Tunable: "
+            "GENESIS_PN132_VOCAB (32768 por defecto)."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN131": {
         "title": "Decode de atencion entero SK-18h (PTX) sobre KV int8_per_token_head",
         "env_flag": "GENESIS_ENABLE_PN131_SK18",

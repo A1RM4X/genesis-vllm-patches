@@ -184,6 +184,7 @@ def _kernels(md="int8"):
             if VENT > 0:     # espejo int8 de la ventana reciente
                 ks["lado"] = Kernel("sk18i_lado.cu", "sk18i_lado", warps=4)
                 ks["escribir8"] = Kernel("sk18h_escribir2.cu", "sk18h_escribir2", defs=["-DROTV=1"], warps=1)
+                ks["decuant8"] = Kernel("sk18h_decuant.cu", "sk18h_decuant", defs=["-DROTV=1"], warps=1)
                 ks["prep8"] = Kernel("sk18h_prep2.cu", "sk18h_prep2", warps=1)
                 ks["espejo"] = Kernel("sk18h_batch2.cu", "sk18h_batch2",
                                       defs=defs + [f"-DHIB=1", f"-DESC8={ESC8}", f"-DWCAPW={WCAP}", f"-DSCH={SCH}"], warps=4)
@@ -525,17 +526,31 @@ def decuantizar_bloques(impl, kv_cache, ids):
 
 
 def decuantizar_kv(impl, kv_cache, ids):
+    """Paginas -> fp16 para el prefill. En int4, las paginas que tienen espejo int8 (la ventana
+    reciente, donde vive el prompt que se esta procesando) se decuantizan DESDE el espejo: si no,
+    el prefill ve la version int4 y la calidad de lo estructurado (tool calls) se resiente."""
     nb, nh, bs, blk, raw = _geom(kv_cache)
-    c = _capa(impl, kv_cache.device)
+    dev = kv_cache.device
+    c = _capa(impl, dev)
     ids = ids.to(torch.int64).contiguous()
     n = ids.shape[0]
-    kv = torch.empty((n, 2, bs, nh, QD), dtype=torch.float16, device=kv_cache.device)
+    kv = torch.empty((n, 2, bs, nh, QD), dtype=torch.float16, device=dev)
     mo = modo(impl)
-    if mo == "int4":
-        _kernels(mo)["decuant"].lanzar((n, bs), [raw, ids, c.refs, _signos_dev(kv_cache.device),
-                                                 kv.view(torch.int16), blk, bs, nh])
-    else:
-        _kernels(mo)["decuant"].lanzar((n, bs), [raw, ids, c.refs, kv.view(torch.int16), blk, bs, nh])
+    ks = _kernels(mo)
+    if mo != "int4":
+        ks["decuant"].lanzar((n, bs), [raw, ids, c.refs, _signos_dev(dev), kv.view(torch.int16), blk, bs, nh])
+        return kv
+    ids4 = ids
+    if VENT > 0 and c.lado is not None:
+        dueno = _get_bufs(dev, nh, bs, max(1, impl.num_heads // nh)).dueno
+        igual = ids[:, None] == dueno.to(torch.int64)[None, :]        # [n, ranuras]
+        esp = torch.where(igual.any(1), igual.float().argmax(1).to(torch.int64), torch.full_like(ids, -1))
+        ids4 = torch.where(esp >= 0, torch.full_like(ids, -1), ids)
+        if bool((esp >= 0).any()):
+            blk8 = bs * nh * 520
+            ks["decuant8"].lanzar((n, bs), [c.lado, esp, c.refs8, _signos_dev(dev),
+                                            kv.view(torch.int16), blk8, bs, nh])
+    ks["decuant"].lanzar((n, bs), [raw, ids4, c.refs, _signos_dev(dev), kv.view(torch.int16), blk, bs, nh])
     return kv
 
 

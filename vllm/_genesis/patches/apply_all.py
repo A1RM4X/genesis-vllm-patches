@@ -2442,6 +2442,24 @@ def apply_patch_N129() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN132 vocabulario del borrador MTP")
+def apply_patch_N132_mtp_vocab() -> PatchResult:
+    """PN132: el borrador MTP propone sobre un vocabulario recortado (FR-Spec)."""
+    name = "PN132 vocabulario del borrador MTP"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.spec_decode import patch_PN132_mtp_vocab
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN132_mtp_vocab.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN131 SK-18 decode entero")
 def apply_patch_N131_sk18_decode() -> PatchResult:
     """PN131: decode de atencion entero SK-18h sobre KV int8_per_token_head."""

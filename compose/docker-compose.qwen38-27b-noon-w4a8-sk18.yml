@@ -58,6 +58,8 @@ services:
       - /home/usuario/.cache/torch/qwen38-27b-noon-w4a8-sk18:/root/.cache/torch
       - /home/usuario/.cache/triton/qwen38-27b-noon-w4a8-sk18:/root/.cache/triton
       - /home/usuario/.cache/torchinductor/qwen38-27b-noon-w4a8-sk18:/root/.cache/torchinductor
+      # Corpus de calibracion para PN132 (vocabulario del borrador)
+      - ../tests/bench/medicion/calib:/p:ro
       # Montaje de la suite de parches Genesis en modo lectura
       - ../vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
       - /home/usuario/Proyectos/genesis-vllm-patches/tests/bench/medicion/trazas:/traces
@@ -256,6 +258,8 @@ services:
       # PN130: Marlin W4A8 propio con escalas int16 CON signo (exacto; con PN130 cargado PN125 no toca pesos).
       - GENESIS_ENABLE_PN130_MARLIN_S16=1
       - GENESIS_ENABLE_PN124_TRITON_AMPERE=1  # Triton afinado para Ampere (prefill con KV int8)
+      - GENESIS_ENABLE_PN132_VOCAB=${PN132:-0}   # borrador MTP con vocabulario recortado (FR-Spec)
+      - GENESIS_PN132_VOCAB=${PN132_V:-32768}
       - GENESIS_ENABLE_PN131_SK18=1  # decode de atencion entero SK-18h (PTX)
       - GENESIS_PN131_EXCLUIR=${PN131_EXCLUIR:-}
       - GENESIS_PN131_DIAG=${PN131_DIAG:-}
@@ -263,6 +267,8 @@ services:
       - GENESIS_PN131_PLANOSA=${PN131_PLANOSA:-1}   # int4: planos en la pasada del maximo
       - GENESIS_PN131_VENTANA=${PN131_VENTANA:-2}   # int4: paginas de la ventana reciente en int8
       - GENESIS_PN131_MAXTOK=${PN131_MAXTOK:-5}     # tokens por pedido en el decode uniforme (MTP K+1)
+      - GENESIS_PN131_MARGENK4=${PN131_MK4:-8}      # int4: margen de la referencia de K
+      - GENESIS_PN131_MARGEN4=${PN131_M4:-16}       # int4: margen de la referencia de V
       - GENESIS_PN131_SCH=${PN131_SCH:-8}           # int4: trozos por pagina espejada (paralelismo)
       - GENESIS_ENABLE_PN126_ROT_QK=${PN126:-1}  # rotacion Hadamard de q/k antes de la atencion
       - GENESIS_PN126_ROT=${PN126_ROT:-hadamard}
@@ -425,6 +431,10 @@ services:
       - --async-scheduling
       - --scheduling-policy
       - priority
+      # Fusiones de torch.compile: meten la cuantizacion int8 de la activacion dentro del RMSNorm
+      # y de la activacion del MLP (256 + 68 lanzamientos sueltos por paso hoy).
+      - --compilation-config
+      - '{"pass_config": {"fuse_norm_quant": ${FUSEQ:-true}, "fuse_act_quant": ${FUSEQ:-true}}}'
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":${MTPK:-4}}'
       - --host

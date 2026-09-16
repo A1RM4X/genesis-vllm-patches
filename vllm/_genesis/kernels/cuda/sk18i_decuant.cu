@@ -30,6 +30,7 @@ sk18i_decuant(
     const int i = blockIdx.x;
     const int o = blockIdx.y;
     const int lane = threadIdx.x;
+    if (ids[i] < 0) return;                  // esta pagina la hace el kernel del espejo
     const size_t base = (size_t)ids[i] * (size_t)BLK;
     const size_t KOFF = (size_t)BS * NH * (QD / 2);
     const int ek = refs[0], ev = refs[1];
