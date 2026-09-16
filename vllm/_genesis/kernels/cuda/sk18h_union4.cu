@@ -68,9 +68,12 @@ sk18h_union4(
 #endif
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            long long oc_ = (long long)oh[base + e] * 256 + (long long)ol[base + e];
-#ifdef O32   // int4: el cero de V es igual para toda dimension y se resta aca
-            oc_ -= cc;
+#ifdef O32   // int4: las paginas reales traen O entero en oh; las ranuras extra del espejo, hi/lo
+            long long oc_ = (i < nreal) ? (long long)oh[base + e]
+                                        : ((long long)oh[base + e] * 256 + (long long)ol[base + e]);
+            oc_ -= cc;   // cero de V: igual para toda dimension
+#else
+            const long long oc_ = (long long)oh[base + e] * 256 + (long long)ol[base + e];
 #endif
             acc[e] += (oc_ * sc + 16384) >> 15;
         }

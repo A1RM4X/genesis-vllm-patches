@@ -162,7 +162,7 @@ sk18i_batch(
     const int lb_col = 16 * ((lane >> 3) & 1);
     const int nthreads = NWARPS * 32;
 
-    int qr_[2], lm[2], mq[2], dc[2], rqg[2][4], sqg[2][QPLANOS][4];
+    int qr_[2], lm[2], mq[2], dc[2], sqg[2][QPLANOS][4];
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
         const int r = bq + wq + tig * 2 + e;
@@ -172,12 +172,10 @@ sk18i_batch(
         mq[e] = vale ? mqb[r] : 1;
         dc[e] = vale ? dcap[r] : 0;
 #pragma unroll
-        for (int g = 0; g < 4; ++g) {
-            rqg[e][g] = vale ? rq[(size_t)r * 4 + g] : 0;
+        for (int g = 0; g < 4; ++g)
 #pragma unroll
             for (int pl = 0; pl < QPLANOS; ++pl)
                 sqg[e][pl][g] = vale ? sq[((size_t)r * QPLANOS + pl) * 4 + g] : 0;
-        }
     }
 
     // Q^T (nibbles) a shared
@@ -270,7 +268,7 @@ sk18i_batch(
                         _Pragma("unroll") for (int d = 0; d < 4; ++d) {        \
                             const int b = (int)pe[2 + d];                      \
                             const int rk = (b & 15) + 1, zp = ((b >> 4) & 15) - 8; \
-                            t += rk * (rqg[e][d] * acc[d][hr * 2 + e]          \
+                            t += rk * (acc[d][hr * 2 + e]                      \
                                        - zp * sqg[e][(NP) == 1 ? QPLANOS - 1 : pl][d]); \
                         }                                                      \
                         zs[hr][e] += ((NP) == 2 && pl) ? ((long long)t << 4) : (long long)t; \
@@ -442,11 +440,10 @@ sk18i_batch(
                 const int r = qr_[e];
                 if (r < hlim) {
                     size_t o = ((size_t)tramo * R + r) * QD + i * 16 + gid + hr * 8;
-                    // mismo formato que el camino int8: O = hi * 256 + lo
-                    const int O = o0[i][hr * 2 + e] + (o1[i][hr * 2 + e] << 4) + (o2[i][hr * 2 + e] << 8);
-                    const int hi2 = O >> 8;
-                    out_hi[o] = hi2;
-                    out_lo[o] = O - (hi2 << 8);
+                    // El O del int4 entra entero en un int32 (<= 1,8e8 por pagina): se escribe
+                    // solo out_hi y la union lo lee asi para las paginas reales. Las ranuras extra
+                    // (espejo int8) siguen con el par hi/lo. Son 4,5 MB por capa que no van ni vuelven.
+                    out_hi[o] = o0[i][hr * 2 + e] + (o1[i][hr * 2 + e] << 4) + (o2[i][hr * 2 + e] << 8);
                 }
             }
 }

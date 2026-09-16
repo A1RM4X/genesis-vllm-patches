@@ -64,8 +64,8 @@ VENT = int(os.environ.get("GENESIS_PN131_VENTANA", 2))     # paginas espejadas (
 SCH = int(os.environ.get("GENESIS_PN131_SCH", 8))           # trozos por pagina espejada
 ESC8 = 3               # el espejo usa refs 2^ESC8 mas chicas (mas precision de escala)   # grupos cp.async pendientes (0 = esperar todo)  # planos en la pasada del maximo
 NIV4 = int(os.environ.get("GENESIS_PN131_NIV", 119 if QPLANOS == 2 else 7))
-# escala del logit int4: q = mx*rq/(255*NIV4), k = KM*r/16 * 2^ek/32767, y 16 = sqrt(256)
-MQ4 = round(2 ** 56 / (NIV4 * 32767 * 255 * 16 * 16 * math.log(2)))
+# escala del logit int4: q = mx/NIV4 (una escala por fila), k = KM*r/16 * 2^ek/32767, 16 = sqrt(256)
+MQ4 = round(2 ** 56 / (NIV4 * 32767 * 16 * 16 * math.log(2)))
 CLIP4 = int(os.environ.get("GENESIS_PN131_CLIP", 243))   # recorte de la escala, sobre 256
 MARGEN_K4 = float(os.environ.get("GENESIS_PN131_MARGENK4", 8))   # int4: KM de 12 bits
 MARGEN4 = float(os.environ.get("GENESIS_PN131_MARGEN4", 16))    # int4: svf <= 2^VSH

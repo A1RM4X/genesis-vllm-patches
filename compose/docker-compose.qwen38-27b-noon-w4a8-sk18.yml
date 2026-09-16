@@ -258,6 +258,8 @@ services:
       # PN130: Marlin W4A8 propio con escalas int16 CON signo (exacto; con PN130 cargado PN125 no toca pesos).
       - GENESIS_ENABLE_PN130_MARLIN_S16=1
       - GENESIS_ENABLE_PN124_TRITON_AMPERE=1  # Triton afinado para Ampere (prefill con KV int8)
+      - GENESIS_ENABLE_PN133_MTP_INT8=${PN133:-0}  # lineales del borrador MTP en W8A8
+      - GENESIS_PN133_MIN=${PN133_MIN:-4194304}    # tamano minimo de matriz a cuantizar
       - GENESIS_ENABLE_PN132_VOCAB=${PN132:-0}   # borrador MTP con vocabulario recortado (FR-Spec)
       - GENESIS_PN132_VOCAB=${PN132_V:-32768}
       - GENESIS_ENABLE_PN131_SK18=1  # decode de atencion entero SK-18h (PTX)

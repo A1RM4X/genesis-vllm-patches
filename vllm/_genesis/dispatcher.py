@@ -1289,6 +1289,23 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN133": {
+        "title": "Lineales del modulo MTP en W8A8",
+        "env_flag": "GENESIS_ENABLE_PN133_MTP_INT8",
+        "default_on": False,
+        "category": "spec_decode",
+        "credit": (
+            "Genesis-original 2026-09-16. El checkpoint deja todo mtp.* fuera de "
+            "la cuantizacion, asi que el borrador hace sus GEMM en fp16 por cuBLAS "
+            "una vez por token propuesto: 2,26 ms de los 29,6 ms del paso (7,6%). "
+            "Se cuantizan sus lineales a int8 con escala por canal de salida y se "
+            "usa el GEMM int8 de cutlass con activacion int8 por token. W8A8 y no "
+            "W4 porque arXiv 2505.22179 mide que GPTQ sobre el borrador degrada la "
+            "aceptacion y que W4 no es compatible con la verificacion."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN132": {
         "title": "Vocabulario recortado para el borrador MTP (FR-Spec)",
         "env_flag": "GENESIS_ENABLE_PN132_VOCAB",

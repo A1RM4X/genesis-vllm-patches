@@ -69,11 +69,10 @@ sk18i_prep(
         const unsigned a = (unsigned)(x[e] < 0 ? -x[e] : x[e]);
         mx = mx > a ? mx : a;
     }
-    const unsigned mg = max_xor8(mx);                    // maximo del grupo de 64 dims
-    mx = max_lanes(mg);                                  // maximo de la fila (Q8)
-    const int r = mx ? (int)(((long long)mg * 255 + (long long)mx - 1) / (long long)mx) : 0;
-    const long long mef = ((long long)mx * r + 254) / 255;
-    const long long rec = mef ? (((long long)NIV << 24) / mef) : 0;
+    mx = max_lanes(mx);                                  // maximo de la fila (Q8)
+    // Una sola escala por fila: el ratio por grupo de q costaba 4 registros y 4 multiplicaciones
+    // por par (key, query) en el kernel, y el camino int8 ya usa escala por fila sin perder nada.
+    const long long rec = mx ? (((long long)NIV << 24) / mx) : 0;
     unsigned char bq[4], bh[4];
     int sbajo = 0, salto = 0;
 #pragma unroll
@@ -99,9 +98,9 @@ sk18i_prep(
     for (int k = 1; k < 8; k <<= 1) { sbajo += bfly32s(sbajo, k); salto += bfly32s(salto, k); }
     if ((lane & 7) == 0) {
         const int g = lane >> 3;
-        rq[row * 4 + g] = r;
-        sq[row * QPLANOS * 4 + g] = r * sbajo;
-        if (QPLANOS == 2) sq[(row * QPLANOS + 1) * 4 + g] = r * salto;
+        rq[row * 4 + g] = 1;                 // ya no hay ratio por grupo (queda por compatibilidad)
+        sq[row * QPLANOS * 4 + g] = sbajo;
+        if (QPLANOS == 2) sq[(row * QPLANOS + 1) * 4 + g] = salto;
     }
     if (lane == 0) {
         const int ek = refs[0];

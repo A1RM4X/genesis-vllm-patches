@@ -2442,6 +2442,24 @@ def apply_patch_N129() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN133 MTP en int8")
+def apply_patch_N133_mtp_int8() -> PatchResult:
+    """PN133: las lineales del modulo MTP en W8A8."""
+    name = "PN133 MTP en int8"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.spec_decode import patch_PN133_mtp_int8
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN133_mtp_int8.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN132 vocabulario del borrador MTP")
 def apply_patch_N132_mtp_vocab() -> PatchResult:
     """PN132: el borrador MTP propone sobre un vocabulario recortado (FR-Spec)."""
