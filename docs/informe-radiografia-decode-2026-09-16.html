@@ -50,7 +50,7 @@
   .leyenda i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 7px;
                vertical-align: -1px; }
   .tabla-caja { overflow-x: auto; border: 1px solid var(--linea); border-radius: 3px; background: var(--panel); }
-  table { border-collapse: collapse; width: 100%; min-width: 900px; font-size: 14px; }
+  table { border-collapse: collapse; width: 100%; min-width: 1180px; font-size: 14px; }
   thead th { font-family: var(--dato); font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
              color: var(--tinta2); text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--linea);
              background: var(--panel2); white-space: nowrap; font-weight: 500; }
@@ -59,6 +59,15 @@
   .k { font-family: var(--dato); font-size: 13px; font-weight: 500; white-space: nowrap; }
   .n { font-family: var(--dato); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
   .pat { color: var(--tinta2); font-size: 13.5px; }
+  .tipos { font-family: var(--dato); font-size: 11.5px; line-height: 1.45; display: flex;
+           flex-direction: column; gap: 5px; min-width: 215px; }
+  .tipos .io { display: flex; gap: 6px; align-items: baseline; }
+  .tipos .fl { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; font-weight: 600;
+               flex: 0 0 34px; }
+  .tipos .in .fl { color: var(--ok); }
+  .tipos .out .fl { color: var(--acento); }
+  .tipos .mid { color: var(--tinta2); border-left: 2px solid var(--linea); padding-left: 8px;
+                margin-left: 2px; }
   .chip { font-family: var(--dato); font-size: 11px; padding: 2px 7px; border-radius: 2px;
           white-space: nowrap; border: 1px solid; font-weight: 500; }
   .ptx { color: var(--acento); border-color: color-mix(in srgb, var(--acento) 45%, transparent);
@@ -157,7 +166,7 @@
   <table>
     <thead><tr>
       <th>Kernel</th><th>Dónde vive</th><th class="n">µs/paso</th><th class="n">%</th>
-      <th class="n">lanz.</th><th>Qué hace</th><th>Patrón de diseño</th>
+      <th class="n">lanz.</th><th>Qué hace</th><th>Tipos e instrucciones</th><th>Patrón de diseño</th>
     </tr></thead>
     <tbody>
       <tr>
@@ -165,6 +174,7 @@
         <td><span class="chip aje">ajeno</span></td><td class="n">9.022</td><td class="n">30,6</td><td class="n">256</td>
         <td>Todas las lineales del modelo en W4A8: desempaqueta nibbles a registros, los multiplica
         contra activaciones int8 y acumula en int32.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>activación int8 + escala fp32 por token; pesos int4 empaquetados en int32</span></div><div class="mid">desempaqueta los nibbles a int8 en registros y multiplica con <code>mma.m16n8k16.s32.s8.s8.s32.satfinite</code>; acumulador int32; las escalas se aplican en fp16/fp32 en el epílogo</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">GEMM por tiles con doble buffer (productor-consumidor) y dequant fusionado en el
         prólogo. Está al 98-103 % del techo de DRAM.</td>
       </tr>
@@ -173,6 +183,7 @@
         <td><span class="chip aje">ajeno</span></td><td class="n">3.743</td><td class="n">12,7</td><td class="n">5</td>
         <td>Proyección a vocabulario de 248.320 × 5.120 en W4: 318 MB de pesos por GPU y por llamada,
         una por el modelo y cuatro por los pasos del borrador MTP.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>activación int8; pesos int8 empaquetados (4 por int32) + <code>weight_scale</code> fp16</span></div><div class="mid">mismo <code>mma.m16n8k16.s32.s8.s8.s32</code>, acumulador int32; 318 MB de pesos por llamada</div><div class="io out"><span class="fl">sale</span><span>fp16 (logits de 248.320)</span></div></td>
         <td class="pat">El mismo GEMM, pero con M=1..5: memoria pura. 749 µs contra 497 de techo → corre
         al 66 % del ancho de banda sostenido.</td>
       </tr>
@@ -182,6 +193,7 @@
         <td>Atención int4: Q·K con <code>mma.m16n8k64.s4.s4</code>, softmax entero (potencia de dos por
         tramos), pesos en tres planos de nibbles y w·V con el mismo mma. Dos pasadas por página: la
         primera saca el máximo exacto, la segunda usa pesos ya fijos.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q en nibbles s4 (uint8, 2 planos), KV en nibbles s4 (uint8), escalas uint8/int16, sumas de q int32</span></div><div class="mid"><code>cp.async.cg</code> de 16 B a shared; <code>ldmatrix.m8n8.x4.b16</code>; <code>mma.m16n8k64.s32.s4.s4.s32.satfinite</code> con acumulador int32; los logits se arman con productos int32 y UNA multiplicación int64 por par; softmax = potencia de dos por tramos en Q15 (todo entero); pesos en 3 planos de nibbles; máximos y sumas entre lanes con <code>shfl.sync.bfly.b32</code></div><div class="io out"><span class="fl">sale</span><span>int32 (O, máximo, S y corrección del cero de V)</span></div></td>
         <td class="pat">FlashAttention por tiles, pero con reducción en <em>dos pasadas</em> en vez de
         softmax en streaming — reescalar acumuladores del mma mientras el pipe tensorial acumula es una
         carrera. Carga con <code>cp.async</code> en dos etapas. <strong>−5 % el 16/09</strong>: q pasó a
@@ -192,6 +204,7 @@
         <td class="k">cross_device_reduce</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">2.910</td><td class="n">9,9</td><td class="n">141</td>
         <td>All-reduce de tensor parallel: 141 colectivas de ~40 KB por paso, dos por capa.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (el parcial de cada rank) + banderas int32</span></div><div class="mid">lectura P2P del buffer del otro rank y suma en fp16 dentro del grafo CUDA</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">Colectiva one-shot P2P dentro del grafo CUDA. 25,7 µs cada una: es latencia de
         PCIe, no ancho de banda (NCCL da exactamente lo mismo).</td>
       </tr>
@@ -201,6 +214,7 @@
         <td>Las lineales del módulo MTP (el borrador), que el checkpoint dejó <strong>sin cuantizar</strong>:
         corren en fp16 por cuBLAS, cuatro veces por paso. Cuantizarlas a W8A8 está probado: anda, ahorra
         ~1 ms y <strong>baja la aceptación de 88,9 % a 81,9 %</strong>, así que quedó apagado.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (activación y pesos del borrador, sin cuantizar)</span></div><div class="mid"><code>mma.m16n8k16.f32.f16.f16.f32</code>: entradas fp16, acumulador fp32</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">GEMM fp16 genérico de cuBLAS. No hay nada especial: sobra porque el resto del
         modelo sí está en W4A8.</td>
       </tr>
@@ -208,6 +222,7 @@
         <td class="k">cutlass_80_wmma</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">1.298</td><td class="n">4,4</td><td class="n">48</td>
         <td>El núcleo recurrente del GDN (gated delta): actualización del estado por capa.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (q, k, v) + estado recurrente fp32</span></div><div class="mid"><code>wmma</code> 16×16×16 con entradas f16 y acumulador fp32</div><div class="io out"><span class="fl">sale</span><span>fp16 + estado fp32</span></div></td>
         <td class="pat">Scan recurrente con estado persistente, resuelto como GEMM chico de 16×16.</td>
       </tr>
       <tr class="propio">
@@ -215,12 +230,14 @@
         <td><span class="chip tri">Triton propio</span></td><td class="n">1.360</td><td class="n">4,6</td><td class="n">96</td>
         <td>Cinta de rollback del MTP en GDN (PN122): en vez de copiar K veces el estado recurrente,
         escribe una cinta y la rebobina cuando el MTP rechaza tokens.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (k, v, a, b) + índices int64</span></div><div class="mid">Triton: todo se sube a fp32 para el delta y las compuertas (<code>tl.float32</code>), punteros e índices en int64</div><div class="io out"><span class="fl">sale</span><span>fp16 (cinta y estado)</span></div></td>
         <td class="pat">Journal / write-ahead log: registrar el delta y deshacerlo, en vez de snapshot.</td>
       </tr>
       <tr>
         <td class="k">_per_token_quant_int8</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">560</td><td class="n">1,9</td><td class="n">256</td>
         <td>Cuantiza la activación a int8 antes de cada lineal Marlin (una por GEMM).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16</span></div><div class="mid">máximo absoluto por fila en fp32 y división</div><div class="io out"><span class="fl">sale</span><span>int8 + escala fp32</span></div></td>
         <td class="pat">Map + reducción por fila. Es el caso de libro de un epílogo fusionable: 256
         lanzamientos que podrían vivir dentro del kernel anterior.</td>
       </tr>
@@ -228,12 +245,14 @@
         <td class="k">elementwise_kernel</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">521</td><td class="n">1,8</td><td class="n">244</td>
         <td>Copias, slices y casts que quedan entre operadores de PyTorch.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (y algunos int32/int64 de índices)</span></div><div class="mid">copias y casts; sin tensor cores</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">Map elementwise. Cada uno es corto; lo que pesa es la cantidad.</td>
       </tr>
       <tr>
         <td class="k">triton_red_fused</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">521</td><td class="n">1,8</td><td class="n">165</td>
         <td>RMSNorm y sumas de residual fusionadas por Inductor.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (activación y residual)</span></div><div class="mid">reducción de la suma de cuadrados en fp32 y normalización</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">Reducción por fila + map, generada por el compilador.</td>
       </tr>
       <tr class="propio">
@@ -241,6 +260,7 @@
         <td><span class="chip ptx">PTX propio</span></td><td class="n">516</td><td class="n">1,7</td><td class="n">20</td>
         <td>Une los resultados parciales de todas las páginas: toma el máximo global por consulta,
         reescala cada página con una potencia de dos entera y suma O y S.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>int32 (O, máximo, S, corrección) + mqb/dcap int32</span></div><div class="mid">acumuladores int64; el factor de cada página es una potencia de dos entera en Q15; máximo global entre lanes con <code>shfl.sync.bfly.b32</code></div><div class="io out"><span class="fl">sale</span><span>int64 (O y S por grupo)</span></div></td>
         <td class="pat">Merge de log-sum-exp = reducción con combinador asociativo (map-reduce). Es el
         mismo patrón que <code>merge_states</code> de FlashInfer, pero entero. El máximo global se reparte
         entre los 32 lanes y, en int4, el O viaja en un solo int32 (4,5 MB menos por capa).</td>
@@ -252,6 +272,7 @@
         también en un pool espejo aparte. Ahí se concentra el 39-49 % de la masa de atención. El
         <strong>prefill también lee de ahí</strong> desde el 16/09: mientras no lo hacía, los tool calls
         del prompt salían con JSON roto.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q int8, KV int8, escalas int16</span></div><div class="mid"><code>mma.m16n8k32.s32.s8.s8.s32.satfinite</code>, acumulador int32; el mismo softmax entero; el máximo se convierte a las unidades del int4 con una división entera</div><div class="io out"><span class="fl">sale</span><span>int32 (par alto/bajo)</span></div></td>
         <td class="pat">Caché por niveles con etiqueta: <code>dueno[ranura]</code> valida que el espejo
         siga siendo de ese bloque, como una caché de mapeo directo. Cada página se parte en trozos para
         que no quede limitada por latencia.</td>
@@ -260,12 +281,14 @@
         <td class="k">triton_poi_fused</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">452</td><td class="n">1,5</td><td class="n">282</td>
         <td>RoPE, activaciones y casts fusionados por Inductor.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (y bits de posición int32 para RoPE)</span></div><div class="mid">seno y coseno en fp32 dentro del kernel; el resto es map elementwise sin tensor cores</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">Map elementwise generado; 282 lanzamientos por paso.</td>
       </tr>
       <tr>
         <td class="k">ncclDevKernel_AllGather</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">456</td><td class="n">1,5</td><td class="n">9</td>
         <td>Los pocos colectivos que no entran en el camino rápido (MoE y logits).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16</span></div><div class="mid">protocolo LL de NCCL sobre PCIe</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">Ring LL de NCCL.</td>
       </tr>
       <tr class="propio">
@@ -273,6 +296,7 @@
         <td><span class="chip ptx">PTX propio</span></td><td class="n">264</td><td class="n">0,9</td><td class="n">40</td>
         <td>Escribe la KV en int4: rota k y v con Hadamard entero, saca mínimo, máximo y media por grupo
         de 64 dimensiones, recorta la escala al 95 % y guarda nibbles con cero por grupo.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>k y v en fp16 leídos como bits (uint16), slot int64, referencias y signos int32</span></div><div class="mid">los bits del fp16 se pasan a magnitud fija de 64 bits con desplazamientos (sin FPU) y de ahí a Q8 int32; Walsh-Hadamard entero con mariposas <code>shfl.sync.bfly.b32</code>; mínimo, máximo y media por grupo entre lanes; recíprocos con <code>div.s64</code> y redondeo en int64</div><div class="io out"><span class="fl">sale</span><span>uint8 (nibbles s4) + escalas uint8/int16</span></div></td>
         <td class="pat">Scatter con cambio de layout (K por token, V por dimensión) y cuantización
         asimétrica en el mismo paso. Se lanza dos veces, una por paridad, porque dos tokens vecinos
         comparten byte en V.</td>
@@ -280,12 +304,14 @@
       <tr>
         <td class="k">act_and_mul</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">271</td><td class="n">0,9</td><td class="n">68</td>
-        <td>SiLU × gate del MLP.</td><td class="pat">Map elementwise con dos entradas.</td>
+        <td>SiLU × gate del MLP.</td><td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16</span></div><div class="mid">SiLU en fp32 y multiplicación</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Map elementwise con dos entradas.</td>
       </tr>
       <tr>
         <td class="k">triton_poi_fused_marlin</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">272</td><td class="n">0,9</td><td class="n">208</td>
         <td>Epílogo de Marlin: multiplica por las escalas de salida.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>int32 (acumulador de Marlin)</span></div><div class="mid">multiplicación por la escala</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
         <td class="pat">Map elementwise; otro candidato natural a fusionarse en el GEMM.</td>
       </tr>
       <tr class="propio">
@@ -293,17 +319,20 @@
         <td><span class="chip ptx">PTX propio</span></td><td class="n">177</td><td class="n">0,6</td><td class="n">20</td>
         <td>Divide O entre S, des-rota la V con Walsh-Hadamard entero y arma los bits fp16 a mano
         (con <code>clz</code> y desplazamientos).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>int64 (O y S por grupo) + referencias y signos int32</span></div><div class="mid">división entera de 64 bits, Walsh-Hadamard entero en int32 entre lanes y armado del fp16 a mano con <code>clz</code> y desplazamientos (redondeo al par, saturación a 65504)</div><div class="io out"><span class="fl">sale</span><span>uint16 (bits fp16)</span></div></td>
         <td class="pat">Red de mariposas entre lanes (FWHT) + conversión de punto fijo a fp16 sin FPU.</td>
       </tr>
       <tr>
         <td class="k">_causal_conv1d_update</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">166</td><td class="n">0,6</td><td class="n">48</td>
-        <td>La convolución causal corta del GDN.</td><td class="pat">Stencil 1-D sobre estado en anillo.</td>
+        <td>La convolución causal corta del GDN.</td><td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 + estado en anillo fp16</span></div><div class="mid">acumulación en fp32</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Stencil 1-D sobre estado en anillo.</td>
       </tr>
       <tr class="propio">
         <td class="k">sk18h_escribir2 <span style="color:var(--tinta2)">(espejo)</span></td>
         <td><span class="chip ptx">PTX propio</span></td><td class="n">77</td><td class="n">0,3</td><td class="n">20</td>
         <td>La misma escritura pero en int8 y hacia el pool espejo de la ventana reciente.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>k y v fp16 (bits uint16)</span></div><div class="mid">mismo camino entero que el int4 pero cuantizando a int8; V también rotada</div><div class="io out"><span class="fl">sale</span><span>int8 + escalas int16</span></div></td>
         <td class="pat">Scatter con rotación; comparte código con el camino int8 vía defines.</td>
       </tr>
       <tr class="propio">
@@ -311,6 +340,7 @@
         <td><span class="chip ptx">PTX propio</span></td><td class="n">67</td><td class="n">0,2</td><td class="n">20</td>
         <td>Prepara las consultas: rotación Hadamard entera, cuantización a int8 partido en dos planos
         de nibbles, y las constantes del softmax entero por fila.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q fp16 (bits uint16), referencias y signos int32</span></div><div class="mid">fp16 → Q8 int32 sin FPU; Walsh-Hadamard entero con mariposas; una escala por fila con <code>div.s64</code>; el int8 se parte en dos nibbles con signo (tope 119)</div><div class="io out"><span class="fl">sale</span><span>uint8 (2 planos de nibbles) + int32 (sumas, mqb, dcap, lim)</span></div></td>
         <td class="pat">Map por fila + FWHT en mariposa. Un bloque por token-cabeza, 32 lanes = 32 grupos
         de 8 dimensiones.</td>
       </tr>
@@ -318,6 +348,7 @@
         <td class="k">sk18h_prep2 <span style="color:var(--tinta2)">(espejo)</span></td>
         <td><span class="chip ptx">PTX propio</span></td><td class="n">59</td><td class="n">0,2</td><td class="n">20</td>
         <td>Lo mismo para el camino int8 del espejo (q int8 entero, escalas propias).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q fp16 (bits uint16)</span></div><div class="mid">igual, pero el q queda en int8 entero</div><div class="io out"><span class="fl">sale</span><span>int8 + int32</span></div></td>
         <td class="pat">Idéntico; cambia solo la referencia de escala.</td>
       </tr>
       <tr class="propio">
@@ -325,6 +356,7 @@
         <td><span class="chip ptx">PTX propio</span></td><td class="n">47</td><td class="n">0,2</td><td class="n">20</td>
         <td>Decide qué tokens entran al espejo: calcula la posición absoluta de cada uno, se queda con
         las dos últimas páginas y escribe la etiqueta <code>dueno</code>.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>slot int64, inicios y largos int32</span></div><div class="mid">aritmética entera pura: posición absoluta, división por el tamaño de página y etiqueta de la ranura</div><div class="io out"><span class="fl">sale</span><span>int64 (slot del espejo) + int32 (dueño)</span></div></td>
         <td class="pat">Indexación / mapeo de direcciones, un hilo por token. Es el "planificador" del
         nivel de caché.</td>
       </tr>
@@ -332,11 +364,12 @@
         <td class="k">resto</td>
         <td><span class="chip aje">ajeno</span></td><td class="n">~350</td><td class="n">1,2</td><td class="n">~110</td>
         <td>Reducciones del muestreo, gathers de índices, memcpy de estado y kernels sueltos.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>varios</span></div><div class="mid">reducciones del muestreo y gathers de índices</div><div class="io out"><span class="fl">sale</span><span>varios</span></div></td>
         <td class="pat">Varios.</td>
       </tr>
     </tbody>
     <tfoot><tr><td>Total GPU</td><td></td><td class="n">29.493</td><td class="n">100</td><td class="n">2.166</td>
-      <td colspan="2">Pared por paso: 30.223 µs — quedan ~730 µs de huecos entre kernels.</td></tr></tfoot>
+      <td colspan="3">Pared por paso: 30.223 µs — quedan ~730 µs de huecos entre kernels.</td></tr></tfoot>
   </table>
   </div>
 </section>
@@ -364,6 +397,10 @@
 
 <section>
   <h2><span class="num">04</span>Cómo se midió</h2>
+  <p class="nota">La columna de tipos sale de leer el código: los kernels propios están en
+  <code>vllm/_genesis/kernels/cuda/*.cu</code> (PTX inline, ni una instrucción de punto flotante), la cinta
+  del GDN en <code>vllm/_genesis/gdn_cinta.py</code> (Triton) y el <code>mma</code> de Marlin en
+  <code>csrc/quantization/marlin/marlin_mma.h</code> de vLLM.</p>
   <p class="nota">Perfil con el torch profiler de vLLM (<code>tests/bench/medicion/perfil_stack.sh</code>),
   rank 0, 60 pasos de decode con prefijo cacheado de 57.530 tokens y una ventana de prefill en frío de
   17 k. Traza <code>int4_v2</code> del 16 de septiembre. Los µs/paso son la suma de duraciones de kernel dividida por la cantidad de pasos (un paso =
