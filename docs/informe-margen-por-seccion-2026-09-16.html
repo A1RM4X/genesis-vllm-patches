@@ -64,6 +64,15 @@
   .fuentes a:hover, .fuentes a:focus-visible { border-bottom-color: var(--frio); }
   a:focus-visible { outline: 2px solid var(--acento); outline-offset: 2px; }
   .riesgo { font-size: 13.5px; color: var(--tinta2); font-family: var(--dato); }
+  .estado { font-family: var(--dato); font-size: 11px; letter-spacing: .04em; text-transform: uppercase;
+            padding: 3px 8px; border-radius: 2px; border: 1px solid; font-weight: 500; white-space: nowrap; }
+  .e-no { color: var(--acento); border-color: color-mix(in srgb, var(--acento) 45%, transparent);
+          background: color-mix(in srgb, var(--acento) 10%, transparent); }
+  .e-si { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+          background: color-mix(in srgb, var(--ok) 10%, transparent); }
+  .e-med { color: var(--tinta2); border-color: var(--linea); background: var(--panel2); }
+  .e-parc { color: var(--aviso); border-color: color-mix(in srgb, var(--aviso) 45%, transparent);
+            background: color-mix(in srgb, var(--aviso) 10%, transparent); }
   .lista { display: flex; flex-direction: column; gap: 20px; }
   ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; max-width: 70ch; }
   li { font-size: 15.5px; }
@@ -76,30 +85,38 @@
 <header>
   <div class="ojo">Genesis · continuación de la radiografía del decode</div>
   <h1>Dónde queda margen</h1>
-  <p class="bajada">El paso de decode son 29,6 ms. Esto es qué se le puede sacar a cada tramo, qué dice
+  <p class="bajada">El paso de decode son 29,5 ms. Esto es qué se le puede sacar a cada tramo, qué dice
   la literatura reciente sobre cada uno, cuánto esperaríamos ganar y qué tan riesgoso es. Ordenado por
   premio, no por tamaño del tramo.</p>
+  <p class="bajada" style="font-size:16px"><strong>Actualizado el 16 de septiembre</strong> con lo que
+  ya se probó: dos frentes hechos, tres medidos y descartados, dos que son piso de hardware y uno todavía
+  sin probar. El resumen incómodo: los dos que prometían 4 ms eran del borrador MTP, y el borrador es
+  justo lo que menos tolera perder precisión.</p>
 </header>
 
 <section>
   <h2>El orden que propongo</h2>
   <div class="tabla-caja">
   <table>
-    <thead><tr><th>#</th><th>Frente</th><th class="n">Hoy</th><th class="n">Ganancia est.</th><th>Esfuerzo / riesgo</th></tr></thead>
+    <thead><tr><th>#</th><th>Frente</th><th class="n">Hoy</th><th class="n">Ganancia est.</th><th>Estado</th><th>Esfuerzo / riesgo</th></tr></thead>
     <tbody>
-      <tr><td class="n">1</td><td>Vocabulario recortado en el borrador MTP</td><td class="n">3,0 ms</td><td class="n">2,2–2,6 ms</td><td>Medio · baja la aceptación si se recorta de más</td></tr>
-      <tr><td class="n">2</td><td>Cuantizar el módulo MTP (hoy fp16)</td><td class="n">2,26 ms</td><td class="n">1,5–1,7 ms</td><td>Medio · hay que recalibrar y medir aceptación</td></tr>
-      <tr><td class="n">3</td><td>Fusionar la unión dentro del kernel de atención</td><td class="n">0,49 ms</td><td class="n">0,4–0,5 ms</td><td>Medio · es nuestro código, sin riesgo de calidad</td></tr>
-      <tr><td class="n">4</td><td>Epílogo del kernel int4 (ALU por par key-query)</td><td class="n">4,02 ms</td><td class="n">0,4–0,8 ms</td><td>Alto · registros al límite (255, con derrame)</td></tr>
-      <tr><td class="n">5</td><td>Fusionar norm+quant y epílogos de Marlin</td><td class="n">1,33 ms</td><td class="n">0,4–0,7 ms</td><td>Bajo · ya existe en vLLM, hay que habilitarlo y medir</td></tr>
-      <tr><td class="n">6</td><td>GDN: estado recurrente diferido</td><td class="n">2,85 ms</td><td class="n">0,5–1,0 ms</td><td>Alto · toca el camino recurrente, delicado</td></tr>
-      <tr><td class="n">7</td><td>All-reduce fusionado con RMSNorm</td><td class="n">2,88 ms</td><td class="n">0–1,0 ms</td><td>Alto · en PCIe sin NVLink puede no dar nada</td></tr>
-      <tr><td class="n">8</td><td>Lineales del modelo (Marlin)</td><td class="n">9,01 ms</td><td class="n">~0</td><td>Ya está al 98–103 % del techo de DRAM</td></tr>
+      <tr><td class="n">1</td><td>Vocabulario recortado en el borrador MTP</td><td class="n">3,0 ms</td><td class="n">2,2–2,6 ms</td><td><span class="estado e-no">probado · no rinde</span></td><td>Medio · baja la aceptación si se recorta de más</td></tr>
+      <tr><td class="n">2</td><td>Cuantizar el módulo MTP (hoy fp16)</td><td class="n">2,26 ms</td><td class="n">1,5–1,7 ms</td><td><span class="estado e-no">probado · no rinde</span></td><td>Medio · hay que recalibrar y medir aceptación</td></tr>
+      <tr><td class="n">3</td><td>Unión: menos tráfico (no fusionarla)</td><td class="n">0,49 ms</td><td class="n">0,2 ms</td><td><span class="estado e-si">hecho</span></td><td>Medio · es nuestro código, sin riesgo de calidad</td></tr>
+      <tr><td class="n">4</td><td>Epílogo del kernel int4 (ALU por par key-query)</td><td class="n">3,79 ms</td><td class="n">0,2 ms</td><td><span class="estado e-si">hecho · −5 %</span></td><td>Alto · registros al límite (255, con derrame)</td></tr>
+      <tr><td class="n">5</td><td>Fusionar norm+quant y epílogos de Marlin</td><td class="n">1,33 ms</td><td class="n">0,4–0,7 ms</td><td><span class="estado e-parc">no engancha</span></td><td>Bajo · ya existe en vLLM, hay que habilitarlo y medir</td></tr>
+      <tr><td class="n">6</td><td>GDN: estado recurrente diferido</td><td class="n">2,85 ms</td><td class="n">0,5–1,0 ms</td><td><span class="estado e-med">pendiente</span></td><td>Alto · toca el camino recurrente, delicado</td></tr>
+      <tr><td class="n">7</td><td>All-reduce fusionado con RMSNorm</td><td class="n">2,91 ms</td><td class="n">0–1,0 ms</td><td><span class="estado e-parc">parcial</span></td><td>Alto · en PCIe sin NVLink puede no dar nada</td></tr>
+      <tr><td class="n">8</td><td>Lineales del modelo (Marlin)</td><td class="n">9,02 ms</td><td class="n">~0</td><td><span class="estado e-si">cerrado</span></td><td>Ya está al 98–103 % del techo de DRAM</td></tr>
     </tbody>
   </table>
   </div>
-  <p class="riesgo">Sumando 1 a 5 sin tocar lo riesgoso: entre 4,9 y 6,3 ms de los 29,6 → 17–21 % más
-  de decode, que sobre 158 tok/s serían ~185–190 tok/s.</p>
+  <p class="riesgo">Resultado real: de los ocho frentes, <strong>dos se hicieron</strong> (unión y
+  epílogo int4, ~0,4 ms), <strong>tres se midieron y no rinden</strong> (los dos del borrador MTP y la
+  fusión por configuración), <strong>dos son piso de hardware</strong> (all-reduce y Marlin) y
+  <strong>uno sigue sin probar</strong> (GDN diferido). Los dos grandes que prometían 4 ms resultaron ser
+  los que rompen la aceptación del MTP: el borrador es la parte del stack que menos tolera perder
+  precisión, y su costo no es kernel sino ancho de banda del lm_head.</p>
 </section>
 
 <section>
@@ -124,7 +141,19 @@
       <div class="riesgo">Riesgo: si el token correcto queda fuera del subconjunto, el borrador falla y
       baja la aceptación. VocabTrim reporta caídas chicas con vocabularios grandes; hay que barrer el
       tamaño del recorte contra nuestra aceptación de 90 %.</div>
-      <div class="fuentes">
+            <div class="riesgo" style="border-left:2px solid var(--acento); padding-left:12px">
+      <strong style="color:var(--tinta)">MEDIDO 16/09 · no rinde acá.</strong> Implementado como PN132
+      (<code>vllm/_genesis/mtp_vocab.py</code> + parche en <code>compute_logits</code> de los modelos MTP):
+      arma la lista de frecuentes con un corpus de calibración y guarda una copia propia de esas filas del
+      lm_head leídas del checkpoint. Con V'=16384 la aceptación cayó de <strong>89,7 % a 70,5 %</strong> y
+      el decode empeoró (141 tok/s a 57 k). La razón apareció en el camino: el lm_head de este modelo
+      <strong>ya está cuantizado a int8</strong> (635 MB por GPU, <code>weight</code> int32 de 320×496640
+      más <code>weight_scale</code>), así que una copia fp16 recortada solo ahorra con V' chico, y con V'
+      chico se rompe la propuesta. Para que sirviera habría que cuantizar también la cabeza recortada.
+      Queda apagado (<code>GENESIS_ENABLE_PN132_VOCAB=0</code>). Coincide con la literatura: el trabajo que
+      evalúa spec decoding + cuantización directamente no cuantiza el borrador y dice que su cuello es el
+      lm_head y el softmax.</div>
+<div class="fuentes">
         <a href="https://arxiv.org/pdf/2502.14856">FR-Spec: Frequency-Ranked Speculative Sampling</a>
         <a href="https://arxiv.org/pdf/2506.22694">VocabTrim: Vocabulary Pruning for Efficient Speculative Decoding</a>
         <a href="https://arxiv.org/pdf/2605.10453">SlimSpec: Low-Rank Draft LM-Head</a>
@@ -144,7 +173,17 @@
       el borrador entero (lineales + cabeza) pasa de ~5,3 ms a menos de 1 ms por paso.</p>
       <div class="riesgo">Riesgo: el borrador es más sensible que el modelo grande — su única métrica es
       la aceptación. Hay que medirla antes y después con la misma batería.</div>
-      <div class="fuentes">
+            <div class="riesgo" style="border-left:2px solid var(--tinta2); padding-left:12px">
+      <strong style="color:var(--tinta)">MEDIDO 16/09 · no rinde.</strong> Implementado como PN133
+      (<code>vllm/_genesis/mtp_int8.py</code>): 5 lineales del borrador a int8 con escala por canal de
+      salida y GEMM int8 de cutlass con activación int8 por token — 202 MiB en vez de 405. La aceptación
+      cayó de <strong>88,9 % a 81,9 %</strong> y el decode a 57 k a 135 tok/s. Cuantizando solo la matriz
+      más grande (85 MiB): aceptación 83,5 %, 159,4 a 57 k, corto 158,5 — sigue sin ganar. Apagado por
+      defecto. Es exactamente lo que advierte el paper: el borrador no tolera perder precisión. Dos
+      trampas del camino: vLLM comparte la instancia de <code>quant_method</code> entre capas (hay que
+      volver al método original si la capa no está cuantizada) y <code>cutlass_scaled_mm</code> quiere la
+      B como <code>[K,N]</code> columna-major</div>
+<div class="fuentes">
         <a href="https://arxiv.org/pdf/2508.15601">TurboMind: mixed-precision LLM inference (LMDeploy)</a>
         <a href="https://arxiv.org/pdf/2505.15909">¿Alcanza con round-to-nearest selectivo?</a>
       </div>
@@ -152,7 +191,7 @@
 
     <article class="ficha">
       <div class="cab"><h3>3 · La unión puede vivir adentro del kernel</h3>
-        <span class="hoy">sk18h_union4 · 0,49 ms/paso (1,7 %)</span>
+        <span class="hoy">sk18h_union4 · 0,52 ms/paso (1,7 %)</span>
         <span class="gana">−0,4 a −0,5 ms</span></div>
       <p>Hoy el kernel principal escribe un resultado parcial por página (máximo, suma y acumuladores de
       256 dimensiones) y un segundo kernel los une. Son 9 MB por capa que salen a memoria y vuelven a
@@ -162,14 +201,20 @@
       carrera de reescalado que ya nos costó cara (los acumuladores del mma no se tocan).</p>
       <div class="riesgo">Riesgo: bajo. Es código propio, y el test contra el emulador entero ya está
       escrito. El único cuidado es la ocupación: hoy el kernel usa 255 registros y 78 KB de shared.</div>
-      <div class="fuentes">
+            <div class="riesgo" style="border-left:2px solid var(--aviso); padding-left:12px">
+      <strong style="color:var(--tinta)">HECHO, por otro lado.</strong> Fusionar la unión adentro no
+      conviene: con páginas de 1632 tokens agrupar deja 6 bloques para 82 SMs y se pierde más por
+      paralelismo que lo que se gana en tráfico. Lo que sí se hizo: el máximo global se reparte entre los
+      32 lanes, y en int4 el O entra en un int32, así que el kernel escribe solo <code>oh</code> (las
+      ranuras del espejo siguen con hi/lo). Son 4,5 MB por capa que ya no van ni vuelven</div>
+<div class="fuentes">
         <a href="https://arxiv.org/html/2603.05451v1">FlashAttention-4: co-diseño de pipeline (el patrón, aunque apunte a Blackwell)</a>
       </div>
     </article>
 
     <article class="ficha">
       <div class="cab"><h3>4 · El epílogo del int4 hace 2,5× más cuentas que el del int8</h3>
-        <span class="hoy">sk18i_batch · 4,02 ms/paso (13,6 %)</span>
+        <span class="hoy">sk18i_batch · 3,79 ms/paso (12,8 %) tras la optimización</span>
         <span class="gana">−0,4 a −0,8 ms</span></div>
       <p>El int4 lee la mitad de bytes que el int8 y usa la mitad de instrucciones de mma, pero igual
       tarda más: el costo está en el epílogo por cada par (key, query), donde hay que combinar cuatro
@@ -185,7 +230,13 @@
       Vale la pena escribirlo: es una solución al problema que ese paper declara abierto.</p>
       <div class="riesgo">Riesgo: alto para la parte de registros (el kernel ya está en el límite), bajo
       para el precálculo por key.</div>
-      <div class="fuentes">
+            <div class="riesgo" style="border-left:2px solid var(--ok); padding-left:12px">
+      <strong style="color:var(--tinta)">HECHO 16/09.</strong> Se sacó el ratio por grupo de q: ahora usa
+      una sola escala por fila, como el camino int8. Son 4 registros y 4 multiplicaciones menos por par
+      (key, query). Derrame de registros <strong>584 → 276 bytes</strong>, kernel 0,294 → 0,279 ms
+      (−5 %), y el error no se movió (4,84 → 4,88 %). En el servidor: 12/12 agujas, 6/6 pocas, 0 tool
+      calls malformados, 158,3 tok/s a 57 k.</div>
+<div class="fuentes">
         <a href="https://arxiv.org/html/2604.19157v1">SAW-INT4: 4-bit KV-cache para serving real</a>
         <a href="https://arxiv.org/pdf/2510.05373">KVLinC: rotación Hadamard + corrección lineal</a>
         <a href="https://arxiv.org/pdf/2603.00040">Attn-QAT: atención de 4 bits con entrenamiento consciente</a>
@@ -204,7 +255,13 @@
       el tensor core está ocioso.</p>
       <div class="riesgo">Riesgo: bajo. Es configuración y medición, no kernels nuevos. Ojo con las
       guardas de elegibilidad: varias fusiones solo se activan por debajo de cierto número de tokens.</div>
-      <div class="fuentes">
+            <div class="riesgo" style="border-left:2px solid var(--aviso); padding-left:12px">
+      <strong style="color:var(--tinta)">MEDIDO 16/09 · los pases no enganchan.</strong> Con
+      <code>fuse_norm_quant</code> y <code>fuse_act_quant</code> en true, el perfil queda idéntico: los
+      mismos 256 lanzamientos de <code>_per_token_quant_int8</code> (579 µs contra 566). Con
+      <code>custom_ops: ['none']</code> y la cuantización propia de Marlin, el pase no encuentra el patrón.
+      Si se quiere esta ganancia hay que escribir el kernel fusionado a mano.</div>
+<div class="fuentes">
         <a href="https://docs.vllm.ai/en/stable/design/fusions/">vLLM · pases de fusión de torch.compile</a>
         <a href="https://arxiv.org/pdf/2606.11244">SPEAR: recuperación de error fusionada en el epílogo</a>
       </div>
@@ -230,7 +287,7 @@
 
     <article class="ficha tibia">
       <div class="cab"><h3>7 · All-reduce: el problema es la cantidad, no el tamaño</h3>
-        <span class="hoy">141 colectivas × 25,7 µs = 2,88 ms/paso (9,7 %)</span>
+        <span class="hoy">141 colectivas × 25,7 µs = 2,91 ms/paso (9,9 %)</span>
         <span class="gana">0 a −1,0 ms</span></div>
       <p>Ya medimos las dos vías obvias y las dos dieron cero: comprimir a int8 no sirve (los mensajes
       son de 40 KB, manda la latencia) y el custom all-reduce de vLLM dentro del grafo cuesta
@@ -240,7 +297,12 @@
       de esa fusión para pocos tokens. <strong>SiFAR</strong> ataca la sincronización misma.</p>
       <div class="riesgo">Riesgo: alto, y con techo. En decode hay poco cómputo con qué tapar la
       comunicación, que es justo lo que TokenWeave señala como el caso difícil.</div>
-      <div class="fuentes">
+            <div class="riesgo" style="border-left:2px solid var(--aviso); padding-left:12px">
+      <strong style="color:var(--tinta)">MEDIDO 16/09.</strong> El custom all-reduce de vLLM ahora sí entra
+      dentro de los grafos (<code>GENESIS_B3_CAPTURA=1</code>, sin cumem): NCCL pasa de 4.439 a 508 µs por
+      paso… y el custom cuesta 3.618 µs, o sea <strong>25,7 µs por llamada, lo mismo que NCCL</strong>.
+      Queda activado porque igual ahorra ~300 µs. Sin probar: la fusión AllReduce+RMSNorm tipo TokenWeave.</div>
+<div class="fuentes">
         <a href="https://arxiv.org/pdf/2505.11329">TokenWeave: solape cómputo-comunicación</a>
         <a href="https://arxiv.org/html/2607.08973v1">SiFAR: all-reduce sin sincronización</a>
         <a href="https://arxiv.org/pdf/2511.09557">Comunicación en inferencia multi-nodo: por qué NCCL sufre con mensajes chicos</a>
@@ -249,7 +311,7 @@
 
     <article class="ficha fria">
       <div class="cab"><h3>8 · Las lineales ya están en el techo</h3>
-        <span class="hoy">marlin::Marlin · 9,01 ms/paso (30,4 %)</span>
+        <span class="hoy">marlin::Marlin · 9,02 ms/paso (30,6 %)</span>
         <span class="gana">~0</span></div>
       <p>Medido: 98-103 % del techo de DRAM sostenido de las placas capadas a 220 W. No hay kernel que
       lo mejore, solo menos bytes. Las opciones de menos bytes ya las probamos y fallaron: 2:4 en pesos
@@ -270,6 +332,11 @@
 <section>
   <h2>Lo que ya probamos y no va</h2>
   <ul>
+    <li><strong>Vocabulario recortado del borrador</strong>: aceptación 89,7 % → 70,5 % (el lm_head ya está en int8).</li>
+    <li><strong>Lineales del borrador en W8A8</strong>: aceptación 88,9 % → 81,9 % (83,5 % cuantizando solo la matriz grande).</li>
+    <li><strong>Pases de fusión de torch.compile</strong> (<code>fuse_norm_quant</code>, <code>fuse_act_quant</code>): no enganchan, perfil idéntico.</li>
+    <li><strong>Agrupar páginas en el kernel de atención</strong>: mata el paralelismo (6 bloques para 82 SMs).</li>
+    <li><strong>Márgenes más holgados en la referencia int4</strong> (32/64 en vez de 8/16): la salida se degenera.</li>
     <li><strong>All-reduce int8 en decode</strong>: los mensajes son de 40 KB; es latencia, no ancho de banda.</li>
     <li><strong>Custom all-reduce en vez de NCCL</strong>: 25,7 µs por llamada, idéntico. Queda activado igual porque ahorra ~300 µs/paso de NCCL residual.</li>
     <li><strong>MTP K=5</strong>: la aceptación cae a 82,8 % y la atención cuesta el doble (36 filas no entran en bloques de 32). K=4 es el punto.</li>
@@ -282,10 +349,11 @@
 <section>
   <h2>Método y fechas</h2>
   <p class="riesgo">Las ganancias estimadas salen de aplicar el factor que reporta cada trabajo al tiempo
-  que ya medimos en nuestro perfil (decode 57 k, int4, MTP K=4, 60 pasos, rank 0), no de correr esos
+  que ya medimos en nuestro perfil (decode 57 k, int4, MTP K=4, 60 pasos, rank 0; traza <code>int4_v2</code> del 16/09), no de correr esos
   trabajos. Las búsquedas son de septiembre de 2026; los papers citados van de 2024 a agosto de 2026.
   Todo lo de "ya probamos" está medido en este mismo servidor con la misma batería
   (pocas, suite de calidad, 12 agujas a 57 k, aceptación MTP, PP a 42 k).</p>
-  <footer>Genesis · PN131 / SK-18 · informe de mejoras · 16 de septiembre de 2026</footer>
+  <footer>Genesis · PN131 / SK-18 · informe de mejoras · actualizado el 16 de septiembre de 2026 con los
+  resultados de los frentes 1 a 5 y 7; queda sin probar el 6 (GDN diferido)</footer>
 </section>
 </div>
