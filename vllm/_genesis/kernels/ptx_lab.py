@@ -133,6 +133,8 @@ class Kernel:
                 vals.append(ctypes.c_uint64(v.data_ptr()))
             elif isinstance(v, float):
                 vals.append(ctypes.c_float(v))
+            elif isinstance(v, ctypes._SimpleCData):
+                vals.append(v)          # puntero crudo o tipo elegido a mano, va tal cual
             else:
                 vals.append(ctypes.c_int32(int(v)))
         arr = (ctypes.c_void_p * len(vals))(
