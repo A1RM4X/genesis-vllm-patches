@@ -493,12 +493,29 @@ __device__ inline void dequant<__nv_fp8x4_e4m3, vllm::kFE2M1f.id(), true>(
 template <>
 __device__ inline void dequant<int32_t, vllm::kU4B8.id(), true>(
     int q, int32_t* frag_b) {
+#ifdef GENESIS_QSERVE_CRUDO
+  // PN140 (metodo de QServe, arXiv 2405.04532): el nibble va CRUDO al tensor core, en [0,15], y
+  // el offset de 8 se corrige DESPUES sobre el acumulador:
+  //
+  //     suma_k a_k*(q_k - 8)*s  ==  s * [ suma_k a_k*q_k  -  8*suma_k a_k ]
+  //
+  // Es sacar factor comun, no una aproximacion: el resultado es bit a bit el mismo. Se ahorran
+  // las cinco instrucciones que existen solo para pasar de [0,15] a [-8,7] (el |MASK, el -zp y
+  // el ^MASK, dos veces), y el desempaque queda en dos: and y shr. Medido aislado, 1,92x.
+  //
+  // El precio esta afuera: hace falta suma_k a_k por fila y por grupo, y restar
+  // 8 * suma_a * escala. Eso es un GEMM de [M, K/G] x [K/G, N] — con K/G = 40 contra K = 5120,
+  // el 0,78% del trabajo del GEMM principal — asi que se hace aparte y el pipeline no se toca.
+  frag_b[0] = q & 0x0F0F0F0F;
+  frag_b[1] = (q >> 4) & 0x0F0F0F0F;
+#else
   constexpr int repeated_zp = 0x08080808;
   constexpr int MASK = 0x80808080;
 
   frag_b[0] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
   q >>= 4;
   frag_b[1] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
+#endif
 }
 
 template <>
