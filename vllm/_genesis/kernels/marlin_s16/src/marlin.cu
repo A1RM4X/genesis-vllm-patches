@@ -136,6 +136,24 @@ typedef struct {
   int num_threads;
 } thread_config_t;
 
+// Tope de bloques por SM. El reparto de stripes del kernel ya es generico en gridDim.x — no usa
+// sms en ningun lado — y los dos buffers que el host dimensionaba con sms (C_tmp y el workspace
+// de locks) estan arreglados, asi que 2 FUNCIONA y da resultados bit a bit identicos.
+//
+// Queda igual en 1 porque MIDIENDOLO no sirve. El barrido aislado prometia (M=160: 283 -> 239 us,
+// M=256: 406 -> 307) pero en el servidor ese M no existe: el decode con MTP usa M = 5 x pedidos,
+// o sea 5 a 30, y el prefill parte M en trozos de 64 filas por el camino de par_count. Medido
+// punta a punta con 2 bloques:
+//
+//     prefill      2420 tok/s   contra 2440
+//     decode       173,9        contra 179,9
+//     6 pedidos    446,2        contra 503,3      <-- 11% PEOR
+//
+// Con el doble de bloques para el mismo trabajo hay mas sincronizacion entre bloques, y eso se
+// come de sobra lo que aporta la ocupacion. Subirlo a 2 es correcto pero mas lento: no es una
+// cuestion de terminar de afinarlo.
+constexpr int MAX_BLOQUES_POR_SM = 1;
+
 thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
 
@@ -333,19 +351,16 @@ exec_config_t determine_exec_config(
 
     if (kernel == MarlinDefault) continue;
 
-    // blocks_per_sm se queda en 1, y NO es por falta de shared: la config del decode usa 41 KB
-    // de los 99 que el lanzamiento reserva (max_shared_mem / blocks_per_sm), o sea que tira 58 KB
-    // por bloque y se queda en 8 warps de 48 — 17% de ocupacion.
-    //
-    // Subirlo a 2 se probo y da ILLEGAL MEMORY ACCESS. La causa no es el workspace (se le agrego
-    // la guarda de abajo y sigue fallando con un workspace de sobra): es que `blocks` sale de
-    // sms * blocks_per_sm, y Marlin es un kernel PERSISTENTE cuyo reparto de stripes y su
-    // aritmetica de slices asumen gridDim == sms. Duplicar el grid es rediseñar el reparto, no
-    // cambiar una constante.
-    //
-    // Queda anotado porque el margen es real — en el barrido, con 2 bloques, M=256 bajaba de 406
-    // a 331 us — pero pide trabajo de verdad sobre init_slice() y los locks.
-    int por_sm = 1;
+    // Cuantos bloques entran por SM. Estaba clavado en 1 y el cache_size que se calcula arriba no
+    // se usaba: como el lanzamiento pide max_shared_mem / blocks_per_sm, el kernel se reservaba
+    // TODA la shared del SM aunque no la necesitara. Medido en la config del decode: usa 41 KB,
+    // pedia 99, y se quedaba en 8 warps de 48 (17% de ocupacion).
+    int por_sm = max_shared_mem / (cache_size + 1024);
+    if (por_sm < 1) por_sm = 1;
+    if (por_sm > MAX_BLOQUES_POR_SM) por_sm = MAX_BLOQUES_POR_SM;
+    // Y nunca mas bloques que slots de lock tenga el workspace: lo dimensiona el llamador con
+    // marlin_make_workspace_new(device, max_blocks_per_sm), que por defecto da sms. Si es chico,
+    // se vuelve a 1 en vez de escribir fuera.
     while (por_sm > 1 && (int64_t)sms * por_sm > workspace_slots) por_sm--;
 
     return {por_sm, th_config};
@@ -755,8 +770,11 @@ torch::stable::Tensor marlin_gemm(
   if (use_fp32_reduce) {
     int max_m_block_size = (size_m + 16 - 1) / 16 * 16;
     max_m_block_size = min(max_m_block_size, 64);
-    int max_c_tmp_size =
-        sms * max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n;
+    // sms * MAX_BLOQUES_POR_SM y no sms a secas: cada BLOQUE escribe su parcial aca, y el grid
+    // es sms * blocks_per_sm. Dimensionarlo con sms era la causa del illegal memory access al
+    // subir blocks_per_sm — los bloques de arriba escribian fuera.
+    int max_c_tmp_size = sms * MARLIN_NAMESPACE_NAME::MAX_BLOQUES_POR_SM *
+                         max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n;
     c_tmp = torch::stable::empty({max_c_tmp_size},
                                  torch::headeronly::ScalarType::Float,
                                  std::nullopt, device);
@@ -904,6 +922,10 @@ torch::stable::Tensor marlin_gemm(
                   "size_n = ", size_n, ", is not divisible by min_thread_n = ",
                   MARLIN_NAMESPACE_NAME::min_thread_n);
 
+  // sms y no sms * MAX_BLOQUES_POR_SM a proposito: el workspace CHICO es valido, lo unico que
+  // implica es que determine_exec_config se queda en un bloque por SM (ahi esta la guarda que lo
+  // baja). Lo que seria un bug es al reves — dejar pasar un workspace mas chico que el grid —, y
+  // de eso se ocupa esa guarda, no este chequeo.
   int min_workspace_size = sms;
   STD_TORCH_CHECK(workspace.numel() >= min_workspace_size,
                   "workspace.numel = ", workspace.numel(),
