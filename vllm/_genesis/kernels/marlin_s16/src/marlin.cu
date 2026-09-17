@@ -64,6 +64,7 @@ torch::stable::Tensor marlin_gemm(
     std::optional<torch::stable::Tensor> const& b_zeros_or_none,
     std::optional<torch::stable::Tensor> const& g_idx_or_none,
     std::optional<torch::stable::Tensor> const& perm_or_none,
+    std::optional<torch::stable::Tensor> const& a_sums_or_none,
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool is_k_full,
     bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
@@ -372,7 +373,7 @@ exec_config_t determine_exec_config(
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
                void* perm, void* a_tmp, int prob_m, int prob_n, int prob_k,
-               int lda, void* workspace, int64_t workspace_slots,
+               int lda, void* workspace, int64_t workspace_slots, const void* a_sums,
                vllm::ScalarType const& a_type,
                vllm::ScalarType const& b_type, vllm::ScalarType const& c_type,
                vllm::ScalarType const& s_type, bool has_bias,
@@ -410,9 +411,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   const int4* B_ptr = (const int4*)B;
   int4* C_ptr = (int4*)C;
   int4* C_tmp_ptr = (int4*)C_tmp;
-  // PN140: todavia nullptr — la infraestructura esta puesta pero la correccion del offset no se
-  // aplica, asi que el kernel sigue dando exactamente lo mismo que antes.
-  const int* a_sums_ptr = nullptr;
+  const int* a_sums_ptr = (const int*)a_sums;
 
   const int4* bias_ptr = (const int4*)b_bias;
   const float* a_s_ptr = (const float*)a_s;
@@ -614,6 +613,7 @@ torch::stable::Tensor marlin_gemm(
     std::optional<torch::stable::Tensor> const& b_zeros_or_none,
     std::optional<torch::stable::Tensor> const& g_idx_or_none,
     std::optional<torch::stable::Tensor> const& perm_or_none,
+    std::optional<torch::stable::Tensor> const& a_sums_or_none,
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool is_k_full,
     bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
@@ -954,7 +954,9 @@ torch::stable::Tensor marlin_gemm(
       global_scale.mutable_data_ptr(), b_zeros.mutable_data_ptr(),
       g_idx.mutable_data_ptr(), perm.mutable_data_ptr(),
       a_tmp.mutable_data_ptr(), size_m, size_n, size_k, a.stride(0),
-      workspace.mutable_data_ptr(), workspace.numel(), a_type, b_type, c_type,
+      workspace.mutable_data_ptr(), workspace.numel(),
+      a_sums_or_none.has_value() ? a_sums_or_none->const_data_ptr() : nullptr,
+      a_type, b_type, c_type,
       s_type, has_bias,
       has_act_order, is_k_full, has_zp, num_groups, group_size, device_index,
       get_current_cuda_stream(device_index), thread_k, thread_n, sms,
@@ -972,7 +974,8 @@ STABLE_TORCH_LIBRARY(genesis_marlin, m) {
       "Tensor? b_bias_or_none,Tensor b_scales, "
       "Tensor? a_scales, Tensor? global_scale, Tensor? b_zeros_or_none, "
       "Tensor? "
-      "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_type_id, "
+      "g_idx_or_none, Tensor? perm_or_none, Tensor? a_sums_or_none, "
+      "Tensor workspace, int b_type_id, "
       "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
       "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
 }

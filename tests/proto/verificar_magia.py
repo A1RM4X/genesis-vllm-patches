@@ -29,8 +29,14 @@ for N, H in FORMAS:
         x = (torch.randn(M, H, device=dev) * 20).round().clamp(-127, 127).to(torch.int8)
         a_s = torch.full((M, 1), 1 / 127, dtype=torch.float32, device=dev)
         ws.zero_()
+        # PN140: cuando el kernel se compila con el desempaque crudo hace falta pasarle
+        # suma_k a_k por (grupo, fila), en el layout [K/G, M] para que avanzar un grupo sea
+        # sumar M — el analogo del stride de las escalas.
+        sumas = None
+        if os.environ.get("PN140") == "1":
+            sumas = x.to(torch.int32).reshape(M, H // G, G).sum(2).t().contiguous()
         o = torch.ops.genesis_marlin.marlin_gemm_s16(
-            x, None, b_q, None, b_s16, a_s, None, None, vacio, vacio, ws,
+            x, None, b_q, None, b_s16, a_s, None, None, vacio, vacio, sumas, ws,
             scalar_types.uint4b8.id, M, N, H, True, False, True, False)
         torch.save(o.float().cpu(), f"/tmp/ref_{N}_{M}.pt" if os.environ.get("GUARDAR")
                    else "/dev/null")

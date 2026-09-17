@@ -21,9 +21,13 @@ for M in (5,64,70,80,88,96,104,112,128,144,160,256):
     x=torch.randn(M,H,dtype=torch.float16,device=dev)*0.1
     xq=(x*127).round().clamp(-127,127).to(torch.int8)
     a_s=torch.full((M,1),1/127,dtype=torch.float32,device=dev)
+    # PN140: las sumas van precalculadas — en produccion las emite el kernel que cuantiza la
+    # activacion, que ya recorre A entera, asi que no entran en el tiempo del GEMM.
+    sumas = (xq.to(torch.int32).reshape(M, H // G, G).sum(2).t().contiguous()
+             if os.environ.get("PN140") == "1" else None)
     try:
         t=medir(lambda: torch.ops.genesis_marlin.marlin_gemm_s16(
-            xq,None,b_q,None,b_s16,a_s,None,None,vacio,vacio,ws,
+            xq,None,b_q,None,b_s16,a_s,None,None,vacio,vacio,sumas,ws,
             scalar_types.uint4b8.id,M,N,H,True,False,True,False), 30)
         if M==5: base=t
         print(f"{M:5d}{t:9.1f}{nb/t/1e3:9.1f}{t/base:8.2f}x")

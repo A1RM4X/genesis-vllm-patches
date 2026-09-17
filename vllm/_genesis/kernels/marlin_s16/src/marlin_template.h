@@ -392,8 +392,11 @@ __global__ void Marlin(
   // PN140: las sumas de A por fila del tile, para el grupo de K que se esta procesando. Va
   // pegado a sh_a_s y con el mismo tamaño (16 * thread_m_blocks entradas), asi que se puede
   // indexar igual. Son 64 bytes por m_block: al lado de los 41 KB que ya usa el kernel, nada.
+  // Un buffer por etapa del pipeline, igual que las escalas del peso: stages * m_block_size
+  // enteros = stages * 16 * tm * 4 bytes, o sea 4 * stages * tm int4.
   int* sh_a_sum = reinterpret_cast<int*>(sh + (is_a_8bit ? (4 * thread_m_blocks) : 0));
-  int4* sh_new = sh + (is_a_8bit ? (8 * thread_m_blocks) : 0);
+  int4* sh_new =
+      sh + (is_a_8bit ? (4 * thread_m_blocks + 4 * stages * thread_m_blocks) : 0);
   constexpr int pack_factor = 32 / b_type.size_bits();
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
 
@@ -597,6 +600,9 @@ __global__ void Marlin(
           : 1;
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
   int s_gl_rd_delta = s_gl_stride;
+  // PN140: las sumas de A se guardan [K/G, M], asi que avanzar un grupo es sumar m_block_size —
+  // el analogo exacto de s_gl_rd, que avanza s_gl_stride por grupo.
+  int a_sums_gl_rd = 0;
 
   // Scale size/strides with act_order
   constexpr int tb_k = 16 * thread_k_blocks;
@@ -657,6 +663,7 @@ __global__ void Marlin(
     if constexpr (group_blocks == -1) {
       s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
     } else if constexpr (group_blocks >= thread_k_blocks) {
+      a_sums_gl_rd = ((thread_k_blocks * slice_row) / group_blocks) * m_block_size;
       s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
                 s_sh_stride * slice_col + threadIdx.x;
     } else {
@@ -916,7 +923,13 @@ __global__ void Marlin(
             if (s_sh_wr_pred) {
               cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
+            // PN140: la suma de A del mismo grupo, en la misma etapa del pipeline
+            if (a_sums_ptr != nullptr && threadIdx.x < m_block_size) {
+              sh_a_sum[m_block_size * pipe + threadIdx.x] =
+                  a_sums_ptr[a_sums_gl_rd + threadIdx.x];
+            }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
+            a_sums_gl_rd += m_block_size * s_tb_groups;
           }
         }
 
@@ -1322,8 +1335,18 @@ __global__ void Marlin(
     }
   };
 
-  auto matmul_a8 = [&](int k) {
+  // PN140: recibe `pipe` porque la correccion del offset lee la suma de A de la etapa
+  // correspondiente del pipeline, igual que las escalas del peso.
+  auto matmul_a8 = [&](int k, int pipe) {
     int k2 = k % 2;
+    // PN140: la correccion del offset depende de la FILA y del grupo, nunca de j. Calcularla
+    // adentro del lazo de j la repetia cuatro veces, con su lectura de shared cada vez.
+    int corr[2 * thread_m_blocks];
+    if (a_sums_ptr != nullptr) {
+  #pragma unroll
+      for (int h = 0; h < 2 * thread_m_blocks; h++)
+        corr[h] = 8 * sh_a_sum[m_block_size * pipe + h * 8 + (threadIdx.x % 32) / 4];
+    }
   #pragma unroll
     for (int j = 0; j < 2; j++) {
       FragB frag_b[2];
@@ -1373,11 +1396,16 @@ __global__ void Marlin(
 
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
+              // PN140 (QServe): con el nibble crudo el mma dio suma_k a_k*q_k, con q en [0,15],
+              // asi que sobra 8*suma_k a_k. Se resta ANTES de multiplicar por la escala: el
+              // termino que sobra es ~17x el resultado, y multiplicarlo primero haria crecer el
+              // intermedio sin necesidad. corr ya viene calculado arriba, fuera del lazo de j.
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
                 *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
-                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
+                    (*reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) -
+                     corr[i * 2 + g / 2]) *
                     scale;
                 frag_c_tmp[i][j][0][g] = 0.0f;
               }
@@ -1386,7 +1414,8 @@ __global__ void Marlin(
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
                 *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
-                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
+                    (*reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) -
+                     corr[i * 2 + g / 2]) *
                     scale;
                 frag_c_tmp[i][j][1][g] = 0.0f;
               }
@@ -1850,7 +1879,7 @@ __global__ void Marlin(
           matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
         } else {
           static_assert(group_blocks != 0 && group_blocks != 1);
-          matmul_a8(k);
+          matmul_a8(k, pipe);
         }
       }
       slice_iters--;
