@@ -43,6 +43,16 @@ __device__ __forceinline__ void dequant_marlin_mas_escala(int q, int s, int* out
   out[1] = (((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK) * s;
 }
 
+// ── 4) QServe: el nibble va CRUDO al tensor core, el offset se corrige en el acumulador ─────
+// w = (q - 8) * s  =>  suma_k a_k*w_k = s * [ suma_k a_k*q_k  -  8 * suma_k a_k ]
+// El mma hace la primera suma con q en [0,15] (positivos, validos como int8) y el "-8*suma(a)"
+// se aplica UNA vez por acumulador, no por elemento. Es algebra exacta: cero perdida, a
+// diferencia de LiquidQuant que paga 3,85% de error por meter la escala en el IMAD.
+__device__ __forceinline__ void dequant_qserve(int q, int* out) {
+  out[0] = q & 0x0F0F0F0F;
+  out[1] = (q >> 4) & 0x0F0F0F0F;
+}
+
 template <int MODO>
 __global__ void banco(const int* __restrict__ entrada, int* __restrict__ salida, int n) {
   int acc0 = 0, acc1 = 0;
@@ -56,6 +66,7 @@ __global__ void banco(const int* __restrict__ entrada, int* __restrict__ salida,
     if constexpr (MODO == 0) dequant_marlin(q ^ i, out);
     if constexpr (MODO == 1) dequant_liquid(q ^ i, s, a, out);
     if constexpr (MODO == 2) dequant_marlin_mas_escala(q ^ i, s, out);
+    if constexpr (MODO == 3) dequant_qserve(q ^ i, out);
     acc0 += out[0];
     acc1 += out[1];
   }
@@ -88,6 +99,7 @@ int main() {
   float t0 = medir<0>(d_in, d_out, n, bloques, hilos);
   float t1 = medir<1>(d_in, d_out, n, bloques, hilos);
   float t2 = medir<2>(d_in, d_out, n, bloques, hilos);
+  float t3 = medir<3>(d_in, d_out, n, bloques, hilos);
 
   double elem = (double)bloques * hilos * REP * 8;  // 8 elementos por vuelta
   printf("desempaque int4 -> int8, %d bloques x %d hilos x %d vueltas\n", bloques, hilos, REP);
@@ -97,7 +109,10 @@ int main() {
          elem / (t1 * 1e6), "and/imad/xor");
   printf("  %-34s %8.3f ms   %6.2f Gelem/s   %s\n", "Marlin + escala aparte", t2,
          elem / (t2 * 1e6), "and/or/sub/xor/mul");
-  printf("\n  LiquidQuant contra Marlin+escala: %.2fx\n", t2 / t1);
+  printf("  %-34s %8.3f ms   %6.2f Gelem/s   %s\n", "QServe (nibble crudo, exacto)", t3,
+         elem / (t3 * 1e6), "and/shr");
+  printf("\n  LiquidQuant contra Marlin (sin escala): %.2fx   (cuesta 3,85%% de error)\n", t0 / t1);
+  printf("  QServe      contra Marlin (sin escala): %.2fx   (exacto, sin perdida)\n", t0 / t3);
   cudaFree(d_in);
   cudaFree(d_out);
   return 0;
