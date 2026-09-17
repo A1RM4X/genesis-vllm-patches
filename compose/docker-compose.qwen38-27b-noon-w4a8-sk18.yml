@@ -291,7 +291,7 @@ services:
       - GENESIS_PN131_QPLANOS=${PN131_QPLANOS:-2}   # int4: q int8 en dos planos de nibbles
       - GENESIS_PN131_PLANOSA=${PN131_PLANOSA:-1}   # int4: planos en la pasada del maximo
       - GENESIS_PN131_VENTANA=${PN131_VENTANA:-2}   # int4: paginas de la ventana reciente en int8
-      - GENESIS_PN131_MAXTOK=${PN131_MAXTOK:-5}     # tokens por pedido en el decode uniforme (MTP K+1)
+      - GENESIS_PN131_MAXTOK=${PN131_MAXTOK:-}     # tokens por pedido en el decode uniforme (MTP K+1)
       - GENESIS_PN131_MARGENK4=${PN131_MK4:-8}      # int4: margen de la referencia de K
       - GENESIS_PN131_MARGEN4=${PN131_M4:-16}       # int4: margen de la referencia de V
       - GENESIS_PN131_SCH=${PN131_SCH:-8}           # int4: trozos por pagina espejada (paralelismo)

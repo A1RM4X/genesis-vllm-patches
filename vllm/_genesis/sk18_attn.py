@@ -49,7 +49,49 @@ QD = 256
 # Filas por (secuencia, cabeza KV): multiplo de 32 (BQ del kernel) que entre los L*G queries
 # del decode. Con MTP K=3 y 6 cabezas Q por KV son 24; K=4 -> 30; K=5 -> 36, y ahi hace falta 64
 # (dos bloques por secuencia-cabeza, la grilla sale sola de R = gridDim.y * BQ).
-MAX_TOK_DECODE = int(os.environ.get("GENESIS_PN131_MAXTOK", 5))
+def _max_tok_decode() -> int:
+    """Tokens por pedido que el camino de decode entero se banca: K+1 del MTP.
+
+    Sale de la config de vLLM, NO de una constante. Cuando estaba clavado en 5, subir el MTP a
+    K>=5 hacia que el decode se pasara del tope y cayera al camino de PREFILL, que planifica
+    FlashInfer con tensores de CPU => "Cannot copy between CPU and CUDA tensors during CUDA graph
+    capture" y el server no arrancaba. El sintoma no se parecia en nada a la causa.
+    """
+    global _MTD
+    if _MTD is not None:
+        return _MTD
+    v = os.environ.get("GENESIS_PN131_MAXTOK")
+    if v:
+        _MTD = int(v)
+        return _MTD
+    try:
+        from vllm.config import get_current_vllm_config
+        spec = get_current_vllm_config().speculative_config
+        if spec is not None and spec.num_speculative_tokens:
+            _MTD = int(spec.num_speculative_tokens) + 1
+            log.info("PN131: tope del decode entero = %d tokens por pedido (MTP K=%d)",
+                     _MTD, _MTD - 1)
+            return _MTD
+    except Exception:
+        pass
+    # La config global puede no tener todavia el speculative_config segun cuando se pregunte, asi
+    # que la segunda fuente es la linea de comandos, que siempre esta.
+    try:
+        import re as _r
+        import sys as _s
+        linea = " ".join(_s.argv)
+        m = _r.search(r'"num_speculative_tokens"\s*:\s*(\d+)', linea)
+        if m:
+            _MTD = int(m.group(1)) + 1
+            log.info("PN131: tope del decode entero = %d tokens por pedido (MTP K=%d, de argv)",
+                     _MTD, _MTD - 1)
+            return _MTD
+    except Exception:
+        pass
+    return 5          # sin cachear: puede ser que la config todavia no exista
+
+
+_MTD = None
 MB = 32
 ZSH = 13
 ZSH4 = int(os.environ.get("GENESIS_PN131_ZSH4", 16))   # int4: z = (sum_g acc_g*rq_g*rk_g*kmax) >> ZSH4
@@ -246,7 +288,7 @@ def _lado(c, dev, bmax, nh, bs):
 class _Bufs:
     def __init__(self, dev, bmax, nchmax, nh, bs=832, G=6):
         self.bmax, self.nchmax, self.nh, self.bs = bmax, nchmax, nh, bs
-        self.MB = ((MAX_TOK_DECODE * G + 31) // 32) * 32
+        self.MB = ((_max_tok_decode() * G + 31) // 32) * 32
         MB = self.MB
         R = bmax * nh * MB
         NG = (nchmax + CPG - 1) // CPG
@@ -273,7 +315,7 @@ class _Bufs:
         self.os = z(nchx * R, dt=torch.int32)
         self.Og = z(NG * R * QD, dt=torch.int64)
         self.Sg = z(NG * R, dt=torch.int64)
-        self.ar = torch.arange(MAX_TOK_DECODE, device=dev, dtype=torch.int32)
+        self.ar = torch.arange(_max_tok_decode(), device=dev, dtype=torch.int32)
         mb = (self.oh.numel() + self.ol.numel()) * 4 / 2**20
         log.info("PN131 buffers: bmax=%d nchmax=%d MB=%d (%.0f MiB de acumuladores)", bmax, nchmax, MB, mb)
 
@@ -412,7 +454,7 @@ def forward(impl, layer, query, kv_cache, md, output):
         qsl = qsl.numpy() if hasattr(qsl, "numpy") else np.asarray(qsl)
         nreq = len(qsl) - 1
         qlen = np.diff(qsl)[:nreq]
-        if nreq > 0 and qlen.max() <= MAX_TOK_DECODE and qlen.min() >= 1:
+        if nreq > 0 and qlen.max() <= _max_tok_decode() and qlen.min() >= 1:
             L = int(qlen.max())
             if bool((qlen == L).all()):
                 capturando = torch.cuda.is_current_stream_capturing()
