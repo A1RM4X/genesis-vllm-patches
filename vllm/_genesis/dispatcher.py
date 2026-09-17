@@ -1289,6 +1289,25 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN137": {
+        "title": "Suavizado por grupo plegado en los pesos (SmoothQuant exacto)",
+        "env_flag": "GENESIS_ENABLE_PN137_SUAVE",
+        "default_on": False,
+        "category": "kernels",
+        "credit": (
+            "Genesis-original 2026-09-17. Con group_size=128 y desc_act=False, "
+            "un factor de suavizado constante dentro del grupo se pliega EXACTO: "
+            "en el peso alcanza con multiplicar la escala de grupo que el "
+            "checkpoint ya guarda, y del lado de la activacion se pliega en la "
+            "RMSNorm previa. Cero costo en ejecucion y sin re-cuantizar nada. "
+            "Medido sobre activaciones reales, el error relativo baja de 0,1416 "
+            "a 0,0296 en qkv_proj, de 0,0812 a 0,0337 en in_proj_qkvz y de "
+            "0,0570 a 0,0275 en gate_up: 2-4,8x MAS preciso que el dinamico por "
+            "token, que ademas deja de hacer falta."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN136": {
         "title": "All-reduce del MLP solapado con el computo (P2P directo)",
         "env_flag": "GENESIS_ENABLE_PN136_MLP_SOLAPADO",

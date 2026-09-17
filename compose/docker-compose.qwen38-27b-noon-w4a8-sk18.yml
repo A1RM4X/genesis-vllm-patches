@@ -271,6 +271,11 @@ services:
       - GENESIS_ESCALA_ESTATICA=${ESCEST:-0}
       - GENESIS_ESCALA_ARCHIVO=${ESCEST_ARCHIVO:-/escalas/escalas.json}
       - GENESIS_ESCALA_SITIOS=${ESCEST_SITIOS:-qkv_proj,in_proj_qkvz,gate_up_proj}
+      # PN137: suavizado por grupo plegado en las escalas del GPTQ y en la RMSNorm previa.
+      # Exacto, todo en boot, cero costo en ejecucion, y mas preciso que el dinamico.
+      - GENESIS_ENABLE_PN137_SUAVE=${PN137:-0}
+      - GENESIS_SUAVE_ARCHIVO=${PN137_ARCHIVO:-/escalas/suave.json}
+      - GENESIS_SUAVE_SOLO_PLIEGUE=${PN137_SOLO_PLIEGUE:-0}
       - GENESIS_ENABLE_PN136_MLP_SOLAPADO=${PN136:-0}
       - GENESIS_PN136_TROZOS=${PN136_TROZOS:-4}
       - GENESIS_PN136_M_MIN=${PN136_MMIN:-1024}

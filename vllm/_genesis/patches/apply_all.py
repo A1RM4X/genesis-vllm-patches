@@ -2464,6 +2464,24 @@ def apply_patch_actstats() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN137 suavizado por grupo")
+def apply_patch_N137_suave() -> PatchResult:
+    """PN137: suavizado por grupo plegado en las escalas del GPTQ y en la RMSNorm."""
+    name = "PN137 suavizado por grupo"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kernels import patch_PN137_suave
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN137_suave.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN136 MLP solapado")
 def apply_patch_N136_mlp_solapado() -> PatchResult:
     """PN136: el all-reduce del MLP viaja mientras se calcula el resto del bloque."""
