@@ -34,6 +34,8 @@
                     std::is_same<scalar_t, nv_bfloat16>::value, \
                 "only float16 and bfloat16 is supported");
 
+#include <type_traits>
+
 namespace MARLIN_NAMESPACE_NAME {
 
 // Division por un invariante, en enteros.
@@ -1450,14 +1452,19 @@ __global__ void Marlin(
               int red_sh_wr =
                   red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
               if (i < red_off) {
-                float* c_rd = reinterpret_cast<float*>(
+                // ACUM es int32 en el camino W4A8: los parciales que se juntan aca son de la
+                // misma fila y la misma columna, solo de tramos distintos de K, asi que la suma
+                // entera da el MISMO total que daria sumarlos dentro de un warp — que es lo que
+                // el kernel ya hace unas lineas mas arriba. No cambia el rango ni el redondeo.
+                using ACUM = std::conditional_t<is_a_8bit && a_type == vllm::kS8, int32_t, float>;
+                ACUM* c_rd = reinterpret_cast<ACUM*>(
                     &sh_red[red_sh_delta * j + red_sh_rd]);
-                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+                ACUM* c_wr = reinterpret_cast<ACUM*>(&sh_red[red_sh_wr]);
+                ACUM* acc = reinterpret_cast<ACUM*>(
+                    &reinterpret_cast<FragC*>(
+                        frag_c)[(is_a_8bit ? 2 : 4) * 2 * m_block + j]);
   #pragma unroll
-                for (int k = 0; k < 4; k++)
-                  reinterpret_cast<FragC*>(
-                      frag_c)[(is_a_8bit ? 2 : 4) * 2 * m_block + j][k] +=
-                      c_rd[k] + c_wr[k];
+                for (int k = 0; k < 4; k++) acc[k] += c_rd[k] + c_wr[k];
               }
               sh_red[red_sh_wr] = reinterpret_cast<int4*>(
                   &frag_c)[(is_a_8bit ? 2 : 4) * 2 * m_block + j];
@@ -1469,12 +1476,14 @@ __global__ void Marlin(
   #pragma unroll
           for (int i = 0; i < (is_a_8bit ? 2 : 4) * 2;
                i += (m_block_size_8 ? 2 : 1)) {
-            float* c_rd =
-                reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+            using ACUM = std::conditional_t<is_a_8bit && a_type == vllm::kS8, int32_t, float>;
+            ACUM* c_rd =
+                reinterpret_cast<ACUM*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+            ACUM* acc = reinterpret_cast<ACUM*>(
+                &reinterpret_cast<FragC*>(
+                    frag_c)[(is_a_8bit ? 2 : 4) * 2 * m_block + i]);
   #pragma unroll
-            for (int j = 0; j < 4; j++)
-              reinterpret_cast<FragC*>(
-                  frag_c)[(is_a_8bit ? 2 : 4) * 2 * m_block + i][j] += c_rd[j];
+            for (int j = 0; j < 4; j++) acc[j] += c_rd[j];
           }
         }
         __syncthreads();
@@ -1882,39 +1891,9 @@ __global__ void Marlin(
         }
       }
 
-      if constexpr (is_a_8bit) {
-        float frag_a_s[2 * thread_m_blocks];
-
-        for (int i = 0; i < 2 * thread_m_blocks; i++)
-          frag_a_s[i] = sh_a_s[i * 8 + (threadIdx.x % 32) / 4];
-
-  #pragma unroll
-        for (int j = 0; j < 2; j++) {
-  #pragma unroll
-          for (int i = 0; i < thread_m_blocks; i++) {
-  #pragma unroll
-            for (int g = 0; g < 4; g++) {
-              float c_val = frag_c[i][j][0][g];
-
-              if constexpr (a_type == vllm::kS8) {
-                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
-              }
-              float s_val = frag_a_s[i * 2 + g / 2];
-              frag_c[i][j][0][g] = c_val * s_val;
-            }
-  #pragma unroll
-            for (int g = 0; g < 4; g++) {
-              float c_val = frag_c[i][j][1][g];
-
-              if constexpr (a_type == vllm::kS8) {
-                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
-              }
-              float s_val = frag_a_s[i * 2 + g / 2];
-              frag_c[i][j][1][g] = c_val * s_val;
-            }
-          }
-        }
-      }
+      // La escala de ACTIVACION se aplica despues de thread_block_reduce(), no aca: ver el
+      // comentario en esa lambda. Mover esto para abajo es lo que permite que la reduccion entre
+      // warps sea entera.
 
       cp_async_wait<0>();
       bool last = slice_idx == slice_count - 1;
@@ -1931,6 +1910,40 @@ __global__ void Marlin(
       }
 
       thread_block_reduce();
+
+      // Escala de ACTIVACION (una por fila M) y paso a float. Va DESPUES de la reduccion a
+      // proposito: la reduccion suma parciales de la misma fila y la misma columna — solo cambia
+      // el tramo de K — asi que todos comparten esta escala y sacarla del camino deja que la
+      // suma sea entera. Ademas la hace un solo warp en vez de todos.
+      if constexpr (is_a_8bit) {
+        float frag_a_s[2 * thread_m_blocks];
+
+        for (int i = 0; i < 2 * thread_m_blocks; i++)
+          frag_a_s[i] = sh_a_s[i * 8 + (threadIdx.x % 32) / 4];
+
+  #pragma unroll
+        for (int j = 0; j < 2; j++) {
+  #pragma unroll
+          for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+            for (int g = 0; g < 4; g++) {
+              float c_val = frag_c[i][j][0][g];
+              if constexpr (a_type == vllm::kS8) {
+                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
+              }
+              frag_c[i][j][0][g] = c_val * frag_a_s[i * 2 + g / 2];
+            }
+  #pragma unroll
+            for (int g = 0; g < 4; g++) {
+              float c_val = frag_c[i][j][1][g];
+              if constexpr (a_type == vllm::kS8) {
+                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
+              }
+              frag_c[i][j][1][g] = c_val * frag_a_s[i * 2 + g / 2];
+            }
+          }
+        }
+      }
 
       if (has_bias && last) {
         __syncthreads();
