@@ -94,6 +94,15 @@ __device__ __forceinline__ void mma_s8(const uint32_t a[4], const uint32_t b[2],
         "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
 }
 
+// El swizzle XOR de CUTLASS, en trozos de 16 B. Hace falta porque shA tiene filas de KPI
+// bytes: con KPI=128 eso son 32 bancos justos, asi que TODAS las filas arrancan en el banco 0
+// y una lectura por filas choca de a 8 o de a 16 vias. Con el XOR, la fila f corre sus trozos
+// f lugares, y los 32 lanes caen en bancos distintos. El mismo XOR va en la escritura.
+#define TROZOS (KPI / 16)
+__device__ __forceinline__ int swz(int f, int c) {
+  return (c & ~15) ^ ((f & (TROZOS - 1)) * 16) | (c & 15);
+}
+
 __device__ __forceinline__ void ldmatrix4(uint32_t r[4], uint32_t dir) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
@@ -161,7 +170,7 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
     for (int i = tid; i < 16 * A_VEC; i += HILOS) {
       int f = i / A_VEC, c = (i % A_VEC) * 16;
       bool ok = f < M && k + c < K;
-      carga16p(smem_u32(&shA[e * A_POR_ETAPA + f * KPI + c]),
+      carga16p(smem_u32(&shA[e * A_POR_ETAPA + f * KPI + swz(f, c)]),
                &A[(size_t)f * K + k + (ok ? c : 0)], ok);
     }
   };
@@ -221,13 +230,14 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
     // compensa el reacomodo.
   #pragma unroll
     for (int kt = 0; kt < NKT; kt++) {
+      // A -> registros con UNA instruccion. Medido en sk22_sondal.cu: tratando A int8 [16][32]
+      // como b16 [16][16], el fragmento de mma.m16n8k32.s8 es exactamente la convencion de las
+      // cuatro matrices 8x8 de ldmatrix.x4 (reg 0: filas 0-7 cols 0-7; reg 1: filas 8-15; regs
+      // 2 y 3 idem con las columnas altas). Cero diferencias en las 128 posiciones.
       uint32_t fa[4];
-  #pragma unroll
-      for (int r = 0; r < 4; r++) {
-        int f = lane / 4 + (r % 2) * 8;
-        int kk = (lane % 4) * 4 + (r / 2) * 16;
-        fa[r] = *reinterpret_cast<const uint32_t*>(
-            &shA[etapa * A_POR_ETAPA + f * KPI + kt * KT + kk]);
+      {
+        int f = lane % 16, c = kt * KT + (lane / 16) * 16;
+        ldmatrix4(fa, smem_u32(&shA[etapa * A_POR_ETAPA + f * KPI + swz(f, c)]));
       }
 
     // B: desempaque CRUDO (QServe) — dos instrucciones, sin el |MASK -zp ^MASK.
