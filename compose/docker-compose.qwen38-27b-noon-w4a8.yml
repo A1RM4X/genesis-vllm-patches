@@ -1,39 +1,37 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Qwen3.8-27B Uncensored AWQ W4A16 ASYM Native MTP Preserved (compressed-tensors)
-# PRUEBA W4A8: noon-at-cgn/Qwen3.8-27B-Uncensored-W4A16-AutoRound (int4 simetrico g128, AutoRound) + VLLM_MARLIN_INPUT_DTYPE
-# Checkpoint base de la config: Ar4ikov/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM
-# Basado en la arquitectura y suite de parches Genesis vLLM
-#
-# CARACTERÍSTICAS DEL CHECKPOINT:
-# - Modelo base: orcarouter/Qwen3.8-27B-Uncensored (abliterado sin censura).
-# - Cuantizado desde pesos BF16 nativos (sin degradación de doble cuantización).
-# - Cuantización de pesos: AWQ W4A16 asimétrico vía compressed-tensors (group_size 128).
-# - Ocupa ~8.5 - 9.0 GiB por GPU con TP=2 (~15.5 GiB totales).
-# - lm_head, embed_tokens, visión y DeltaNet linear attention preservados en BF16.
-# - MTP (Speculative Decoding): Capa MTP nativa preservada en precisión nativa.
-#   text_config.mtp_num_hidden_layers: 1 -> method: "qwen3_5_mtp", num_speculative_tokens: 3 (MTP module reuse).
-# - Template: Froggeric v22.4 (soporte nativo Qwen 3.8, reasoning_effort='medium', paridad multi-tool).
-#
-# OPTIMIZACIONES GENESIS INCORPORADAS:
-# - PN81: Cuota y poda automática de KV en disco NVMe (/kv-offload).
-# - PN88: Métricas detalladas de tiers de KV (RAM L2 y NVMe L3).
-# - PN90: Gating de escritura SSD L3 por agente.
-# - PN91: Streaming diferido de KV para TTFT en prefijos largos.
-# - PN92: Codec hooks para lectura de bloques comprimidos.
-# - PN93: Sparse GDN checkpoints (stride 16) reduciendo escrituras y uso de KV en capas lineales.
-# - PN99: Compresión GPU L2 a 4 bits.
-# - PN100: Staging ring blocks (32) para subagentes efímeros.
-# - PN56: Fallback de parseo XML para qwen3_coder.
-# - P61b, P62, PN51, PN66: Estabilidad de streaming, timing de thinking y tags.
-# - PN77 & PN108: Cuantización FP8 del LM head y drafter MTP (ahorro ~1.2 GiB VRAM por GPU).
-# - B3: Custom all-reduce TP=2 fast path con fallback seguro.
-# - P66: Filtro de tamaños CUDA graph divisibles por K+1.
-# - P5b: Optimización de páginas KV.
-# - P69: Recordatorio de tool calling en contextos largos (>1000 caracteres).
-# - PN114: Guarda de alineación bounds en mamba_utils (fix vllm#35288).
-# - PN50, PN59, PN54, PN57, PN25, PN12, PN19: Fusión GDN, pools Silu/FFN y scoped max split.
-# - CuMem Allocator + TieringOffloadingSpec (6 GiB RAM ARC + NVMe SSD).
+# noon-at-cgn/Qwen3.8-27B-Uncensored-W4A16-AutoRound servido como W4A8
+# 2x RTX 3090 (GA102, sm_86), TP=2, MTP nativo K=3
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# EL CHECKPOINT
+#   Pesos int4 simetricos g128 de AutoRound, formato compressed-tensors
+#   "pack-quantized" (NO GPTQ): weight_packed [N,K/8] + weight_scale [N,K/G].
+#   El nibble es complemento a dos ([0,15] = [-8,7]) y la MITAD de las escalas
+#   son NEGATIVAS — cualquier clamp_min sobre ellas destruye el peso.
+#   lm_head, embeddings, vision y DeltaNet quedan en BF16 en el checkpoint.
+#   La capa MTP viene preservada: method "qwen3_5_mtp", K=3.
+#
+# EL CAMINO DE COMPUTO (lo que decide el rendimiento)
+#   Activaciones int8 + pesos int4 -> mma.m16n8k32.s8 en los tensor cores.
+#   Marlin es quien lo ejecuta, y es un kernel PERSISTENTE: su grid es el numero
+#   de SMs (82) y reparte el trabajo con stream-K. Los GEMM de decode corren al
+#   81-106% del techo de DRAM, o sea que ahi NO queda margen de kernel.
+#
+# MEDIDO EN ESTA MAQUINA (no son estimaciones)
+#   prefill          2200-2750 tok/s de 1k a 50k de contexto
+#   decode 1 pedido  115-120 tok/s hasta 10k, 92-99 a 50k
+#   coding           139-145 tok/s (42 pasos/s x 3,4 tokens por paso)
+#   throughput       ~870 tok/s agregado con 20-24 pedidos concurrentes
+#   aceptacion MTP   63% con un pedido, 70% con seis
+#
+#   Ojo al medir: con MTP, vLLM manda los tokens aceptados de un paso JUNTOS en
+#   un mismo chunk SSE. Contar chunks subestima 3,4x. Usar `usage`.
+#
+# ESTRUCTURA DE ESTE ARCHIVO
+#   Los parches Genesis (GENESIS_ENABLE_*) van agrupados por tema y cada bloque
+#   dice QUE hace y CUANTO da, con el numero medido. Lo que esta apagado tambien
+#   lleva su motivo: un parche sin justificacion no se vuelve a evaluar nunca.
+#
 version: '3.8'
 
 services:
@@ -91,8 +89,42 @@ services:
       - GENESIS_ENABLE_P62_STRUCT_OUT_SPEC_TIMING=1
       - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
       - GENESIS_ENABLE_PN66=1
+      # ── lm_head ────────────────────────────────────────────────────────────
+      # El lm_head viene en BF16 y con un vocabulario de 150k+ es de los tensores
+      # mas pesados del modelo, y se lee ENTERO en cada paso de decode.
+      # PN77 lo baja a fp8 y PN108 hace lo mismo para el borrador del MTP.
       - GENESIS_ENABLE_PN77_FP8_LM_HEAD=1
       - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=1
+      #
+      # PN139: el mismo lm_head en int4 por grupo (g128) en vez de fp8 — la MITAD
+      # de los bytes, y el decode esta limitado por trafico, no por aritmetica.
+      # Medido: +8,9% de decode (167,7 -> 182,6 tok/s) con la calidad intacta.
+      # Se cuelga del mismo walker que PN77 y tiene prioridad sobre el, asi que
+      # PN77 tiene que quedar PRENDIDO: es el enganche.
+      - GENESIS_ENABLE_PN139_LM_HEAD_INT4=1
+
+      # ── APAGADOS A PROPOSITO, con el motivo medido ─────────────────────────
+      # Sin esto nadie sabe si ya se probo, y se reintenta cada seis meses.
+      #
+      # PN137 (suavizado por grupo plegado en los pesos): EMPATA, no gana. El
+      #   kernel de cuantizacion pesa por TRAFICO, no por la reduccion que se
+      #   ahorra, asi que quitarle la reduccion no mueve el reloj.
+      #
+      # PN140 (QServe: el nibble crudo al tensor core, offset corregido en el
+      #   acumulador): el algebra cierra BIT A BIT y aislado da 1,92x en el
+      #   desempaque, pero dentro de Marlin sale MAS LENTO — el lazo no tiene
+      #   registros libres para la correccion. Queda implementado y apagado.
+      #   OJO: prenderlo exige que el llamador pase a_sums; con a_sums nulo el
+      #   kernel restaba registros sin inicializar (arreglado, pero es la trampa).
+      #
+      # PN131 (SK-18, decode de atencion entero en PTX con KV int8/int4): NO es
+      #   de la tanda de optimizacion de Marlin. Da paridad con FlashInfer fp8 en
+      #   calidad y velocidad, con KV int8 que tiene 4x menos error que fp8; en
+      #   int4 duplica la KV pero cuesta -27% de prefill y -21% de decode largo.
+      #   Sin activar porque el KV dtype se decide aparte (ver la nota de abajo).
+      #
+      # PN126 (rotacion q/k tipo WUSH): baja ~12% el MSE de los logits y la
+      #   salida no cambia. No paga el costo.
       - GENESIS_ENABLE_B3_CUSTOM_AR=1
       - GENESIS_ENABLE_B2_FULL_CG=0
       - GENESIS_ENABLE_P100=1
@@ -249,9 +281,32 @@ services:
       - VLLM_FLOAT32_MATMUL_PRECISION=high
       - VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=1024
       - VLLM_MARLIN_USE_ATOMIC_ADD=1
-      - VLLM_MARLIN_INPUT_DTYPE=int8  # CORRIDA
-      - GENESIS_ENABLE_PN125_MARLIN_W4A8_ESCALAS=1  # escalas negativas de AutoRound -> int8 de Marlin
-      # PN130: Marlin W4A8 propio con escalas int16 CON signo (exacto; con PN130 cargado PN125 no toca pesos).
+      # ── W4A8: el camino int4 x int8 sobre los tensor cores ──────────────────
+      # Manda las activaciones a Marlin en int8 en vez de fp16. Es lo que habilita
+      # el mma entero (m16n8k32.s8), que consume el doble de K por instruccion que
+      # el HMMA de fp16. Sin esto el peso se desempaqueta a fp16 y se pierde todo.
+      - VLLM_MARLIN_INPUT_DTYPE=int8
+      #
+      # PN125: red de contencion para las escalas NEGATIVAS de AutoRound. El Marlin
+      # oficial asume escalas positivas y con estas devuelve BASURA SILENCIOSA (sin
+      # error, sin warning, el modelo simplemente delira). Con PN130 cargado este no
+      # llega a tocar los pesos, pero queda como respaldo si PN130 falla al compilar.
+      - GENESIS_ENABLE_PN125_MARLIN_W4A8_ESCALAS=1
+      #
+      # PN130: Marlin propio con escalas int16 CON signo — el kernel de verdad.
+      # Es exacto contra float64 (2,8e-5, que es el redondeo del fp16 de salida) y
+      # se compila desde vllm/_genesis/kernels/marlin_s16/. Lleva adentro, todo
+      # medido en esta maquina:
+      #   * reduccion entre warps en int32 en vez de fp32 ........... +9,5% prefill
+      #   * division magica en el prologo (sin div/rem enteros) ..... -7% a -18% en M=96-144
+      #   * serie completa de tiles + tope por tramo de M ........... -32% en M=70-88
+      #   * tope de thread_m_blocks en 5 hasta M=80 ................. hasta 4,9x en M=104-112
+      #     (con >=6 el kernel toca los 255 registros y DERRAMA a memoria local:
+      #      845 MB de trafico de DRAM para un peso de 44,6 MB)
+      #   * `corr` inicializado en matmul_a8 ........................ correctitud
+      #     (sin eso, con PN140 apagado se restaban registros basura: sesgo de
+      #      -8*escala por grupo y resultados distintos en cada llamada)
+      # La .so se recompila sola cuando cambia el fuente (huella en huella.txt).
       - GENESIS_ENABLE_PN130_MARLIN_S16=1
       - VLLM_USE_FUSED_MOE_GROUPED_TOPK=1
       - VLLM_LOGGING_LEVEL=INFO
@@ -318,6 +373,17 @@ services:
       - float16
       - --mamba-ssm-cache-dtype
       - "float16"
+      # KV de la atencion. HAY UNA DEUDA ACA, anotada 2026-09-17: una nota de
+      # julio dice que fp8 degrada la calidad en este hibrido (corrupcion a baja
+      # tasa: parentesis que se caen, palabras truncadas) y que el W4A8
+      # productivo usaba "auto". Alguien lo volvio a fp8 despues, sin re-medir.
+      # Las opciones, con lo que ya esta medido:
+      #   auto (fp16)  sin degradacion, pero la KV cae a la mitad (~310k tokens)
+      #   fp8_e4m3     620k tokens, y la duda de calidad de la nota de julio
+      #   int8 (PN131) 620k tokens, misma velocidad que fp8 y 4x MENOS error
+      #   int4 (PN131) ~1,2M tokens, pero -27% prefill y -21% decode largo
+      # Se deja como estaba para no mezclarlo con la tanda de Marlin. Medir la
+      # calidad de ESTE checkpoint antes de moverlo.
       - --kv-cache-dtype
       - "fp8_e4m3"
       # 10 -> 24 (2026-09-17). Medido: con 12 pedidos concurrentes el throughput agregado pasa
