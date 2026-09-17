@@ -39,7 +39,11 @@ _cargado = False
 # en la cache y un fuente nuevo (o al reves) dejaban la llamada con un argumento corrido, y el
 # error era "Expected a value of type 'Tensor' for argument 'workspace' but instead found int".
 # Se resuelve mirando el schema al cargar, asi que las dos firmas andan.
-_TIENE_A_SUMS = None      # None = todavia no se miro el schema
+# Aridad del op, resuelta UNA vez en cargar(). No puede resolverse adentro de marlin_gemm:
+# esa funcion corre dentro de una region trazada por Dynamo, que no sabe iterar
+# `_schema.arguments` ("missing tp_iter") y hornea como constante cualquier condicion que se le
+# ponga. Por eso marlin_gemm no lleva NINGUNA logica: solo la llamada al op.
+_IDX_M = 2                # posicion de size_m dentro de *resto, en el fake
 
 
 def activo() -> bool:
@@ -77,7 +81,12 @@ def cargar() -> bool:
     torch.ops.load_library(so)
     from torch.library import register_fake
 
-    log.info("[PN130] op con a_sums: %s", _tiene_a_sums())
+    global marlin_gemm, _IDX_M
+    tiene = any(a.name == "a_sums_or_none"
+                for a in torch.ops.genesis_marlin.marlin_gemm_s16.default._schema.arguments)
+    marlin_gemm = _gemm_con_a_sums if tiene else _gemm_sin_a_sums
+    _IDX_M = 3 if tiene else 2
+    log.info("[PN130] op con a_sums: %s", tiene)
 
     @register_fake("genesis_marlin::marlin_gemm_s16")
     def _fake(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
@@ -85,8 +94,7 @@ def cargar() -> bool:
         # `resto` es (a_sums?, workspace, b_type_id, size_m, size_n, size_k, ...): el a_sums
         # puede o no estar, asi que el indice se corre. Lo unico que necesita el fake es la
         # forma de la salida.
-        i = 3 if _tiene_a_sums() else 2
-        size_m, size_n = resto[i], resto[i + 1]
+        size_m, size_n = resto[_IDX_M], resto[_IDX_M + 1]
         dtype = a.dtype
         if dtype not in (torch.half, torch.bfloat16):
             dtype = b_scales.dtype
@@ -94,32 +102,6 @@ def cargar() -> bool:
 
     _cargado = True
     return True
-
-
-def _tiene_a_sums() -> bool:
-    """Mira el schema del op UNA vez, la primera que hace falta.
-
-    Se resuelve tarde y no al cargar: si el modulo se importa antes de que la .so este compilada,
-    un global fijado en `cargar()` se queda con el valor de la firma equivocada y la llamada sale
-    con un argumento de mas o de menos. Eso tiraba el arranque con
-    "expected at most 19 argument(s) but received 20".
-    """
-    # El flag se guarda en el OP, no en un global del modulo: vLLM levanta los workers como
-    # procesos aparte y ademas el modulo puede quedar importado por mas de un camino, asi que un
-    # global se queda desincronizado y la llamada sale con un argumento de mas o de menos. El
-    # objeto del op es unico por proceso, que es justo el alcance que hace falta.
-    try:
-        op = torch.ops.genesis_marlin.marlin_gemm_s16
-    except Exception:
-        return False
-    v = getattr(op, "_genesis_a_sums", None)
-    if v is None:
-        v = any(a.name == "a_sums_or_none" for a in op.default._schema.arguments)
-        try:
-            op._genesis_a_sums = v
-        except Exception:
-            pass                  # si no deja, se vuelve a mirar el schema y listo
-    return v
 
 
 def procesar_escalas(s: torch.Tensor):
@@ -131,15 +113,30 @@ def procesar_escalas(s: torch.Tensor):
     return s, factor
 
 
-def marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
-                workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
-                use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False, a_sums=None):
-    """Misma firma que ``vllm._custom_ops.marlin_gemm``, mas el ``a_sums`` opcional de PN140."""
-    extra = (a_sums,) if _tiene_a_sums() else ()
+def _gemm_sin_a_sums(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
+                     g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
+                     use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False,
+                     a_sums=None):
+    """Firma previa a PN140. Sin condicionales: esto se traza con Dynamo."""
     return torch.ops.genesis_marlin.marlin_gemm_s16(
         a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
-        *extra, workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
+        workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
         use_fp32_reduce, is_zp_float)
+
+
+def _gemm_con_a_sums(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
+                     g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
+                     use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False,
+                     a_sums=None):
+    """Firma con el a_sums_or_none de PN140, en su posicion (antes de workspace)."""
+    return torch.ops.genesis_marlin.marlin_gemm_s16(
+        a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
+        a_sums, workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
+        use_fp32_reduce, is_zp_float)
+
+
+# cargar() la reemplaza por la variante que corresponda a la .so que encontro
+marlin_gemm = _gemm_sin_a_sums
 
 
 ACTIVO_Y_CARGADO = False
