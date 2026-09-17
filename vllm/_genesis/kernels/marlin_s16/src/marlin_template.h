@@ -36,6 +36,23 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
+// Division por un invariante, en enteros.
+//
+// nvcc compila `a / b` con b variable como I2F -> MUFU.RCP -> FMUL -> F2I, y MUFU corre a 4
+// ops/ciclo/SM contra 32 de las enteras. Los divisores de aca (gridDim.x, k_tiles, n_tiles) son
+// constantes durante todo el kernel pero el compilador no lo sabe, y ademas n_tiles no es
+// potencia de dos (vale 136 para gate_up), asi que ni __builtin_assume ni un flag lo arreglan.
+//
+// El host precalcula (m, s) con  x / d == mulhi(x, m) >> (s - 32)  y aca queda en dos
+// instrucciones enteras. Verificado contra el PTX: desaparecen las MUFU.RCP del prologo.
+__device__ __forceinline__ uint32_t div_inv(uint32_t x, uint2 ms) {
+  return __umulhi(x, ms.x) >> ms.y;
+}
+
+__device__ __forceinline__ uint32_t rem_inv(uint32_t x, uint2 ms, uint32_t d) {
+  return x - div_inv(x, ms) * d;
+}
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
@@ -267,7 +284,10 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    uint2 mag_grid,        // (m, s) para dividir por gridDim.x sin punto flotante
+    uint2 mag_kt,          // idem para k_tiles
+    uint2 mag_nt) {        // idem para n_tiles — ver div_inv()
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -419,7 +439,7 @@ __global__ void Marlin(
     // then there are at most $sms$ conflict tile blocks
     locks_off = blockIdx.x;
   } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    locks_off = div_inv(iters * blockIdx.x, mag_kt) - 1;
   }
 
   // Compute all information about the current slice which is required for
@@ -492,8 +512,8 @@ __global__ void Marlin(
   auto init_part1_slice = [&]() {
     if (part1_mn_iters) {
       part1_mn_iters--;
-      par_id = slice_col_par / n_tiles;
-      slice_col = slice_col_par % n_tiles;
+      par_id = div_inv(slice_col_par, mag_nt);
+      slice_col = rem_inv(slice_col_par, mag_nt, n_tiles);
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
@@ -509,10 +529,10 @@ __global__ void Marlin(
   auto init_slice = [&]() {
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
-      slice_col_par = (iters * blockIdx.x) / k_tiles;
-      slice_row = (iters * blockIdx.x) % k_tiles;
-      slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
-      par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
+      slice_col_par = div_inv(iters * blockIdx.x, mag_kt);
+      slice_row = rem_inv(iters * blockIdx.x, mag_kt, k_tiles);
+      slice_col = rem_inv(slice_col_par + global_mn_tiles - part2_mn_tiles, mag_nt, n_tiles);
+      par_id = div_inv(slice_col_par + global_mn_tiles - part2_mn_tiles, mag_nt);
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
     }

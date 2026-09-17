@@ -157,6 +157,22 @@ typedef struct {
   thread_config_t tb_cfg;
 } exec_config_t;
 
+// (m, s) para que el kernel divida por un invariante con enteros: x / d == mulhi(x, m) >> (s-32).
+// Se busca el s mas chico cuyo m entre en 32 bits; con numeradores de indices de tiles (muy por
+// debajo de 2^24) eso es exacto. Ver div_inv() en marlin_template.h para el por que.
+uint2 magia_de(int d) {
+  if (d <= 0) return make_uint2(0u, 0u);
+  for (int s = 32; s < 63; s++) {
+    unsigned long long m = ((1ULL << s) / (unsigned)d) + 1ULL;
+    if (m >> 32) continue;
+    // el error del redondeo crece con x; alcanza con chequear el ultimo x del rango util
+    unsigned long long x = (1ULL << 24) - 1;
+    if ((unsigned)(((x * m) >> 32) >> (s - 32)) != (unsigned)(x / (unsigned)d)) continue;
+    return make_uint2((unsigned)m, (unsigned)(s - 32));
+  }
+  return make_uint2(0u, 0u);
+}
+
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
                           int prob_n, int prob_k, int num_bits, int group_size,
                           bool has_act_order, bool is_k_full, int stages) {
@@ -538,7 +554,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
         g_idx_ptr, num_groups,
         prob_m_split, prob_n, prob_k, lda, locks, has_bias, part_use_atomic_add,
-        use_fp32_reduce, max_shared_mem_new);
+        use_fp32_reduce, max_shared_mem_new,
+        magia_de(blocks), magia_de(prob_k / 16 / (thread_k / 16)),
+        magia_de(prob_n / 16 / (thread_n / 16)));
     // clang-format on
 
     bool is_a_8bit = a_type.size_bits() == 8;

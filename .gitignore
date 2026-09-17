@@ -87,3 +87,9 @@ perf.data.old
 *.nsys-rep
 *.ncu-rep
 compose/muestras/
+
+# Volcados de PTX/SASS: se regeneran con tests/proto/asm/generar.sh y pesan megas
+tests/proto/asm/*.ptx
+tests/proto/asm/*.sass
+tests/proto/asm/*.cubin
+tests/proto/asm/decode_*.txt

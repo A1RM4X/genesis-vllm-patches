@@ -5,14 +5,14 @@
 set -euo pipefail
 REPO=/home/usuario/Proyectos/genesis-vllm-patches
 SALIDA=$REPO/tests/proto/asm
-GEN=/root/.cache/genesis/marlin_s16/gen
+GEN=${GEN:-/root/.cache/genesis/marlin_s16_mag/gen}
 IMG=vllm/vllm-openai:v0.27.1
 
 docker run --rm -v $REPO:/w -v /home/usuario/.cache/genesis:/root/.cache/genesis \
   -v $REPO/vllm/_genesis/kernels/marlin_s16:/m -w /w --entrypoint bash $IMG -c '
 set -e
 FLAGS="-DTORCH_EXTENSION_NAME=genesis_marlin_s16 -DTORCH_API_INCLUDE_EXTENSION_H
-  -I/root/.cache/genesis/marlin_s16/gen -I/m/inc
+  -I/root/.cache/genesis/marlin_s16_mag/gen -I/m/inc
   -isystem /usr/local/lib/python3.12/dist-packages/torch/include
   -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include
   -isystem /usr/local/cuda/include -isystem /usr/include/python3.12
@@ -20,10 +20,10 @@ FLAGS="-DTORCH_EXTENSION_NAME=genesis_marlin_s16 -DTORCH_API_INCLUDE_EXTENSION_H
   -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
   --expt-relaxed-constexpr --compiler-options -fPIC -O3 -std=c++17
   -DTORCH_TARGET_VERSION=0x020c000000000000 -DUSE_CUDA -DMARLIN_NAMESPACE_NAME=marlin"
-cd /root/.cache/genesis/marlin_s16/gen
+cd /root/.cache/genesis/marlin_s16_mag/gen
 # Solo la unidad con las instanciaciones del kernel W4A8, no el marlin.cu entero (que arrastra torch)
-/usr/local/cuda/bin/nvcc $FLAGS -arch=sm_86 -ptx sm80_kernel_s8_u4b8_float16.cu -o /w/tests/proto/asm/marlin_s16.ptx
-/usr/local/cuda/bin/nvcc $FLAGS -arch=sm_86 -cubin sm80_kernel_s8_u4b8_float16.cu -o /w/tests/proto/asm/marlin_s16.cubin
+/usr/local/cuda/bin/nvcc $FLAGS -arch=sm_86 -ptx sm80_kernel_s8_u4b8_float16.cu -o /w/tests/proto/asm/marlin_magia_real.ptx
+/usr/local/cuda/bin/nvcc $FLAGS -arch=sm_86 -cubin sm80_kernel_s8_u4b8_float16.cu -o /w/tests/proto/asm/marlin_magia_real.cubin
 '
 # nvdisasm no viene en la imagen de vLLM; el cuobjdump del host si
 /usr/local/cuda/bin/cuobjdump -sass $SALIDA/marlin_s16.cubin > $SALIDA/marlin_s16.sass
