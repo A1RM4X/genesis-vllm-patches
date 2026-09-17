@@ -268,6 +268,10 @@ __global__ void Marlin(
     // float scales of input matrix, only used when is_a_8bit == true.
     // shape (m,)
     const float* __restrict__ a_scales_ptr,
+    // PN140 (QServe): suma de la activacion por (fila, grupo de K), en int32. Hace falta porque
+    // con el nibble crudo el mma calcula suma_k a_k*q_k y sobra 8*suma_k a_k. Es nullptr cuando
+    // el desempaque es el de siempre.
+    const int* __restrict__ a_sums_ptr,
     // fp16 quantization scales. shape (k/groupsize, n)
     const int4* __restrict__ scales_ptr,
     // float global scale (for nvfp4// only)
@@ -385,7 +389,11 @@ __global__ void Marlin(
 
   extern __shared__ int4 sh[];
   float* sh_a_s = reinterpret_cast<float*>(sh);
-  int4* sh_new = sh + (is_a_8bit ? (4 * thread_m_blocks) : 0);
+  // PN140: las sumas de A por fila del tile, para el grupo de K que se esta procesando. Va
+  // pegado a sh_a_s y con el mismo tamaño (16 * thread_m_blocks entradas), asi que se puede
+  // indexar igual. Son 64 bytes por m_block: al lado de los 41 KB que ya usa el kernel, nada.
+  int* sh_a_sum = reinterpret_cast<int*>(sh + (is_a_8bit ? (4 * thread_m_blocks) : 0));
+  int4* sh_new = sh + (is_a_8bit ? (8 * thread_m_blocks) : 0);
   constexpr int pack_factor = 32 / b_type.size_bits();
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
 

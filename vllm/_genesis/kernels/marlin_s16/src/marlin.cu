@@ -410,6 +410,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   const int4* B_ptr = (const int4*)B;
   int4* C_ptr = (int4*)C;
   int4* C_tmp_ptr = (int4*)C_tmp;
+  // PN140: todavia nullptr — la infraestructura esta puesta pero la correccion del offset no se
+  // aplica, asi que el kernel sigue dando exactamente lo mismo que antes.
+  const int* a_sums_ptr = nullptr;
 
   const int4* bias_ptr = (const int4*)b_bias;
   const float* a_s_ptr = (const float*)a_s;
@@ -582,7 +585,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
     kernel<<<blocks, num_threads, max_shared_mem_new, stream>>>(
-        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
+        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, a_sums_ptr, b_s_ptr,
+        g_s_ptr, zp_ptr,
         g_idx_ptr, num_groups,
         prob_m_split, prob_n, prob_k, lda, locks, has_bias, part_use_atomic_add,
         use_fp32_reduce, max_shared_mem_new,
