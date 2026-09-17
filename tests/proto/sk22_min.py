@@ -29,7 +29,7 @@ def caso(M, N, K, nombre, aleatorio=False, factor=1.0):
     b = empaquetar(q)
     c = torch.zeros(M, N, dtype=torch.float16, device=dev)
     k22.lanzar((N // TN, 1), [a, b, esc, sumas, a_esc, c, M, N, K, factor],
-               shared=3 * 16 * 32 + 3 * (TN // 8) * 32 * 4)
+               shared=3 * (16 * 128 + 4 * (TN // 8) * 32 * 4))
     torch.cuda.synchronize()
     # referencia exacta
     ref = torch.zeros(M, N, dtype=torch.float64, device=dev)

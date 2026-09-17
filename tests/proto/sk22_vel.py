@@ -17,8 +17,8 @@ sys.path.insert(0, "/usr/local/lib/python3.12/dist-packages")
 sys.path.insert(0, "/w/tests/proto")
 
 G, TN = 128, 64
-FORMAS = [(5120, 5120)]
-MES = [1, 16]
+FORMAS = [(17408, 5120), (5120, 5120), (7168, 5120)]
+MES = [1, 4, 16]
 
 
 def medir(fn, rep=50):
@@ -39,13 +39,15 @@ def main() -> None:
 
     torch.ops.load_library(os.environ["S16_SO"])
     ET = int(os.environ.get("ETAPAS", "3"))
+    KPI = int(os.environ.get("KPI", "128"))
     k22 = Kernel("sk22_gemm_w4a8.cu", "sk22_gemm_w4a8",
-                 defs=[f"-DTN={TN}", f"-DETAPAS={ET}"], warps=4)
+                 defs=[f"-DTN={TN}", f"-DETAPAS={ET}", f"-DKPI={KPI}"], warps=4)
     dev = "cuda"
-    shmem = ET * 16 * 32 + ET * (TN // 8) * 32 * 4
+    shmem = ET * (16 * KPI + (KPI // 32) * (TN // 8) * 32 * 4)
     vacio = torch.empty(0, dtype=torch.int32, device=dev)
 
-    print(f"{'forma':>14}{'M':>4}{'marlin us':>11}{'sk22 us':>10}{'cociente':>10}")
+    print(f"{'forma':>14}{'M':>4}{'marlin us':>11}{'sk22 us':>10}{'cociente':>10}"
+          f"{'techo us':>10}{'marlin':>8}{'sk22':>7}")
     for N, K in FORMAS:
         torch.manual_seed(1234)
         q = torch.randint(0, 16, (K, N), dtype=torch.int32, device=dev)
@@ -73,7 +75,10 @@ def main() -> None:
                            shared=shmem)
 
             tm, ts = medir(marlin), medir(sk22)
-            print(f"{f'{N}x{K}':>14}{M:>4}{tm:>11.1f}{ts:>10.1f}{tm / ts:>9.2f}x")
+            # techo: el peso int4 hay que traerlo entero de DRAM, a 670 GB/s sostenidos
+            techo = (N * K / 2) / 670e9 * 1e6
+            print(f"{f'{N}x{K}':>14}{M:>4}{tm:>11.1f}{ts:>10.1f}{tm / ts:>9.2f}x"
+                  f"{techo:>10.1f}{techo / tm:>7.0%}{techo / ts:>7.0%}")
         del q, esc, b22, b_q, ws
         torch.cuda.empty_cache()
 

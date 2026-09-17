@@ -46,7 +46,13 @@
 #define G 128              // group_size de las escalas
 #define WARPS 4
 #define HILOS (WARPS * 32)
-#define KT 32              // K por iteracion: lo que consume un mma.m16n8k32
+#define KT 32              // lo que consume UN mma.m16n8k32 — fijo, es la instruccion
+#ifndef KPI
+  #define KPI 128          // K por iteracion del lazo: KPI/KT mma seguidos por warp
+#endif
+#define NKT (KPI / KT)     // tiles de mma por iteracion
+static_assert(KPI % KT == 0, "KPI tiene que ser multiplo de 32");
+static_assert(KPI <= G, "una iteracion no puede cruzar dos grupos de escalas");
 
 // ── helpers PTX ──────────────────────────────────────────────────────────────────────────────
 
@@ -112,14 +118,16 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   // A tambien va por el pipeline: recargarla sincronicamente en cada vuelta costaba el 40% del
   // kernel (medido: 90 -> 53,5 us en 5120x5120), porque el ld.global + __syncthreads() de cada
   // iteracion no tiene con que solaparse. Es chica (512 B por etapa), asi que entra de sobra.
-  constexpr int A_POR_ETAPA = 16 * KT;                           // 512 B
+  constexpr int A_POR_ETAPA = 16 * KPI;
   int8_t* shA = reinterpret_cast<int8_t*>(sh);                   // ETAPAS * A_POR_ETAPA
   int32_t* shB = reinterpret_cast<int32_t*>(sh + ETAPAS * A_POR_ETAPA);
 
   // B por etapa: un tile de K (32 filas) x TN columnas = TN/8 grupos de 8, y cada grupo son 32
   // enteros (uno por lane). Son 256 int32 = 1 KiB con TN=64.
   constexpr int GRUPOS = TN / 8;
-  constexpr int B_POR_ETAPA = GRUPOS * 32;
+  constexpr int B_POR_TILE = GRUPOS * 32;          // un tile de mma: 32 filas de K x TN columnas
+  constexpr int B_POR_ETAPA = NKT * B_POR_TILE;
+  constexpr int B_VEC = B_POR_TILE / 4;            // cargas de 16 B por tile
 
   // DOS acumuladores, como hace Marlin: el del mma se resetea al cerrar cada grupo de K, y el
   // escalado va juntando. Hace falta porque la escala y la correccion cambian POR GRUPO — con un
@@ -131,18 +139,32 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   // ── prologo del pipeline ───────────────────────────────────────────────────────────────────
   const int ngrupos_n = N / 8;                 // grupos de 8 columnas de toda la matriz
   const int g0 = n0 / 8;                       // primer grupo de este bloque
-  for (int e = 0; e < ETAPAS - 1; e++) {
-    int kt = e;
-    if (kt * KT < K) {
-      if (tid < B_POR_ETAPA / 4)
-        carga16(smem_u32(&shB[e * B_POR_ETAPA + tid * 4]),
-                &B[(size_t)kt * ngrupos_n * 32 + g0 * 32 + tid * 4]);
-      if (tid < A_POR_ETAPA / 16) {
-        int f = tid / (KT / 16), c = (tid % (KT / 16)) * 16;
-        carga16p(smem_u32(&shA[e * A_POR_ETAPA + f * KT + c]),
-                 &A[(size_t)f * K + kt * KT + c], f < M);
-      }
+
+  // Trae a la etapa `e` el bloque de K que empieza en `k`. B no es contiguo entre tiles de mma
+  // (cada uno salta ngrupos_n*32), asi que se carga tile por tile; adentro de cada tile si.
+  auto traer = [&](int e, int k) {
+    if (k >= K) return;
+  #pragma unroll
+    for (int i = tid; i < NKT * B_VEC; i += HILOS) {
+      int kt = i / B_VEC, j = (i % B_VEC) * 4;
+      // los tiles que caen pasado K se rellenan de cero (src-size 0), asi un K que no es
+      // multiplo de KPI no lee fuera de rango ni necesita un lazo de cola aparte
+      bool ok = k + kt * KT < K;
+      carga16p(smem_u32(&shB[e * B_POR_ETAPA + kt * B_POR_TILE + j]),
+               &B[(size_t)(k / KT + (ok ? kt : 0)) * ngrupos_n * 32 + g0 * 32 + j], ok);
     }
+    constexpr int A_VEC = KPI / 16;            // cargas de 16 B por fila de A
+  #pragma unroll
+    for (int i = tid; i < 16 * A_VEC; i += HILOS) {
+      int f = i / A_VEC, c = (i % A_VEC) * 16;
+      bool ok = f < M && k + c < K;
+      carga16p(smem_u32(&shA[e * A_POR_ETAPA + f * KPI + c]),
+               &A[(size_t)f * K + k + (ok ? c : 0)], ok);
+    }
+  };
+
+  for (int e = 0; e < ETAPAS - 1; e++) {
+    traer(e, e * KPI);
     commit();
   }
 
@@ -156,8 +178,8 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   // la fila de C que ve este lane, con el layout del mma m16n8k32
   const int fila = lane / 4;
 
-  for (int k = 0; k < K; k += KT) {
-    const int etapa = (k / KT) % ETAPAS;
+  for (int k = 0; k < K; k += KPI) {
+    const int etapa = (k / KPI) % ETAPAS;
 
     esperar<ETAPAS - 2>();
     __syncthreads();
@@ -193,41 +215,35 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
     //   fila = lane/4 + (reg%2)*8      k = (lane%4)*4 + byte + (reg/2)*16
     // Se arma leyendo de shared directo. ldmatrix pide un orden distinto y para 16 filas no
     // compensa el reacomodo.
-    uint32_t fa[4];
   #pragma unroll
-    for (int r = 0; r < 4; r++) {
-      int f = lane / 4 + (r % 2) * 8;
-      int kk = (lane % 4) * 4 + (r / 2) * 16;
-      fa[r] = *reinterpret_cast<const uint32_t*>(&shA[etapa * A_POR_ETAPA + f * KT + kk]);
-    }
+    for (int kt = 0; kt < NKT; kt++) {
+      uint32_t fa[4];
+  #pragma unroll
+      for (int r = 0; r < 4; r++) {
+        int f = lane / 4 + (r % 2) * 8;
+        int kk = (lane % 4) * 4 + (r / 2) * 16;
+        fa[r] = *reinterpret_cast<const uint32_t*>(
+            &shA[etapa * A_POR_ETAPA + f * KPI + kt * KT + kk]);
+      }
 
     // B: desempaque CRUDO (QServe) — dos instrucciones, sin el |MASK -zp ^MASK.
     // El layout esta MEDIDO (tests/proto/sk22_layout.py, 256 posiciones, cero discrepancias):
     // el lane L lee un solo int32 del grupo de 8 columnas g, y sus nibbles bajos son el
     // registro 0 del fragmento (k = (L%4)*4 + byte) y los altos el registro 1 (k + 16).
   #pragma unroll
-    for (int j = 0; j < 2; j++) {
-      int g = warp * 2 + j;                       // grupo de 8 columnas dentro del tile
-      int32_t emp = shB[etapa * B_POR_ETAPA + g * 32 + lane];
-      uint32_t fb[2];
-      fb[0] = emp & 0x0F0F0F0F;
-      fb[1] = (emp >> 4) & 0x0F0F0F0F;
-      mma_s8(fa, fb, acc[j]);
+      for (int j = 0; j < 2; j++) {
+        int g = warp * 2 + j;                     // grupo de 8 columnas dentro del tile
+        int32_t emp = shB[etapa * B_POR_ETAPA + kt * B_POR_TILE + g * 32 + lane];
+        uint32_t fb[2];
+        fb[0] = emp & 0x0F0F0F0F;
+        fb[1] = (emp >> 4) & 0x0F0F0F0F;
+        mma_s8(fa, fb, acc[j]);
+      }
     }
 
     // siguiente etapa
-    int kn = k + (ETAPAS - 1) * KT;
-    if (kn < K) {
-      const int en = (kn / KT) % ETAPAS;
-      if (tid < B_POR_ETAPA / 4)
-        carga16(smem_u32(&shB[en * B_POR_ETAPA + tid * 4]),
-                &B[(size_t)(kn / KT) * ngrupos_n * 32 + g0 * 32 + tid * 4]);
-      if (tid < A_POR_ETAPA / 16) {
-        int f = tid / (KT / 16), c = (tid % (KT / 16)) * 16;
-        carga16p(smem_u32(&shA[en * A_POR_ETAPA + f * KT + c]),
-                 &A[(size_t)f * K + kn + c], f < M);
-      }
-    }
+    int kn = k + (ETAPAS - 1) * KPI;
+    traer((kn / KPI) % ETAPAS, kn);
     commit();
     __syncthreads();
   }

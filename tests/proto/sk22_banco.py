@@ -80,8 +80,9 @@ def main() -> None:
         b = empaquetar(q)
         c = torch.zeros(M, N, dtype=torch.float16, device=dev)
 
-        # shared: A del tile (16x32) + ETAPAS buffers de B (TN/8 grupos x 32 enteros)
-        shmem = 3 * 16 * 32 + 3 * (TN // 8) * 32 * 4
+        # shared: ETAPAS buffers de A (16 x KPI) y de B (KPI/32 tiles x TN/8 grupos x 32 ints)
+        KPI = 128
+        shmem = 3 * (16 * KPI + (KPI // 32) * (TN // 8) * 32 * 4)
         k22.lanzar((N // TN, 1),
                    [a, b, esc, sumas, a_esc, c, M, N, K, factor],
                    shared=shmem)
