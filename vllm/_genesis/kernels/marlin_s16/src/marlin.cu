@@ -295,7 +295,7 @@ exec_config_t determine_exec_config(
     int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
     int num_bits, int group_size, bool has_act_order, bool is_k_full,
     bool has_zp, bool is_zp_float, int is_a_8bit, int stages,
-    int max_shared_mem, int sms) {
+    int max_shared_mem, int sms, int64_t workspace_slots) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -333,7 +333,22 @@ exec_config_t determine_exec_config(
 
     if (kernel == MarlinDefault) continue;
 
-    return {1, th_config};
+    // blocks_per_sm se queda en 1, y NO es por falta de shared: la config del decode usa 41 KB
+    // de los 99 que el lanzamiento reserva (max_shared_mem / blocks_per_sm), o sea que tira 58 KB
+    // por bloque y se queda en 8 warps de 48 — 17% de ocupacion.
+    //
+    // Subirlo a 2 se probo y da ILLEGAL MEMORY ACCESS. La causa no es el workspace (se le agrego
+    // la guarda de abajo y sigue fallando con un workspace de sobra): es que `blocks` sale de
+    // sms * blocks_per_sm, y Marlin es un kernel PERSISTENTE cuyo reparto de stripes y su
+    // aritmetica de slices asumen gridDim == sms. Duplicar el grid es rediseñar el reparto, no
+    // cambiar una constante.
+    //
+    // Queda anotado porque el margen es real — en el barrido, con 2 bloques, M=256 bajaba de 406
+    // a 331 us — pero pide trabajo de verdad sobre init_slice() y los locks.
+    int por_sm = 1;
+    while (por_sm > 1 && (int64_t)sms * por_sm > workspace_slots) por_sm--;
+
+    return {por_sm, th_config};
   }
 
   return exec_cfg;
@@ -342,7 +357,8 @@ exec_config_t determine_exec_config(
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
                void* perm, void* a_tmp, int prob_m, int prob_n, int prob_k,
-               int lda, void* workspace, vllm::ScalarType const& a_type,
+               int lda, void* workspace, int64_t workspace_slots,
+               vllm::ScalarType const& a_type,
                vllm::ScalarType const& b_type, vllm::ScalarType const& c_type,
                vllm::ScalarType const& s_type, bool has_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
@@ -478,7 +494,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
           a_type, b_type, c_type, s_type, prob_m_split, prob_n, prob_k,
           thread_m_blocks, m_block_size_8, num_bits, group_size, has_act_order,
           is_k_full, has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem,
-          sms);
+          sms, workspace_slots);
       thread_tfg = exec_cfg.tb_cfg;
       if (thread_tfg.thread_n != -1) {
         if (prob_n / thread_tfg.thread_n *
@@ -912,7 +928,8 @@ torch::stable::Tensor marlin_gemm(
       global_scale.mutable_data_ptr(), b_zeros.mutable_data_ptr(),
       g_idx.mutable_data_ptr(), perm.mutable_data_ptr(),
       a_tmp.mutable_data_ptr(), size_m, size_n, size_k, a.stride(0),
-      workspace.mutable_data_ptr(), a_type, b_type, c_type, s_type, has_bias,
+      workspace.mutable_data_ptr(), workspace.numel(), a_type, b_type, c_type,
+      s_type, has_bias,
       has_act_order, is_k_full, has_zp, num_groups, group_size, device_index,
       get_current_cuda_stream(device_index), thread_k, thread_n, sms,
       use_atomic_add, use_fp32_reduce, is_zp_float);
