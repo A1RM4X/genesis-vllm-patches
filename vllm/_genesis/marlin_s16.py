@@ -39,7 +39,7 @@ _cargado = False
 # en la cache y un fuente nuevo (o al reves) dejaban la llamada con un argumento corrido, y el
 # error era "Expected a value of type 'Tensor' for argument 'workspace' but instead found int".
 # Se resuelve mirando el schema al cargar, asi que las dos firmas andan.
-_TIENE_A_SUMS = False
+_TIENE_A_SUMS = None      # None = todavia no se miro el schema
 
 
 def activo() -> bool:
@@ -77,10 +77,7 @@ def cargar() -> bool:
     torch.ops.load_library(so)
     from torch.library import register_fake
 
-    global _TIENE_A_SUMS
-    _TIENE_A_SUMS = any(
-        arg.name == "a_sums_or_none"
-        for arg in torch.ops.genesis_marlin.marlin_gemm_s16.default._schema.arguments)
+    log.info("[PN130] op con a_sums: %s", _tiene_a_sums())
 
     @register_fake("genesis_marlin::marlin_gemm_s16")
     def _fake(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
@@ -88,7 +85,7 @@ def cargar() -> bool:
         # `resto` es (a_sums?, workspace, b_type_id, size_m, size_n, size_k, ...): el a_sums
         # puede o no estar, asi que el indice se corre. Lo unico que necesita el fake es la
         # forma de la salida.
-        i = 3 if _TIENE_A_SUMS else 2
+        i = 3 if _tiene_a_sums() else 2
         size_m, size_n = resto[i], resto[i + 1]
         dtype = a.dtype
         if dtype not in (torch.half, torch.bfloat16):
@@ -97,6 +94,25 @@ def cargar() -> bool:
 
     _cargado = True
     return True
+
+
+def _tiene_a_sums() -> bool:
+    """Mira el schema del op UNA vez, la primera que hace falta.
+
+    Se resuelve tarde y no al cargar: si el modulo se importa antes de que la .so este compilada,
+    un global fijado en `cargar()` se queda con el valor de la firma equivocada y la llamada sale
+    con un argumento de mas o de menos. Eso tiraba el arranque con
+    "expected at most 19 argument(s) but received 20".
+    """
+    global _TIENE_A_SUMS
+    if _TIENE_A_SUMS is None:
+        try:
+            _TIENE_A_SUMS = any(
+                arg.name == "a_sums_or_none"
+                for arg in torch.ops.genesis_marlin.marlin_gemm_s16.default._schema.arguments)
+        except Exception:
+            return False          # sin op todavia: no se cachea, se vuelve a mirar
+    return _TIENE_A_SUMS
 
 
 def procesar_escalas(s: torch.Tensor):
@@ -112,7 +128,7 @@ def marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_ze
                 workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
                 use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False, a_sums=None):
     """Misma firma que ``vllm._custom_ops.marlin_gemm``, mas el ``a_sums`` opcional de PN140."""
-    extra = (a_sums,) if _TIENE_A_SUMS else ()
+    extra = (a_sums,) if _tiene_a_sums() else ()
     return torch.ops.genesis_marlin.marlin_gemm_s16(
         a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
         *extra, workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
