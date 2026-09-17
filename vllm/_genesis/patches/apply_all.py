@@ -2442,6 +2442,27 @@ def apply_patch_N129() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("Genesis act_stats (telemetria de activaciones)")
+def apply_patch_actstats() -> PatchResult:
+    """Sonda apagada por omision: solo mide la distribucion de amax por token."""
+    name = "Genesis act_stats"
+    import os
+    if os.environ.get("GENESIS_ACT_STATS", "0") != "1":
+        return _skipped(name, "opt-in: GENESIS_ACT_STATS=1")
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kernels import patch_actstats
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_actstats.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN136 MLP solapado")
 def apply_patch_N136_mlp_solapado() -> PatchResult:
     """PN136: el all-reduce del MLP viaja mientras se calcula el resto del bloque."""
