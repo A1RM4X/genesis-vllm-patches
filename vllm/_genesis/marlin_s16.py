@@ -85,9 +85,11 @@ def cargar() -> bool:
     @register_fake("genesis_marlin::marlin_gemm_s16")
     def _fake(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
               *resto):
-        # `resto` absorbe el a_sums_or_none que puede o no estar; lo unico que se necesita para
-        # el fake es la forma de la salida.
-        size_m, size_n = resto[2], resto[4]
+        # `resto` es (a_sums?, workspace, b_type_id, size_m, size_n, size_k, ...): el a_sums
+        # puede o no estar, asi que el indice se corre. Lo unico que necesita el fake es la
+        # forma de la salida.
+        i = 3 if _TIENE_A_SUMS else 2
+        size_m, size_n = resto[i], resto[i + 1]
         dtype = a.dtype
         if dtype not in (torch.half, torch.bfloat16):
             dtype = b_scales.dtype
