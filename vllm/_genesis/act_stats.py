@@ -47,7 +47,7 @@ SALIDA = os.environ.get("GENESIS_ACT_STATS_OUT", "/tmp/act_stats")
 # Con la clave por forma hay solo 4 cubos (qkv, o, gate_up, down), asi que el tope POR SITIO tiene
 # que ser alto o no se junta nada: con 16 se cortaba en 64 llamadas y no volcaba nunca.
 TOPE = int(os.environ.get("GENESIS_ACT_STATS_TOPE", "100000"))
-TOTAL = int(os.environ.get("GENESIS_ACT_STATS_TOTAL", "200"))    # llamadas entre volcados
+TOTAL = int(os.environ.get("GENESIS_ACT_STATS_TOTAL", "2000"))   # llamadas entre volcados
 
 # log2(amax) va de -20 a +12 en pasos de 1/4: 128 cajas alcanzan y sobran
 LO, HI, PASO = -20.0, 12.0, 0.25
@@ -64,7 +64,7 @@ def activo() -> bool:
 
 
 @torch.library.custom_op("genesis::act_stats", mutates_args=("x",))
-def registrar(x: torch.Tensor, k: int, n: int) -> None:
+def registrar(x: torch.Tensor, nombre: str) -> None:
     """Acumula la distribucion de amax por token de `x`. No modifica nada.
 
     Tiene que ser un CUSTOM OP, no una funcion suelta: este punto vive dentro de la region que
@@ -76,10 +76,10 @@ def registrar(x: torch.Tensor, k: int, n: int) -> None:
     sin salida, Inductor la borra como codigo muerto y la sonda queda muda. Decir que muta la
     entrada solo hace al compilador mas conservador, que para telemetria esta bien.
 
-    La identidad es la forma (K x N), que junta las 64 capas del mismo tipo: es la dispersion
-    PESIMISTA, porque mezcla la variacion entre capas con la de entre tokens.
+    `nombre` es el prefijo de la capa (p.ej. ``...layers.31.mlp.down_proj``), asi que la
+    estadistica sale POR CAPA. Un str es un tipo valido en la firma de un custom op, y dynamo lo
+    hornea como constante porque sale de un atributo del modulo.
     """
-    nombre = f"k{k}n{n}"
     if not ACTIVO:
         return
     try:
@@ -106,7 +106,7 @@ def registrar(x: torch.Tensor, k: int, n: int) -> None:
 
 
 @registrar.register_fake
-def _registrar_fake(x: torch.Tensor, k: int, n: int) -> None:
+def _registrar_fake(x: torch.Tensor, nombre: str) -> None:
     return None
 
 
