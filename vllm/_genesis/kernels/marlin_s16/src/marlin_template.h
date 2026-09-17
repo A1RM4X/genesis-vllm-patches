@@ -1341,7 +1341,11 @@ __global__ void Marlin(
     int k2 = k % 2;
     // PN140: la correccion del offset depende de la FILA y del grupo, nunca de j. Calcularla
     // adentro del lazo de j la repetia cuatro veces, con su lectura de shared cada vez.
-    int corr[2 * thread_m_blocks];
+    // Va INICIALIZADO: `corr` se resta siempre mas abajo, asi que sin a_sums (PN140 apagado, que
+    // es el caso de produccion) quedaban registros sin inicializar y el resultado salia con un
+    // sesgo de -8*escala por grupo. Ademas ese valor cambia entre llamadas cuando el kernel
+    // derrama registros, que es lo que hacia que M=96 y M=112 dieran distinto cada vez.
+    int corr[2 * thread_m_blocks] = {};
     if (a_sums_ptr != nullptr) {
   #pragma unroll
       for (int h = 0; h < 2 * thread_m_blocks; h++)
