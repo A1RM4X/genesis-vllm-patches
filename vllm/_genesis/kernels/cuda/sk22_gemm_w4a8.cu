@@ -157,21 +157,21 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   auto traer = [&](int e, int k) {
     if (k >= K) return;
   #pragma unroll
-    for (int i = tid; i < NKT * B_VEC; i += HILOS) {
-      int kt = i / B_VEC, j = (i % B_VEC) * 4;
+    for (unsigned i = tid; i < NKT * B_VEC; i += HILOS) {
+      unsigned kt = i / B_VEC, j = (i % B_VEC) * 4;
       // los tiles que caen pasado K se rellenan de cero (src-size 0), asi un K que no es
       // multiplo de KPI no lee fuera de rango ni necesita un lazo de cola aparte
-      bool ok = k + kt * KT < K;
+      bool ok = k + (int)kt * KT < K;
       carga16p(smem_u32(&shB[e * B_POR_ETAPA + kt * B_POR_TILE + j]),
-               &B[base_b + (size_t)(k / KT + (ok ? kt : 0)) * B_POR_TILE + j], ok);
+               &B[base_b + (size_t)(k / KT + (ok ? (int)kt : 0)) * B_POR_TILE + j], ok);
     }
     constexpr int A_VEC = KPI / 16;            // cargas de 16 B por fila de A
   #pragma unroll
-    for (int i = tid; i < 16 * A_VEC; i += HILOS) {
-      int f = i / A_VEC, c = (i % A_VEC) * 16;
-      bool ok = f < M && k + c < K;
+    for (unsigned i = tid; i < 16u * A_VEC; i += HILOS) {
+      unsigned f = i / A_VEC, c = (i % A_VEC) * 16;
+      bool ok = (int)f < M && k + (int)c < K;
       carga16p(smem_u32(&shA[e * A_POR_ETAPA + f * KPI + swz(f, c)]),
-               &A[(size_t)f * K + k + (ok ? c : 0)], ok);
+               &A[(size_t)f * K + k + (ok ? (int)c : 0)], ok);
     }
   };
 
@@ -191,8 +191,8 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   // la fila de C que ve este lane, con el layout del mma m16n8k32
   const int fila = lane / 4;
 
+  int etapa = 0, etapa_n = ETAPAS - 1;
   for (int k = 0; k < K; k += KPI) {
-    const int etapa = (k / KPI) % ETAPAS;
 
     esperar<ETAPAS - 2>();
     __syncthreads();
@@ -257,8 +257,10 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
 
     // siguiente etapa
     int kn = k + (ETAPAS - 1) * KPI;
-    traer((kn / KPI) % ETAPAS, kn);
+    traer(etapa_n, kn);
     commit();
+    if (++etapa == ETAPAS) etapa = 0;
+    if (++etapa_n == ETAPAS) etapa_n = 0;
     __syncthreads();
   }
 

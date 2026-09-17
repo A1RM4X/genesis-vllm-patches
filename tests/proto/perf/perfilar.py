@@ -22,6 +22,9 @@ NCU = "/opt/nvidia/nsight-compute/2025.1.1"
 # Cada fila: (metrica de ncu, etiqueta, formato). Elegidas para contestar por que un kernel
 # rinde distinto: cuanto del techo usa cada recurso, que lo limita y donde se traba.
 METRICAS = [
+    ("launch__grid_size",                                        "bloques del grid", "d"),
+    ("launch__block_size",                                       "hilos por bloque", "d"),
+    ("launch__waves_per_multiprocessor",                         "olas por SM", "f"),
     ("launch__registers_per_thread",                             "registros por hilo", "d"),
     ("launch__occupancy_per_register_count",                     "ocupacion max x registros", "f"),
     ("launch__occupancy_per_shared_mem_size",                    "ocupacion max x shared", "f"),
@@ -41,6 +44,8 @@ METRICAS = [
     ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ldsm.sum", "  conflictos en ldmatrix", "d"),
     ("l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum",      "  frentes de onda ld", "d"),
     ("l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ldsm.sum",    "  frentes de onda ldsm", "d"),
+    ("smsp__warps_eligible.avg.per_cycle_active",                "WARPS ELEGIBLES x ciclo", "f"),
+    ("smsp__issue_active.avg.pct_of_peak_sustained_active",      "ciclos que emite %", "f"),
     ("smsp__inst_executed.sum",                                  "instrucciones", "d"),
     ("sm__inst_executed_pipe_tensor.sum",                        "instrucciones de mma", "d"),
     ("smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct", "traba: espera memoria %", "f"),
@@ -61,7 +66,7 @@ def perfilar(kernel: str, n: int, k: int, m: int) -> dict[str, float]:
            "-v", f"{NCU}:{NCU}:ro",
            "-e", "S16_SO=/root/.cache/genesis/bps1/genesis_marlin_s16.so",
            "-e", f"KERNEL={kernel}", "-e", f"N={n}", "-e", f"K={k}", "-e", f"M={m}",
-           "-e", f"WARPS={os.environ.get('WARPS', '2')}",
+           "-e", f"WARPS={os.environ.get('WARPS', '2')}", "-e", f"SK={os.environ.get('SK', '1')}", "-e", f"ETAPAS={os.environ.get('ETAPAS', '3')}",
            "--entrypoint", f"{NCU}/ncu", IMG,
            "--profile-from-start", "off", "--target-processes", "all",
            "--metrics", ",".join(x[0] for x in METRICAS), "--csv",
@@ -100,7 +105,7 @@ def regiones(kernel: str, n: int, k: int, m: int) -> None:
            "-e", "S16_SO=/root/.cache/genesis/bps1/genesis_marlin_s16.so",
            "-e", "GENESIS_LINEINFO=1",
            "-e", f"KERNEL={kernel}", "-e", f"N={n}", "-e", f"K={k}", "-e", f"M={m}",
-           "-e", f"WARPS={os.environ.get('WARPS', '2')}",
+           "-e", f"WARPS={os.environ.get('WARPS', '2')}", "-e", f"SK={os.environ.get('SK', '1')}", "-e", f"ETAPAS={os.environ.get('ETAPAS', '3')}",
            "--entrypoint", f"{NCU}/ncu", IMG,
            "--profile-from-start", "off", "--target-processes", "all",
            "--import-source", "yes", "--set", "source",

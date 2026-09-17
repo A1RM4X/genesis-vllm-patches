@@ -46,7 +46,8 @@ def main() -> None:
         from sk22_banco import empaquetar
         from vllm._genesis.kernels.ptx_lab import Kernel
         W = int(os.environ.get("WARPS", "2"))
-        TN, KPI, ET = W * 16, 128, 3
+        TN, KPI = W * 16, 128
+        ET = int(os.environ.get("ETAPAS", "3"))
         k22 = Kernel("sk22_gemm_w4a8.cu", "sk22_gemm_w4a8",
                      defs=[f"-DTN={TN}", f"-DETAPAS={ET}", f"-DKPI={KPI}", f"-DWARPS={W}"],
                      warps=W)
@@ -57,7 +58,7 @@ def main() -> None:
         shmem = ET * (16 * KPI + (KPI // 32) * (TN // 8) * 32 * 4)
 
         def lanzar():
-            k22.lanzar((N // TN, 1), [a, b22, esc, sumas, a_esc, c, M, N, K, 1 / 4096],
+            k22.lanzar((N // TN, int(os.environ.get("SK", "1"))), [a, b22, esc, sumas, a_esc, c, M, N, K, 1 / 4096],
                        shared=shmem)
 
     for _ in range(30):                      # calentar fuera del rango perfilado
