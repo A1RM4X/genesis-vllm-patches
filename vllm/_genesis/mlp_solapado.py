@@ -3,13 +3,13 @@
 
 CABLEADO, CORRIENDO Y EXACTO — PERO NO GANA NADA, asi que queda APAGADO por omision.
 
-Medido en el servidor real (prefill de 42k tokens, 3 corridas x 3 repeticiones cada una):
+Medido en el servidor real, con la cache de torch.compile BORRADA en cada lado y verificando en
+el log que el camino solapado corriera de verdad:
 
-    PN136 apagado      2.383 tok/s
-    PN136, 4 trozos    2.390 tok/s   (+0,3%)
-    PN136, 2 trozos    2.392 tok/s   (+0,4%)
+    una peticion por vez (prefill de 42k):   apagado 2.383 tok/s | prendido 2.390
+    CINCO peticiones concurrentes:           apagado 2.627 tok/s | prendido 2.622
 
-O sea, ruido. El camino solapado corre de verdad (lo dice el log "MLP partido en N trozos") y sin
+O sea, ruido, con carga concurrente igual que sin ella. El camino solapado corre de verdad (lo dice el log "MLP partido en N trozos") y sin
 un solo error. Por que no gana: con PN120 los parciales ya viajan en int8 (la mitad de los bytes)
 y, despues de emparejar las placas por potencia, lo que queda de intercambio es chico al lado del
 computo del bloque MLP. NCCL en ese regimen ya no molesta.
@@ -235,6 +235,26 @@ def _pn136_mlp_fake(x: torch.Tensor, capa: int):
     return torch.empty_like(x)
 
 
+def _avisar_cache_caliente() -> None:
+    """Grita si la cache de torch.compile ya existe.
+
+    Prender o apagar PN136 cambia el grafo (aparece o desaparece el custom op), pero la clave de
+    la cache de vLLM NO mira nuestras variables de entorno: con la cache caliente se reusa el
+    grafo viejo y el parche queda INERTE sin decir una palabra. Paso dos veces, y la segunda
+    invalido un A/B entero. Ver la memoria del proyecto.
+    """
+    import glob
+
+    for raiz in ("/root/.cache/vllm/torch_compile_cache",
+                 os.path.expanduser("~/.cache/vllm/torch_compile_cache")):
+        if glob.glob(raiz):
+            log.warning(
+                "PN136: la cache de torch.compile ya existe (%s). Si venis de correr con otro "
+                "valor de GENESIS_ENABLE_PN136_MLP_SOLAPADO, BORRALA o el grafo compilado no va "
+                "a incluir el camino solapado y esto queda inerte en silencio.", raiz)
+            return
+
+
 def _capas_del_modelo(model):
     """Encuentra la lista de capas del decoder sin depender de como se llame el envoltorio.
 
@@ -266,6 +286,8 @@ def preparar(model, cap_filas: int | None = None) -> int:
     global _buzones, _comm
     if not _ACTIVO or _buzones is not None:
         return 0
+    _avisar_cache_caliente()
+
     from vllm.distributed.parallel_state import get_tp_group
 
     tp = get_tp_group()

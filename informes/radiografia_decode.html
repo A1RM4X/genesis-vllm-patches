@@ -1,0 +1,432 @@
+<title>Radiografía del decode</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>
+  :root {
+    --fondo: #f7f6f3; --panel: #ffffff; --panel2: #f1efea; --tinta: #15181c; --tinta2: #5b6169;
+    --linea: #ddd9d1; --acento: #b25419; --frio: #2b6b78; --ok: #4a7c3f; --aviso: #9a6b12;
+    --violeta: #6b4a86; --sombra: 0 1px 2px rgba(20,23,28,.06), 0 8px 24px -16px rgba(20,23,28,.25);
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --cuerpo: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --dato: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fondo: #0e1114; --panel: #161a1f; --panel2: #1b2027; --tinta: #e8ecf1; --tinta2: #9aa3ad;
+      --linea: #252b33; --acento: #e08a4e; --frio: #5fb3c4; --ok: #82c06f; --aviso: #d9ad4a;
+      --violeta: #b394cf; --sombra: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --fondo: #0e1114; --panel: #161a1f; --panel2: #1b2027; --tinta: #e8ecf1; --tinta2: #9aa3ad;
+    --linea: #252b33; --acento: #e08a4e; --frio: #5fb3c4; --ok: #82c06f; --aviso: #d9ad4a;
+    --violeta: #b394cf; --sombra: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--fondo); color: var(--tinta); font-family: var(--cuerpo);
+         font-size: 16px; line-height: 1.6; padding: 0 20px; padding-block: 0 72px; }
+  .marco { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+  header { padding-block: 48px 0; display: flex; flex-direction: column; gap: 18px; }
+  .ojo { font-family: var(--dato); font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+         color: var(--acento); font-weight: 500; }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(34px, 6vw, 52px);
+       line-height: 1.04; margin: 0; letter-spacing: -.02em; text-wrap: balance; }
+  .bajada { font-size: 19px; color: var(--tinta2); max-width: 62ch; margin: 0; }
+  .ficha { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px;
+           background: var(--linea); border: 1px solid var(--linea); border-radius: 3px; overflow: hidden; }
+  .ficha div { background: var(--panel); padding: 12px 14px; }
+  .ficha dt { font-family: var(--dato); font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+              color: var(--tinta2); margin: 0 0 4px; }
+  .ficha dd { margin: 0; font-family: var(--dato); font-size: 14px; font-weight: 500; }
+  h2 { font-family: var(--display); font-weight: 600; font-size: 24px; margin: 0 0 6px;
+       letter-spacing: -.01em; }
+  h2 .num { font-family: var(--dato); font-size: 13px; color: var(--acento); margin-right: 10px;
+            font-weight: 500; }
+  h3 { font-family: var(--display); font-size: 17px; margin: 10px 0 0; font-weight: 600; }
+  section { display: flex; flex-direction: column; gap: 16px; }
+  p { margin: 0; max-width: 68ch; }
+  .barra { display: flex; width: 100%; height: 46px; border-radius: 3px; overflow: hidden;
+           border: 1px solid var(--linea); }
+  .barra span { display: block; height: 100%; position: relative; }
+  .leyenda { display: flex; flex-wrap: wrap; gap: 8px 22px; font-family: var(--dato); font-size: 12.5px; }
+  .leyenda i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 7px;
+               vertical-align: -1px; }
+  .tabla-caja { overflow-x: auto; border: 1px solid var(--linea); border-radius: 3px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 1180px; font-size: 14px; }
+  thead th { font-family: var(--dato); font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+             color: var(--tinta2); text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--linea);
+             background: var(--panel2); white-space: nowrap; font-weight: 500; }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--linea); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  .k { font-family: var(--dato); font-size: 13px; font-weight: 500; white-space: nowrap; }
+  .n { font-family: var(--dato); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .pat { color: var(--tinta2); font-size: 13.5px; }
+  .tipos { font-family: var(--dato); font-size: 11.5px; line-height: 1.45; display: flex;
+           flex-direction: column; gap: 5px; min-width: 215px; }
+  .tipos .io { display: flex; gap: 6px; align-items: baseline; }
+  .tipos .fl { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; font-weight: 600;
+               flex: 0 0 34px; }
+  .tipos .in .fl { color: var(--ok); }
+  .tipos .out .fl { color: var(--acento); }
+  .tipos .mid { color: var(--tinta2); border-left: 2px solid var(--linea); padding-left: 8px;
+                margin-left: 2px; }
+  .chip { font-family: var(--dato); font-size: 11px; padding: 2px 7px; border-radius: 2px;
+          white-space: nowrap; border: 1px solid; font-weight: 500; }
+  .ptx { color: var(--acento); border-color: color-mix(in srgb, var(--acento) 45%, transparent);
+         background: color-mix(in srgb, var(--acento) 10%, transparent); }
+  .tri { color: var(--violeta); border-color: color-mix(in srgb, var(--violeta) 45%, transparent);
+         background: color-mix(in srgb, var(--violeta) 10%, transparent); }
+  .aje { color: var(--frio); border-color: color-mix(in srgb, var(--frio) 40%, transparent);
+         background: color-mix(in srgb, var(--frio) 8%, transparent); }
+  tr.propio td { background: color-mix(in srgb, var(--acento) 3.5%, transparent); }
+  tfoot td { font-family: var(--dato); font-weight: 600; background: var(--panel2); }
+  .nota { font-size: 14px; color: var(--tinta2); max-width: 78ch; }
+  .nota code, code { font-family: var(--dato); font-size: .92em;
+         background: var(--panel2); padding: 1px 5px; border-radius: 2px; }
+  .dos { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 20px; }
+  .caja { background: var(--panel); border: 1px solid var(--linea); border-radius: 3px; padding: 18px 20px;
+          box-shadow: var(--sombra); display: flex; flex-direction: column; gap: 8px; }
+  .caja h3 { font-family: var(--display); font-size: 16px; margin: 0; font-weight: 600; }
+  .caja p { font-size: 14.5px; color: var(--tinta2); }
+  .cifra { font-family: var(--dato); font-size: 30px; font-weight: 600; line-height: 1; }
+  .cifra small { font-size: 14px; color: var(--tinta2); font-weight: 400; margin-left: 4px; }
+  .destacado { background: color-mix(in srgb, var(--acento) 7%, var(--panel));
+               border: 1px solid color-mix(in srgb, var(--acento) 30%, var(--linea));
+               border-left: 3px solid var(--acento); border-radius: 3px; padding: 18px 20px;
+               display: flex; flex-direction: column; gap: 10px; }
+  .destacado p { font-size: 15px; color: var(--tinta2); max-width: 76ch; }
+  .destacado strong { color: var(--tinta); }
+  hr { border: none; border-top: 1px solid var(--linea); margin: 0; }
+  footer { font-size: 13.5px; color: var(--tinta2); font-family: var(--dato); }
+  @media (max-width: 640px) { header { padding-block: 32px 0; } body { font-size: 15.5px; } }
+</style>
+
+<div class="marco">
+<header>
+  <div class="ojo">Genesis · vLLM 0.27.1 · Qwen3.8-27B W4A8 · 2×RTX 3090 @229/243 W</div>
+  <h1>Radiografía del decode</h1>
+  <p class="bajada">Un paso de decode con 57 k tokens de contexto dura <strong>28,2 ms</strong> de GPU.
+  Esto es qué kernel corre en cada tramo, cuánto cuesta, quién lo escribió y con qué patrón está armado.
+  Todos los números salen del mismo perfil (torch profiler, rank 0, 60 pasos).</p>
+  <p class="bajada" style="font-size:16px"><strong>Reperfilado</strong> después de emparejar las dos
+  placas por potencia. Las 3090 no son gemelas: con el mismo tope de 220 W una sacaba bastante menos
+  reloj que la otra, y con TP=2 el paso lo fija la lenta. Repartiendo 229/243 W el paso bajó de 29,5 a
+  28,2 ms y el all-reduce, de 3.367 a 2.011 µs — <em>era espera, no comunicación</em>.</p>
+  <dl class="ficha">
+    <div><dt>KV</dt><dd>int4 por token-cabeza</dd></div>
+    <div><dt>Contexto</dt><dd>57.530 tokens</dd></div>
+    <div><dt>MTP</dt><dd>K=4 · 86,8 % acept.</dd></div>
+    <div><dt>Paso de GPU</dt><dd>28,2 ms <span style="color:var(--tinta2)">(era 29,5)</span></dd></div>
+    <div><dt>KV total</dt><dd>1.182.002 tokens</dd></div>
+    <div><dt>Agujas 57k</dt><dd>12/12 · tool calls 12/12</dd></div>
+  </dl>
+</header>
+
+<section>
+  <h2><span class="num">00</span>Lo que cambió: las placas no eran gemelas</h2>
+  <div class="destacado">
+    <p>Buscando tráfico entre placas apareció algo mucho más grande que el tráfico. Comparando las
+    trazas de <strong>los dos ranks</strong> del mismo prefill, el rank 0 medía <strong>932 ms</strong>
+    de AllGather y el rank 1 <strong>398 ms</strong> sobre exactamente la misma colectiva. El kernel de
+    NCCL cuenta como duración el tiempo que el que llega primero pasa adentro esperando al otro: un
+    desbalance de cómputo se disfraza de comunicación.</p>
+    <p>Y el desbalance era real: <strong>el rank 1 hacía el mismo trabajo un 39 % más lento</strong>
+    (Marlin 840 vs 1.230 ms, FlashInfer 194 vs 289 ms). No por reparto de trabajo — TP=2 divide parejo —
+    sino por la placa: con las dos a 220 W, la GPU 1 sacaba 615-1.080 MHz consumiendo 218 W mientras la
+    GPU 0 sacaba 930-1.485 MHz con 210 W. Y la GPU 1 corría <em>más fría</em> (52 contra 63 °C): no es
+    refrigeración, es el bin de silicio. Son modelos distintos, con otra VBIOS.</p>
+    <p>El arreglo cuesta dos comandos: repartir la potencia de forma asimétrica. El óptimo se buscó a
+    total constante midiendo el reloj de cada placa durante un prefill real — como las dos son GA102,
+    mismo reloj es misma velocidad — y el punto donde se igualan resulta ser también el más rápido, que
+    es lo esperable si el paso lo fija la lenta.</p>
+  </div>
+  <div class="tabla-caja">
+  <table style="min-width:640px">
+    <thead><tr><th>Reparto (mismo total)</th><th class="n">Reloj GPU 0</th><th class="n">Reloj GPU 1</th><th class="n">Diferencia</th><th class="n">Prefill</th></tr></thead>
+    <tbody>
+      <tr><td>240 / 232 W</td><td class="n">1.478 MHz</td><td class="n">1.110 MHz</td><td class="n">−368</td><td class="n">2.205 tok/s</td></tr>
+      <tr><td>236 / 236 W</td><td class="n">1.425</td><td class="n">1.170</td><td class="n">−255</td><td class="n">2.278</td></tr>
+      <tr><td>232 / 240 W</td><td class="n">1.320</td><td class="n">1.185</td><td class="n">−135</td><td class="n">2.344</td></tr>
+      <tr class="propio"><td><strong>229 / 243 W</strong></td><td class="n" colspan="2" style="text-align:center">parejos</td><td class="n">≈0</td><td class="n"><strong>2.366</strong></td></tr>
+      <tr><td>224 / 248 W</td><td class="n">1.162</td><td class="n">1.358</td><td class="n">+195</td><td class="n">2.303</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="nota">Efecto en el prefill: el desbalance de cómputo entre ranks pasó de <strong>+39,1 % a
+  +0,9 %</strong>, y la espera dentro de las colectivas de <strong>542 a 52 ms por paso</strong>. El paso
+  de prefill bajó 16,6 % y el throughput subió 13,4 % (2.086 → 2.366 tok/s), con TTFT de 30,0 a 26,2 s a
+  57 k. Queda puesto en <code>nvidia-powerlimit.service</code>. Si se cambia una placa o se mueve de
+  slot, hay que rehacer el barrido: el balance es de <em>este</em> par.</p>
+</section>
+
+<section>
+  <h2><span class="num">01</span>Cómo se reparten los 28,2 ms</h2>
+  <div class="barra" role="img" aria-label="Composición del paso: lineales 46%, atención propia 18%, GDN 10%, cuBLAS 8%, all-reduce 7%, resto 11%">
+    <span style="width:46.3%;background:var(--frio)"></span>
+    <span style="width:18.0%;background:var(--acento)"></span>
+    <span style="width:10.2%;background:var(--violeta)"></span>
+    <span style="width:8.0%;background:color-mix(in srgb, var(--frio) 35%, var(--fondo))"></span>
+    <span style="width:7.1%;background:color-mix(in srgb, var(--frio) 60%, var(--fondo))"></span>
+    <span style="width:10.4%;background:var(--tinta2)"></span>
+  </div>
+  <div class="leyenda">
+    <span><i style="background:var(--frio)"></i>Lineales W4A8 Marlin 46,3 %</span>
+    <span><i style="background:var(--acento)"></i>Atención propia en PTX 18,0 %</span>
+    <span><i style="background:var(--violeta)"></i>GDN recurrente 10,2 %</span>
+    <span><i style="background:color-mix(in srgb, var(--frio) 35%, var(--fondo))"></i>Borrador MTP en fp16 8,0 %</span>
+    <span><i style="background:color-mix(in srgb, var(--frio) 60%, var(--fondo))"></i>All-reduce TP 7,1 %</span>
+    <span><i style="background:var(--tinta2)"></i>Norm, quant, copias 10,4 %</span>
+  </div>
+  <p class="nota">Contra el perfil anterior, el all-reduce cayó del 11,4 % al 7,1 % (2.910 → 1.616 µs en
+  el <code>cross_device_reduce</code>, de 20,6 a 11,5 µs por llamada) sin tocar una línea de código: era
+  la GPU rápida esperando a la lenta. Todo lo demás quedó igual, así que Marlin pasó a pesar más en
+  proporción.</p>
+  <div class="dos">
+    <div class="caja">
+      <div class="cifra" style="color:var(--acento)">18,0 %<small>5.088 µs</small></div>
+      <h3>Nuestro, en PTX</h3>
+      <p>Diez kernels escritos a mano: toda la atención del decode (Q·K, softmax entero, w·V, unión de
+      páginas, escritura y lectura de la KV, rotación Hadamard) más el espejo int8 de la ventana reciente.
+      Ni una instrucción de punto flotante.</p>
+    </div>
+    <div class="caja">
+      <div class="cifra" style="color:var(--violeta)">4,9 %<small>1.382 µs</small></div>
+      <h3>Nuestro, en Triton</h3>
+      <p>La cinta de rollback del MTP en GDN (PN122): <code>_k_escribir</code> y <code>_k_spec</code>.
+      Es el único código propio que todavía no está en PTX.</p>
+    </div>
+    <div class="caja">
+      <div class="cifra" style="color:var(--frio)">77,1 %<small>21.739 µs</small></div>
+      <h3>Ajeno</h3>
+      <p>Marlin, cuBLAS, CUTLASS, NCCL y los kernels de vLLM e Inductor. Ahí está el 46 % de las
+      lineales y el 13,3 % del <code>lm_head</code>. Los dos intentos de bajarlo (recortarle el
+      vocabulario al borrador y cuantizarle las lineales) están medidos y descartados: rompen la
+      aceptación del MTP.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">02</span>Kernel por kernel</h2>
+  <p class="nota">Ordenado por costo. <span class="chip ptx">PTX propio</span> es código nuestro escrito
+  en PTX/CUDA inline y lanzado con <code>cuLaunchKernel</code>; <span class="chip tri">Triton propio</span>
+  es código nuestro en Triton; <span class="chip aje">ajeno</span> es upstream (vLLM, Marlin, NCCL,
+  cuBLAS, Inductor).</p>
+  <div class="tabla-caja">
+  <table>
+    <thead><tr>
+      <th>Kernel</th><th>Dónde vive</th><th class="n">µs/paso</th><th class="n">%</th>
+      <th class="n">lanz.</th><th>Qué hace</th><th>Tipos e instrucciones</th><th>Patrón de diseño</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td class="k">marlin::Marlin<br><span style="color:var(--tinta2)">(256 lanz. modelo)</span></td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">9.035</td><td class="n">32,0</td><td class="n">256</td>
+        <td>Todas las lineales del modelo en W4A8: desempaqueta nibbles a registros, los multiplica
+        contra activaciones int8 y acumula en int32.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>activación int8 + escala fp32 por token; pesos int4 empaquetados en int32</span></div><div class="mid">desempaqueta los nibbles a int8 en registros y multiplica con <code>mma.m16n8k16.s32.s8.s8.s32.satfinite</code>; acumulador int32; las escalas se aplican en fp16/fp32 en el epílogo</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">GEMM por tiles con doble buffer (productor-consumidor) y dequant fusionado en el
+        prólogo. Está al 98-103 % del techo de DRAM.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_batch</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">3.810</td><td class="n">13,5</td><td class="n">20</td>
+        <td>Atención int4: Q·K con <code>mma.m16n8k64.s4.s4</code>, softmax entero (potencia de dos por
+        tramos), pesos en tres planos de nibbles y w·V con el mismo mma. Dos pasadas por página: la
+        primera saca el máximo exacto, la segunda usa pesos ya fijos.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q en nibbles s4 (uint8, 2 planos), KV en nibbles s4 (uint8), escalas uint8/int16, sumas de q int32</span></div><div class="mid"><code>cp.async.cg</code> de 16 B a shared; <code>ldmatrix.m8n8.x4.b16</code>; <code>mma.m16n8k64.s32.s4.s4.s32.satfinite</code> con acumulador int32; los logits se arman con productos int32 y UNA multiplicación int64 por par; softmax = potencia de dos por tramos en Q15 (todo entero); pesos en 3 planos de nibbles; máximos y sumas entre lanes con <code>shfl.sync.bfly.b32</code></div><div class="io out"><span class="fl">sale</span><span>int32 (O, máximo, S y corrección del cero de V)</span></div></td>
+        <td class="pat">FlashAttention por tiles, pero con reducción en <em>dos pasadas</em> en vez de
+        softmax en streaming — reescalar acumuladores del mma mientras el pipe tensorial acumula es una
+        carrera. Carga con <code>cp.async</code> en dos etapas.</td>
+      </tr>
+      <tr>
+        <td class="k">marlin::Marlin<br><span style="color:var(--tinta2)">(lm_head)</span></td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">3.744</td><td class="n">13,3</td><td class="n">5</td>
+        <td>Proyección a vocabulario de 248.320 × 5.120 en W4: 318 MB de pesos por GPU y por llamada,
+        una por el modelo y cuatro por los pasos del borrador MTP.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>activación int8; pesos int8 empaquetados (4 por int32) + <code>weight_scale</code> fp16</span></div><div class="mid">mismo <code>mma.m16n8k16.s32.s8.s8.s32</code>, acumulador int32; 318 MB de pesos por llamada</div><div class="io out"><span class="fl">sale</span><span>fp16 (logits de 248.320)</span></div></td>
+        <td class="pat">El mismo GEMM, pero con M=1..5: memoria pura. 749 µs contra 497 de techo → corre
+        al 66 % del ancho de banda sostenido.</td>
+      </tr>
+      <tr>
+        <td class="k">cross_device_reduce</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">1.616</td><td class="n">5,7</td><td class="n">141</td>
+        <td>All-reduce de tensor parallel: 141 colectivas de ~40 KB por paso, dos por capa.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (el parcial de cada rank) + banderas int32</span></div><div class="mid">lectura P2P del buffer del otro rank y suma en fp16 dentro del grafo CUDA</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Colectiva one-shot P2P dentro del grafo CUDA. <strong>11,5 µs cada una, contra
+        20,6 antes de emparejar las placas</strong>: casi la mitad de lo que medía era la GPU rápida
+        esperando. Lo que queda es latencia de PCIe.</td>
+      </tr>
+      <tr>
+        <td class="k">cutlass_80_wmma</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">1.305</td><td class="n">4,6</td><td class="n">48</td>
+        <td>El núcleo recurrente del GDN (gated delta): actualización del estado por capa.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (q, k, v) + estado recurrente fp32</span></div><div class="mid"><code>wmma</code> 16×16×16 con entradas f16 y acumulador fp32</div><div class="io out"><span class="fl">sale</span><span>fp16 + estado fp32</span></div></td>
+        <td class="pat">Scan recurrente con estado persistente, resuelto como GEMM chico de 16×16.</td>
+      </tr>
+      <tr>
+        <td class="k">ampere_fp16_s16816gemm</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">2.262</td><td class="n">8,0</td><td class="n">20</td>
+        <td>Las lineales del módulo MTP (el borrador), que el checkpoint dejó <strong>sin cuantizar</strong>:
+        corren en fp16 por cuBLAS, cuatro veces por paso. Cuantizarlas a W8A8 está probado: anda, ahorra
+        ~1 ms y <strong>baja la aceptación de 88,9 % a 81,9 %</strong>, así que quedó apagado.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (activación y pesos del borrador, sin cuantizar)</span></div><div class="mid"><code>mma.m16n8k16.f32.f16.f16.f32</code>: entradas fp16, acumulador fp32</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">GEMM fp16 genérico de cuBLAS. No hay nada especial: sobra porque el resto del
+        modelo sí está en W4A8.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">_k_escribir · _k_spec</td>
+        <td><span class="chip tri">Triton propio</span></td><td class="n">1.382</td><td class="n">4,9</td><td class="n">96</td>
+        <td>Cinta de rollback del MTP en GDN (PN122): en vez de copiar K veces el estado recurrente,
+        escribe una cinta y la rebobina cuando el MTP rechaza tokens.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (k, v, a, b) + índices int64</span></div><div class="mid">Triton: todo se sube a fp32 para el delta y las compuertas (<code>tl.float32</code>), punteros e índices en int64</div><div class="io out"><span class="fl">sale</span><span>fp16 (cinta y estado)</span></div></td>
+        <td class="pat">Journal / write-ahead log: registrar el delta y deshacerlo, en vez de snapshot.</td>
+      </tr>
+      <tr>
+        <td class="k">_per_token_quant_int8</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">564</td><td class="n">2,0</td><td class="n">256</td>
+        <td>Cuantiza la activación a int8 antes de cada lineal Marlin (una por GEMM).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16</span></div><div class="mid">máximo absoluto por fila en fp32 y división</div><div class="io out"><span class="fl">sale</span><span>int8 + escala fp32</span></div></td>
+        <td class="pat">Map + reducción por fila. Es el caso de libro de un epílogo fusionable: 256
+        lanzamientos que podrían vivir dentro del kernel anterior.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_union4</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">502</td><td class="n">1,8</td><td class="n">20</td>
+        <td>Une los resultados parciales de todas las páginas: toma el máximo global por consulta,
+        reescala cada página con una potencia de dos entera y suma O y S.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>int32 (O, máximo, S, corrección) + mqb/dcap int32</span></div><div class="mid">acumuladores int64; el factor de cada página es una potencia de dos entera en Q15; máximo global entre lanes con <code>shfl.sync.bfly.b32</code></div><div class="io out"><span class="fl">sale</span><span>int64 (O y S por grupo)</span></div></td>
+        <td class="pat">Merge de log-sum-exp = reducción con combinador asociativo (map-reduce). Es el
+        mismo patrón que <code>merge_states</code> de FlashInfer, pero entero.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_batch2 <span style="color:var(--tinta2)">(espejo)</span></td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">470</td><td class="n">1,7</td><td class="n">20</td>
+        <td>La misma atención pero en int8, solo sobre las dos páginas más recientes, que se guardan
+        también en un pool espejo aparte. Ahí se concentra el 39-49 % de la masa de atención. El
+        prefill también lee de ahí: mientras no lo hacía, los tool calls del prompt salían con JSON roto.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q int8, KV int8, escalas int16</span></div><div class="mid"><code>mma.m16n8k32.s32.s8.s8.s32.satfinite</code>, acumulador int32; el mismo softmax entero; el máximo se convierte a las unidades del int4 con una división entera</div><div class="io out"><span class="fl">sale</span><span>int32 (par alto/bajo)</span></div></td>
+        <td class="pat">Caché por niveles con etiqueta: <code>dueno[ranura]</code> valida que el espejo
+        siga siendo de ese bloque, como una caché de mapeo directo.</td>
+      </tr>
+      <tr>
+        <td class="k">ncclDevKernel_AllGather</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">395</td><td class="n">1,4</td><td class="n">9</td>
+        <td>Los pocos colectivos que no entran en el camino rápido (MoE y logits).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16</span></div><div class="mid">protocolo LL de NCCL sobre PCIe</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Ring LL de NCCL.</td>
+      </tr>
+      <tr>
+        <td class="k">elementwise_kernel</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">348</td><td class="n">1,2</td><td class="n">154</td>
+        <td>Copias, slices y casts que quedan entre operadores de PyTorch.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (y algunos int32/int64 de índices)</span></div><div class="mid">copias y casts; sin tensor cores</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Map elementwise. Cada uno es corto; lo que pesa es la cantidad.</td>
+      </tr>
+      <tr>
+        <td class="k">act_and_mul</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">272</td><td class="n">1,0</td><td class="n">68</td>
+        <td>SiLU × gate del MLP.</td><td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16</span></div><div class="mid">SiLU en fp32 y multiplicación</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Map elementwise con dos entradas.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_escribir</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">265</td><td class="n">0,9</td><td class="n">40</td>
+        <td>Escribe la KV en int4: rota k y v con Hadamard entero, saca mínimo, máximo y media por grupo
+        de 64 dimensiones, recorta la escala al 95 % y guarda nibbles con cero por grupo.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>k y v en fp16 leídos como bits (uint16), slot int64, referencias y signos int32</span></div><div class="mid">los bits del fp16 se pasan a magnitud fija de 64 bits con desplazamientos (sin FPU) y de ahí a Q8 int32; Walsh-Hadamard entero con mariposas <code>shfl.sync.bfly.b32</code>; mínimo, máximo y media por grupo entre lanes; recíprocos con <code>div.s64</code> y redondeo en int64</div><div class="io out"><span class="fl">sale</span><span>uint8 (nibbles s4) + escalas uint8/int16</span></div></td>
+        <td class="pat">Scatter con cambio de layout (K por token, V por dimensión) y cuantización
+        asimétrica en el mismo paso. Se lanza dos veces, una por paridad, porque dos tokens vecinos
+        comparten byte en V.</td>
+      </tr>
+      <tr>
+        <td class="k">triton_red/poi_fused</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">918</td><td class="n">3,3</td><td class="n">427</td>
+        <td>RMSNorm, residual, RoPE y casts fusionados por Inductor.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 (activación y residual; bits de posición int32 para RoPE)</span></div><div class="mid">suma de cuadrados y seno/coseno en fp32; el resto es map elementwise</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Reducción por fila + map, generadas por el compilador. 427 lanzamientos por paso.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18i_salida</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">177</td><td class="n">0,6</td><td class="n">20</td>
+        <td>Divide O entre S, des-rota la V con Walsh-Hadamard entero y arma los bits fp16 a mano
+        (con <code>clz</code> y desplazamientos).</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>int64 (O y S por grupo) + referencias y signos int32</span></div><div class="mid">división entera de 64 bits, Walsh-Hadamard entero en int32 entre lanes y armado del fp16 a mano con <code>clz</code> y desplazamientos (redondeo al par, saturación a 65504)</div><div class="io out"><span class="fl">sale</span><span>uint16 (bits fp16)</span></div></td>
+        <td class="pat">Red de mariposas entre lanes (FWHT) + conversión de punto fijo a fp16 sin FPU.</td>
+      </tr>
+      <tr>
+        <td class="k">_causal_conv1d_update</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">166</td><td class="n">0,6</td><td class="n">48</td>
+        <td>La convolución causal corta del GDN.</td><td class="tipos"><div class="io in"><span class="fl">entra</span><span>fp16 + estado en anillo fp16</span></div><div class="mid">acumulación en fp32</div><div class="io out"><span class="fl">sale</span><span>fp16</span></div></td>
+        <td class="pat">Stencil 1-D sobre estado en anillo.</td>
+      </tr>
+      <tr class="propio">
+        <td class="k">sk18h_escribir2 · sk18i_prep · sk18h_prep2 · sk18i_lado</td>
+        <td><span class="chip ptx">PTX propio</span></td><td class="n">250</td><td class="n">0,9</td><td class="n">80</td>
+        <td>Escritura del espejo int8, preparación de las consultas (Hadamard entero + cuantización a
+        nibbles) y el mapeo de qué tokens entran al espejo.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>q/k/v fp16 como bits (uint16), slots int64, referencias int32</span></div><div class="mid">fp16 → Q8 int32 sin FPU; Walsh-Hadamard entero con mariposas; escalas con <code>div.s64</code>; el int8 se parte en dos nibbles con signo (tope 119); aritmética entera pura para el mapeo de ranuras</div><div class="io out"><span class="fl">sale</span><span>uint8/int8 + int32</span></div></td>
+        <td class="pat">Map por fila + FWHT en mariposa; el mapeo del espejo es indexación pura, un hilo
+        por token.</td>
+      </tr>
+      <tr>
+        <td class="k">resto</td>
+        <td><span class="chip aje">ajeno</span></td><td class="n">~730</td><td class="n">2,6</td><td class="n">~290</td>
+        <td>Reducciones del muestreo, gathers de índices, memcpy de estado y kernels sueltos.</td>
+        <td class="tipos"><div class="io in"><span class="fl">entra</span><span>varios</span></div><div class="mid">reducciones del muestreo y gathers de índices</div><div class="io out"><span class="fl">sale</span><span>varios</span></div></td>
+        <td class="pat">Varios.</td>
+      </tr>
+    </tbody>
+    <tfoot><tr><td>Total GPU</td><td></td><td class="n">28.209</td><td class="n">100</td><td class="n">2.166</td>
+      <td colspan="3">Pared por paso: 28.932 µs — quedan ~720 µs de huecos entre kernels.</td></tr></tfoot>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">03</span>El prefill es otro animal</h2>
+  <p>En una ventana de prefill de ~17 k tokens (1,95 s de GPU) el reparto cambia: ahora que las placas
+  están emparejadas, <strong>manda el cómputo</strong>. Antes el all-reduce se llevaba el 41,6 %, pero
+  más de la mitad de eso era espera.</p>
+  <div class="tabla-caja">
+  <table style="min-width:640px">
+    <thead><tr><th>Sección</th><th class="n">ms</th><th class="n">%</th><th class="n">antes</th><th>Comentario</th></tr></thead>
+    <tbody>
+      <tr><td>Lineales W4A8 Marlin</td><td class="n">937,3</td><td class="n">48,0</td><td class="n">36,1 %</td><td>Con M grande: cómputo real. Pasó a ser el dueño del paso.</td></tr>
+      <tr><td>All-reduce / AllGather</td><td class="n">459,1</td><td class="n">23,5</td><td class="n">41,6 %</td><td>Viaja en int8 (PN120). De esto, 369 ms son transferencia y sólo 52 ms siguen siendo espera (eran 542).</td></tr>
+      <tr class="propio"><td>Atención (FlashInfer sobre KV decuantizada)</td><td class="n">215,6</td><td class="n">11,0</td><td class="n">8,3 %</td><td>El único tramo del prefill que no es nuestro: decuantizamos las páginas con un kernel PTX y llamamos al prefill paginado de FlashInfer.</td></tr>
+      <tr><td>Inductor (norm/rope/act)</td><td class="n">107,7</td><td class="n">5,5</td><td class="n">4,5 %</td><td>862 lanzamientos.</td></tr>
+      <tr><td>GDN</td><td class="n">65,4</td><td class="n">3,3</td><td class="n">2,6 %</td><td>2.374 lanzamientos, todos chicos.</td></tr>
+      <tr><td>cuBLAS/cutlass</td><td class="n">52,5</td><td class="n">2,7</td><td class="n">2,1 %</td><td>lm_head y rotaciones.</td></tr>
+      <tr><td>SiLU × gate + cuantización</td><td class="n">59,2</td><td class="n">3,0</td><td class="n">2,5 %</td><td>Candidatos a fusionarse con el GEMM que los rodea.</td></tr>
+      <tr class="propio"><td>Escritura de KV (nuestra, PTX)</td><td class="n">7,7</td><td class="n">0,4</td><td class="n">0,3 %</td><td>80 lanzamientos.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="nota">Total de GPU por paso: <strong>1.953 ms contra 2.340 antes</strong> (−16,6 %). El
+  throughput de prefill subió de 2.086 a 2.366 tok/s (+13,4 %) y el TTFT a 57 k bajó de 30,0 a 26,2 s.
+  Nada de eso es código nuevo: es sólo haber dejado de desperdiciar una placa.</p>
+</section>
+
+<section>
+  <h2><span class="num">04</span>Cómo se midió</h2>
+  <p class="nota">La columna de tipos sale de leer el código: los kernels propios están en
+  <code>vllm/_genesis/kernels/cuda/*.cu</code> (PTX inline, ni una instrucción de punto flotante), la cinta
+  del GDN en <code>vllm/_genesis/gdn_cinta.py</code> (Triton) y el <code>mma</code> de Marlin en
+  <code>csrc/quantization/marlin/marlin_mma.h</code> de vLLM.</p>
+  <p class="nota">Perfil con el torch profiler de vLLM (<code>tests/bench/medicion/perfil_stack.sh</code>),
+  rank 0, 60 pasos de decode con prefijo cacheado de 57.530 tokens y una ventana de prefill en frío de
+  17 k. Traza <code>p2p_final</code>, comparada contra <code>int4_v2</code> (la misma configuración pero
+  con las dos placas a 220 W). Los µs/paso son la suma de duraciones de kernel dividida por la cantidad
+  de pasos (un paso = un <code>eagle_prepare_inputs_padded_kernel</code>). El porcentaje es contra el
+  total de GPU, no contra la pared.</p>
+  <p class="nota">El desbalance entre placas se mide comparando las trazas de <em>los dos</em> ranks
+  (<code>carga_por_rank.py</code> y <code>skew.py</code>): la transferencia real de una colectiva es el
+  <em>mínimo</em> de las dos duraciones, y la diferencia es espera. Sin esa comparación, el desbalance
+  se lee como si fuera costo de comunicación.</p>
+  <p class="nota">Configuración: <code>KVDTYPE=int4_per_token_head</code>, ventana espejo de 2 páginas,
+  MTP K=4, custom all-reduce dentro de los grafos CUDA, TP=2, potencia 229 W en la GPU 0 y 243 W en la
+  GPU 1 (472 W en total, el mismo presupuesto que los 220+220 anteriores más 32 W).</p>
+  <hr>
+  <footer>Genesis · PN131 / SK-18 · perfil <code>p2p_final</code> · 16 de septiembre de 2026</footer>
+</section>
+</div>

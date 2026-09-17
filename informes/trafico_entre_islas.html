@@ -109,84 +109,93 @@
 </style>
 
 <div class="hoja">
-  <div class="sello">Qwen3.8-27B W4A8 · TP=2 · 2× RTX 3090 @220 W · KV int4 · MTP K=4</div>
+  <div class="sello">Qwen3.8-27B W4A8 · TP=2 · 2× RTX 3090 @229/243 W · KV int4 · MTP K=4</div>
   <h1>Dónde se va el paso</h1>
-  <p class="bajada">Perfil por sección de las dos trazas reales (<span class="m">int4_v2</span>), y qué
-  kernels vecinos se pueden unir para dejar de mandar datos de ida y vuelta por memoria. Todos los
-  números son tiempo de GPU normalizado por paso del engine, no reloj de pared.</p>
+  <p class="bajada">Perfil por sección de las dos trazas reales, y qué kernels vecinos se pueden unir
+  para dejar de mandar datos de ida y vuelta por memoria. Todos los números son tiempo de GPU
+  normalizado por paso del engine, no reloj de pared.</p>
+  <div class="nota">
+    <p><strong>Reperfilado sobre la configuración nueva.</strong> Buscando tráfico entre placas
+    apareció algo más grande: <strong>el 23% del paso de prefill era una GPU esperando a la otra</strong>,
+    no comunicación. Las dos 3090 no son iguales — con el mismo tope de 220 W la GPU1 sacaba 615-1.080
+    MHz mientras la GPU0 sacaba 930-1.485, y encima más fría. Repartiendo la potencia 229/243 W (mismo
+    total que antes, 472 W) el desbalance de cómputo entre ranks bajó de <strong>+39,1% a +0,9%</strong>.
+    Todo lo de abajo está medido después de ese cambio; la traza vieja está entre paréntesis donde
+    cambió mucho.</p>
+  </div>
 
   <div class="dos">
     <div class="perfil">
       <header>
         <h3>Decode</h3>
-        <span class="tot n">29.493 µs/paso · 2.166 lanz.</span>
+        <span class="tot n">28.209 µs/paso · 2.166 lanz. <span style="color:var(--tinta-3)">(era 29.493)</span></span>
       </header>
-      <div class="fila"><span class="et">Lineales W4A8 (Marlin)</span><span class="v n">13.037</span><span class="p n">44,2%</span></div>
-      <div class="barra"><i style="width:44.2%"></i></div>
-      <div class="fila"><span class="et">Atención (nuestros kernels)</span><span class="v n">5.073</span><span class="p n">17,2%</span></div>
-      <div class="barra"><i style="width:17.2%"></i></div>
-      <div class="fila"><span class="et">All-reduce de TP</span><span class="v n">3.367</span><span class="p n">11,4%</span></div>
-      <div class="barra calor"><i style="width:11.4%"></i></div>
-      <div class="fila"><span class="et">GDN (recurrente + conv)</span><span class="v n">2.859</span><span class="p n">9,7%</span></div>
-      <div class="barra"><i style="width:9.7%"></i></div>
-      <div class="fila"><span class="et">cuBLAS/cutlass (lm_head, rot.)</span><span class="v n">2.255</span><span class="p n">7,6%</span></div>
-      <div class="barra"><i style="width:7.6%"></i></div>
-      <div class="fila"><span class="et">Norma/rope de inductor</span><span class="v n">928</span><span class="p n">3,1%</span></div>
-      <div class="barra calor"><i style="width:3.1%"></i></div>
-      <div class="fila"><span class="et">Copias / elementwise / índices</span><span class="v n">609</span><span class="p n">2,1%</span></div>
-      <div class="barra calor"><i style="width:2.1%"></i></div>
-      <div class="fila"><span class="et">Cuantización int8</span><span class="v n">560</span><span class="p n">1,9%</span></div>
-      <div class="barra calor"><i style="width:1.9%"></i></div>
-      <div class="fila"><span class="et">Escritura de KV</span><span class="v n">388</span><span class="p n">1,3%</span></div>
-      <div class="barra"><i style="width:1.3%"></i></div>
-      <div class="fila"><span class="et">SiLU × gate</span><span class="v n">352</span><span class="p n">1,2%</span></div>
-      <div class="barra calor"><i style="width:1.2%"></i></div>
+      <div class="fila"><span class="et">Lineales W4A8 (Marlin)</span><span class="v n">13.051</span><span class="p n">46,3%</span></div>
+      <div class="barra"><i style="width:46.3%"></i></div>
+      <div class="fila"><span class="et">Atención (nuestros kernels)</span><span class="v n">5.088</span><span class="p n">18,0%</span></div>
+      <div class="barra"><i style="width:18.0%"></i></div>
+      <div class="fila"><span class="et">All-reduce de TP</span><span class="v n">2.011</span><span class="p n">7,1%</span></div>
+      <div class="barra calor"><i style="width:7.1%"></i></div>
+      <div class="fila"><span class="et">GDN (recurrente + conv)</span><span class="v n">2.888</span><span class="p n">10,2%</span></div>
+      <div class="barra"><i style="width:10.2%"></i></div>
+      <div class="fila"><span class="et">cuBLAS/cutlass (lm_head, rot.)</span><span class="v n">2.262</span><span class="p n">8,0%</span></div>
+      <div class="barra"><i style="width:8.0%"></i></div>
+      <div class="fila"><span class="et">Norma/rope de inductor</span><span class="v n">918</span><span class="p n">3,3%</span></div>
+      <div class="barra calor"><i style="width:3.3%"></i></div>
+      <div class="fila"><span class="et">Copias / elementwise / índices</span><span class="v n">614</span><span class="p n">2,2%</span></div>
+      <div class="barra calor"><i style="width:2.2%"></i></div>
+      <div class="fila"><span class="et">Cuantización int8</span><span class="v n">564</span><span class="p n">2,0%</span></div>
+      <div class="barra calor"><i style="width:2.0%"></i></div>
+      <div class="fila"><span class="et">Escritura de KV</span><span class="v n">389</span><span class="p n">1,4%</span></div>
+      <div class="barra"><i style="width:1.4%"></i></div>
+      <div class="fila"><span class="et">SiLU × gate</span><span class="v n">354</span><span class="p n">1,3%</span></div>
+      <div class="barra calor"><i style="width:1.5%"></i></div>
     </div>
 
     <div class="perfil">
       <header>
         <h3>Prefill <span style="color:var(--tinta-3);font-weight:400">(chunk de 8.160 tokens)</span></h3>
-        <span class="tot n">2.340.066 µs/paso · 7.305 lanz.</span>
+        <span class="tot n">1.952.669 µs/paso · 7.337 lanz. <span style="color:var(--tinta-3)">(era 2.340.066)</span></span>
       </header>
-      <div class="fila"><span class="et">All-reduce de TP</span><span class="v n">973.325</span><span class="p n">41,6%</span></div>
-      <div class="barra calor"><i style="width:41.6%"></i></div>
-      <div class="fila"><span class="et">Lineales W4A8 (Marlin)</span><span class="v n">844.654</span><span class="p n">36,1%</span></div>
-      <div class="barra"><i style="width:36.1%"></i></div>
-      <div class="fila"><span class="et">Atención (FlashInfer prefill)</span><span class="v n">194.209</span><span class="p n">8,3%</span></div>
-      <div class="barra"><i style="width:8.3%"></i></div>
-      <div class="fila"><span class="et">Norma/quant/dequant de inductor</span><span class="v n">106.395</span><span class="p n">4,5%</span></div>
-      <div class="barra calor"><i style="width:4.5%"></i></div>
-      <div class="fila"><span class="et">GDN (recurrente + conv)</span><span class="v n">60.872</span><span class="p n">2,6%</span></div>
-      <div class="barra"><i style="width:2.6%"></i></div>
-      <div class="fila"><span class="et">cuBLAS/cutlass</span><span class="v n">48.350</span><span class="p n">2,1%</span></div>
-      <div class="barra"><i style="width:2.1%"></i></div>
-      <div class="fila"><span class="et">SiLU × gate</span><span class="v n">29.422</span><span class="p n">1,3%</span></div>
-      <div class="barra calor"><i style="width:1.3%"></i></div>
-      <div class="fila"><span class="et">Cuantización int8</span><span class="v n">29.242</span><span class="p n">1,2%</span></div>
-      <div class="barra calor"><i style="width:1.2%"></i></div>
-      <div class="fila"><span class="et">Copias / elementwise</span><span class="v n">10.363</span><span class="p n">0,4%</span></div>
-      <div class="barra calor"><i style="width:0.4%"></i></div>
-      <div class="fila"><span class="et">Escritura de KV</span><span class="v n">7.416</span><span class="p n">0,3%</span></div>
-      <div class="barra"><i style="width:0.3%"></i></div>
+      <div class="fila"><span class="et">All-reduce de TP</span><span class="v n">459.089</span><span class="p n">23,5%</span></div>
+      <div class="barra calor"><i style="width:23.5%"></i></div>
+      <div class="fila"><span class="et">Lineales W4A8 (Marlin)</span><span class="v n">937.295</span><span class="p n">48,0%</span></div>
+      <div class="barra"><i style="width:48.0%"></i></div>
+      <div class="fila"><span class="et">Atención (FlashInfer prefill)</span><span class="v n">215.634</span><span class="p n">11,0%</span></div>
+      <div class="barra"><i style="width:11.0%"></i></div>
+      <div class="fila"><span class="et">Norma/quant/dequant de inductor</span><span class="v n">107.675</span><span class="p n">5,5%</span></div>
+      <div class="barra calor"><i style="width:5.5%"></i></div>
+      <div class="fila"><span class="et">GDN (recurrente + conv)</span><span class="v n">65.385</span><span class="p n">3,3%</span></div>
+      <div class="barra"><i style="width:3.3%"></i></div>
+      <div class="fila"><span class="et">cuBLAS/cutlass</span><span class="v n">52.458</span><span class="p n">2,7%</span></div>
+      <div class="barra"><i style="width:2.2%"></i></div>
+      <div class="fila"><span class="et">SiLU × gate</span><span class="v n">29.821</span><span class="p n">1,5%</span></div>
+      <div class="barra calor"><i style="width:1.4%"></i></div>
+      <div class="fila"><span class="et">Cuantización int8</span><span class="v n">29.391</span><span class="p n">1,5%</span></div>
+      <div class="barra calor"><i style="width:1.5%"></i></div>
+      <div class="fila"><span class="et">Copias / elementwise</span><span class="v n">10.553</span><span class="p n">0,5%</span></div>
+      <div class="barra calor"><i style="width:0.5%"></i></div>
+      <div class="fila"><span class="et">Escritura de KV</span><span class="v n">7.668</span><span class="p n">0,4%</span></div>
+      <div class="barra"><i style="width:0.4%"></i></div>
     </div>
   </div>
-  <p style="font-size:.82rem;color:var(--tinta-3)">En ámbar, las secciones que existen sólo para
-  convertir o mover datos entre otras dos: 7,6% del decode y 7,4% del prefill.</p>
+  <p style="font-size:.82rem;color:var(--tinta-3)">En ámbar, las secciones que existen sólo para convertir o mover datos entre otras dos: 8,8% del decode y 9,0% del prefill.</p>
 
   <h2>Los dos cuellos son distintos</h2>
   <p><strong>En decode manda la latencia.</strong> Con M=5 tokens por paso (1 + 4 del MTP), cada
   kernel tarda ~2 µs en arrancar y casi nada en trabajar; 2.166 lanzamientos por paso son ~4 ms de
   puro arranque. Los GEMM ya están contra el techo de DRAM, así que fusionar sólo gana el
   lanzamiento que desaparece.</p>
-  <p><strong>En prefill manda el PCIe.</strong> El all-reduce mueve 42 MB en int8 por llamada y
-  tarda 3,9 ms: son <span class="m">10,8 GB/s</span>, el techo físico del enlace. No hay nada que
-  ganar del lado del kernel — sólo mandando menos bytes, o solapando la comunicación con el cálculo.</p>
+  <p><strong>En prefill manda el cómputo</strong>, y eso es nuevo: emparejar las placas movió el
+  all-reduce del 41,6% al 23,5% y dejó a Marlin como el dueño del paso con el 48%. De esos 23,5%
+  restantes, la transferencia real son 369 ms y sólo 52 ms siguen siendo espera (antes eran 542).</p>
 
   <div class="nota">
-    <p><strong>El detalle que más llama la atención:</strong> cada all-reduce dispara <em>dos</em>
-    AllGather, uno con los datos (3,9 ms) y otro con las escalas por grupo (140 µs para 32 KB, es
-    toda latencia). Empaquetando las escalas al final del mismo buffer se ahorra un AllGather
-    entero por all-reduce: ~19 ms por paso de prefill, sin tocar la numérica.</p>
+    <p><strong>La lección de medición:</strong> el perfil le achacaba al all-reduce un costo que era
+    de otro. El kernel de NCCL cuenta como duración el tiempo que el rank que llega primero pasa
+    adentro esperando al otro, así que un desbalance de cómputo se disfraza de comunicación. Se ve
+    comparando las trazas de <em>los dos</em> ranks: rank0 medía 932 ms de AllGather y rank1 398 ms
+    sobre la misma colectiva. El mínimo de los dos es la transferencia; la diferencia es espera.</p>
   </div>
 
   <h2>Uniones candidatas, ordenadas por lo que devuelven</h2>
@@ -244,8 +253,9 @@
       </tr>
       <tr>
         <td>norma → quant → escala×factor global</td>
-        <td><strong>SK-20</strong>: los tres en un kernel. Ya está escrito y medido (1,04× en
-            decode, 1,22× en prefill), pero el traspaso del int8 no sobrevive a torch.compile.</td>
+        <td><strong>SK-20</strong>: los tres en un kernel. Escrito y medido (1,04× en decode,
+            1,22× en prefill), pero el traspaso del int8 al lineal no sobrevive a torch.compile: hay
+            que pasar por buffers fijos leídos por identidad de capa.</td>
         <td class="n">~120 µs<br>0,4%</td>
         <td class="n">~7 ms<br>0,3%</td>
         <td><span class="chip medio">medio</span></td>
@@ -270,37 +280,55 @@
   </table>
   </div>
 
-  <h2>El all-reduce sí se puede esconder — pero no con NCCL</h2>
-  <p>La comunicación puede pasar mientras el SM calcula, porque el bloque MLP es por token: se lo
-  parte en trozos y el trozo <em>i</em> viaja mientras se calcula el <em>i+1</em>. Lo medí con dos
-  procesos reales sobre las dos placas. La sorpresa está en el transporte.</p>
+  <h2>El P2P anda a pleno — pero esconder el all-reduce ya no compra nada</h2>
+  <p>La idea era partir el bloque MLP en trozos (es por token, así que partirlo es exacto) y mandar
+  el trozo <em>i</em> mientras se calcula el <em>i+1</em>. Se cableó entero, corre, y da el mismo
+  resultado bit a bit. <strong>No mueve la aguja:</strong></p>
   <div class="scroll">
   <table>
-    <thead><tr><th>Transporte y nivel</th><th class="n">Solape</th><th class="n">Ganancia</th><th>Por qué</th></tr></thead>
+    <thead><tr><th>Escenario</th><th class="n">Apagado</th><th class="n">Prendido</th><th class="n">Δ</th></tr></thead>
     <tbody>
-      <tr><td>NCCL, sin dependencia ninguna</td><td class="n">23%</td><td class="n">—</td><td>sus kernels compiten por SM</td></tr>
-      <tr><td>NCCL con <span class="m">MAX_NCHANNELS=2</span></td><td class="n">42-58%</td><td class="n">—</td><td>menos canales, menos contención</td></tr>
-      <tr><td>NCCL, pipeline en <span class="m">down_proj</span></td><td class="n">—</td><td class="n">1,09×</td><td>poco detrás de qué esconderse</td></tr>
-      <tr class="calor"><td>NCCL, pipeline en el bloque MLP</td><td class="n">0%</td><td class="n">1,00×</td><td>el MLP llena los 82 SM y NCCL no consigue lugar; darle prioridad al stream no cambia nada</td></tr>
-      <tr><td><strong>DMA P2P, pipeline en el bloque MLP</strong></td><td class="n"><strong>98-101%</strong></td><td class="n"><strong>1,27-1,34×</strong></td><td>lo ejecuta el motor de copia: no usa SM, solapa por construcción</td></tr>
+      <tr><td>Una petición por vez (prefill de 42k)</td><td class="n">2.383 tok/s</td><td class="n">2.390</td><td class="n">+0,3%</td></tr>
+      <tr><td>Cinco peticiones concurrentes</td><td class="n">2.627 tok/s</td><td class="n">2.622</td><td class="n">−0,2%</td></tr>
     </tbody>
   </table>
   </div>
-  <div class="nota">
-    <p><strong>La trampa que casi me hace descartar la idea:</strong> el <span class="m">copy_</span>
-    de torch toma un camino lento cuando el <em>destino</em> es un tensor importado por IPC —
-    5,9 GB/s contra 11,0 de NCCL. Parecía que el DMA era la mitad de rápido. No lo es: llamando
-    <span class="m">cudaMemcpyPeerAsync</span> a mano da 11,4 GB/s, y <em>tirando</em> (destino
-    local, origen remoto) da <strong>12,9 GB/s</strong>, por encima de NCCL. Con el transporte
-    corregido el solape pasó de 83% a 100% y la ganancia de 1,19× a 1,34×.</p>
+  <p>Por qué: con los parciales ya en int8 (mitad de bytes) y las placas emparejadas, lo que queda de
+  intercambio es chico al lado del cómputo del bloque MLP. Queda apagado y documentado.</p>
+
+  <h3>Lo que sí quedó aprendido del transporte</h3>
+  <p>El camino importa muchísimo, y no por el hardware sino por <em>cómo se comparte la memoria</em>.
+  Medido sobre 40 MB, compartiendo el <em>mismo</em> tensor de tres formas:</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Forma de compartir</th><th class="n">memcpyPeer</th><th>¿un kernel puede leerlo?</th></tr></thead>
+    <tbody>
+      <tr class="calor"><td><span class="m">reduce_tensor</span> de torch</td><td class="n">4,9 GB/s</td><td><strong>no, acceso ilegal</strong></td></tr>
+      <tr><td><span class="m">cudaIpcGetMemHandle</span> a mano sobre el tensor de torch</td><td class="n"><strong>13,0 GB/s</strong></td><td>sí</td></tr>
+      <tr><td><span class="m">cudaMalloc</span> crudo + IPC a mano</td><td class="n">13,0 GB/s</td><td>sí</td></tr>
+    </tbody>
+  </table>
   </div>
-  <p>Las dos placas están en el mismo puente PCIe con P2P habilitado, así que la copia va directa
-  de una memoria a la otra, sin pasar por la RAM del host. El enlace es x8 (límite del slot) y
-  entrena a gen4 bajo carga: 15,8 GB/s teóricos, 12,9 medidos.</p>
-  <p>Partir el MLP es <strong>exacto</strong> (verificado: diferencia 0), porque cada token pasa
-  por gate_up, SiLU×gate y down sin mirar a los demás. Lo que falta para cablearlo: buzones IPC
-  persistentes (vLLM ya tiene esa maquinaria en su all-reduce propio), que el bloque partido sea
-  un custom op para sobrevivir a torch.compile, y la sincronización entre ranks.</p>
+  <p>O sea que no hace falta memoria cruda: alcanza con hacer el IPC uno mismo. El culpable es
+  exactamente <span class="m">reduce_tensor</span>, 2,6× más lento y además deja la memoria fuera del
+  alcance de los kernels. Con el IPC bien hecho, los transportes quedan así:</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Transporte</th><th class="n">GB/s</th><th class="n">SM que usa</th><th class="n">Solape con un GEMM</th></tr></thead>
+    <tbody>
+      <tr><td>NCCL all_gather</td><td class="n">11,0</td><td class="n">muchos</td><td class="n">25%</td></tr>
+      <tr><td><strong><span class="m">cudaMemcpyPeerAsync</span></strong></td><td class="n"><strong>13,0</strong></td><td class="n">ninguno</td><td class="n"><strong>105%</strong></td></tr>
+      <tr><td>Kernel propio en PTX, 4 bloques</td><td class="n">9,6</td><td class="n">5%</td><td class="n">92%</td></tr>
+      <tr><td>Kernel propio en PTX, 8 bloques</td><td class="n">11,4</td><td class="n">10%</td><td class="n">93%</td></tr>
+      <tr><td>Kernel propio en PTX, 32 bloques</td><td class="n">11,4</td><td class="n">39%</td><td class="n">53%</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>El motor de copia gana por goleada: más ancho de banda que NCCL y solape total, sin gastar un SM.
+  El kernel propio sirve cuando se quiera repartir SM a mano, que es lo que NCCL no deja hacer. Las dos
+  placas cuelgan del mismo puente PCIe con el driver de P2P por BAR1, así que la copia va directa de
+  una memoria a la otra sin pasar por la RAM del host — y se verificó que ACS <em>no</em> era el
+  problema (apagarlo no movió nada; <span class="m">iommu=pt</span> ya estaba).</p>
 
   <h2>El all-reduce no puede bajar de int8</h2>
   <p>Era el candidato de 16%, así que lo medí con las condiciones reales (outliers dispersos, dos
@@ -326,6 +354,27 @@
   <p><strong>Conclusión:</strong> para bajar el prefill hay que <em>solapar</em> la comunicación con
   el cálculo, no comprimir más. Esa es la fila de arriba de la tabla, y es la única que queda con
   premio grande.</p>
+
+  <h2>Cómo quedó la arquitectura</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tramo</th><th>Quién lo hace hoy</th><th>Estado</th></tr></thead>
+    <tbody>
+      <tr><td>Reparto de potencia</td><td>229 W en la GPU0, 243 W en la GPU1 (472 W en total), en
+          <span class="m">nvidia-powerlimit.service</span></td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>Lineales</td><td>Marlin W4A8: activación int8 por token, pesos int4, acumulador int32</td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>Atención en decode</td><td>Nuestra, en PTX entero: <span class="m">mma.s4.s4</span> para KV int4 + espejo int8 de las dos páginas recientes</td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>Atención en prefill</td><td>FlashInfer sobre la KV des-cuantizada con kernel propio (lee del espejo donde lo hay)</td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>KV</td><td>int4 por token-cabeza, asimétrica con cero por grupo, Hadamard entero</td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>All-reduce de TP</td><td>Parciales en int8 con escala por grupo de 64 (PN120) sobre NCCL; en decode, el all-reduce propio de vLLM dentro del grafo</td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>Rollback del MTP en GDN</td><td>Cinta en Triton (PN122) en vez de copiar el estado</td><td><span class="chip hecho">en producción</span></td></tr>
+      <tr><td>P2P entre placas</td><td>Driver con BAR1 (<span class="m">nvidia-p2p/610.57.04</span>) + <span class="m">iommu=pt</span>; 13 GB/s medidos</td><td><span class="chip hecho">disponible</span></td></tr>
+      <tr><td>MLP solapado (PN136)</td><td>Buzones IPC propios + copia P2P; exacto pero sin ganancia</td><td><span class="chip medio">escrito, apagado</span></td></tr>
+      <tr><td>Norma + quant fusionadas (SK-20)</td><td>Un kernel; falta el traspaso del int8 al lineal</td><td><span class="chip medio">escrito, sin cablear</span></td></tr>
+      <tr><td>Quant int8 + factor global (PN134/SK-19)</td><td>Un kernel propio; quedó en paridad</td><td><span class="chip medio">escrito, apagado</span></td></tr>
+    </tbody>
+  </table>
+  </div>
 
   <h2>Conversiones que se podrían borrar de raíz</h2>
   <p>Más allá de unir kernels vecinos, hay tres conversiones estructurales que existen sólo porque
@@ -366,9 +415,11 @@
   </ul>
 
   <div class="pie">
-    Trazas: <span class="m">tests/bench/medicion/trazas/int4_v2_{decode,prefill}</span> ·
+    Trazas: <span class="m">tests/bench/medicion/trazas/p2p_final_{decode,prefill}</span>
+    (16/09, con 229/243 W), comparadas contra <span class="m">int4_v2_*</span> (220/220 W) ·
     60 pasos de decode a 57k de contexto y 3 pasos de prefill ·
-    scripts <span class="m">secciones_traza.py</span>, <span class="m">cadena_traza.py</span>,
-    <span class="m">nccl_hist.py</span>.
+    scripts <span class="m">secciones_traza.py</span>, <span class="m">carga_por_rank.py</span>,
+    <span class="m">skew.py</span>, <span class="m">cadena_traza.py</span>,
+    <span class="m">nccl_inventario.py</span>, <span class="m">pp_concurrente.py</span>.
   </div>
 </div>
