@@ -320,8 +320,13 @@ services:
       - "float16"
       - --kv-cache-dtype
       - "fp8_e4m3"
+      # 10 -> 24 (2026-09-17). Medido: con 12 pedidos concurrentes el throughput agregado pasa
+      # de 490 a 733 tok/s, con 16 de 604 a 815 y con 24 de 597 a 860 (+35% a +49%). Con 10 el
+      # tope real del lote era 10 secuencias y los pedidos hacian cola; lo que parecia un
+      # "acantilado a 12 pedidos" era eso. Verificado sobre el patron real de carga (un hilo de
+      # 80k mas 6 subagentes de 6k): CERO preempciones, que es el riesgo de subirlo.
       - --max-num-seqs
-      - "10"
+      - "24"
       - --tensor-parallel-size
       - "2"
       - --max-model-len
