@@ -1,5 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # noon-at-cgn/Qwen3.8-27B-Uncensored-W4A16-AutoRound servido como W4A8
+# KV de atencion en INT8 por token-cabeza (PN131 / SK-18g)
 # 2x RTX 3090 (GA102, sm_86), TP=2, MTP nativo K=3
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -82,7 +83,9 @@ services:
       - GENESIS_PN92_CHUNK_ELEMS=1048576
       - GENESIS_ENABLE_PN93_SPARSE_GDN=0
       - GENESIS_PN93_GDN_CHECKPOINT_STRIDE=16
-      - GENESIS_ENABLE_PN99_GPU_COMPRESSED_L2=1
+      # PN99 comprime a 4 bits asumiendo que el KV es fp8; con el KV en int8 por
+      # token-cabeza el layout no le corresponde.
+      - GENESIS_ENABLE_PN99_GPU_COMPRESSED_L2=0
       - GENESIS_PN100_RING_BLOCKS=32
       - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1
       - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1
@@ -127,7 +130,9 @@ services:
       #   salida no cambia. No paga el costo.
       - GENESIS_ENABLE_B3_CUSTOM_AR=1
       - GENESIS_ENABLE_B2_FULL_CG=0
-      - GENESIS_ENABLE_P100=1
+      # P100 y PN129 son especificos de FlashInfer (cudagraph FULL para spec-decode
+      # y el workspace de decode sin pin). Con TRITON_ATTN no tienen donde aplicarse.
+      - GENESIS_ENABLE_P100=0
       # PN115: admision por headroom de bloques KV + bypass por prioridad.
       # El gating de KV protege de fallos de allocate_slots y tormentas de
       # preemption. El PID de latencia va APAGADO: cambia throughput por
@@ -222,7 +227,7 @@ services:
       # PN128: input-prep async espera el postproceso del spec decode (Xid 31 VIRT_WRITE).
       - GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER=1
       # PN129: buffer de decode de FlashInfer sin pin (Xid 31 VIRT_READ con >=4 requests MTP; visto 2026-09-13).
-      - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=1
+      - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=0
       # PN122: el rollback del MTP en GDN usa una cinta en vez de K copias del
       # estado. Medido: ~18 bloques GDN por request con K=3.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
@@ -308,6 +313,27 @@ services:
       #      -8*escala por grupo y resultados distintos en cada llamada)
       # La .so se recompila sola cuando cambia el fuente (huella en huella.txt).
       - GENESIS_ENABLE_PN130_MARLIN_S16=1
+      #
+      # PN131 (SK-18g): el decode de la atencion en un kernel entero propio (PTX)
+      # que lee la KV en int8. Sin esto, --kv-cache-dtype int8_per_token_head no
+      # tiene quien lo atienda.
+      - GENESIS_ENABLE_PN131_SK18=1
+      #
+      # PN124: TRITON_ATTN viene sin afinar para Ampere y pierde 40% de prefill y
+      # 3-4x de decode largo. Dos causas, las dos arregladas aca: BLOCK_M=16 deja
+      # 2 queries por programa (el afinado para head 256 esta atado a Blackwell y
+      # ademas no entra en la SRAM de Ampere), y el kernel 3D paralelo exige
+      # max_seqlen_q==1, que con MTP K=3 nunca se cumple. OBLIGATORIO con
+      # TRITON_ATTN: sin el, el cambio no compensa.
+      - GENESIS_ENABLE_PN124_TRITON_AMPERE=1
+      #
+      # PN131 dimensiona sus acumuladores para un lote MAXIMO y tira el pedido si
+      # se pasa. Deberia leerlo de --max-num-seqs, pero el contexto de config de
+      # vLLM no esta disponible cuando arma los buffers (corre en la primera
+      # inferencia del worker), asi que cae a 10 y el servidor se muere al llegar
+      # el lote 11: "RuntimeError: PN131: lote 12 > GENESIS_PN131_BMAX 10".
+      # Tiene que ACOMPAÑAR a --max-num-seqs de mas abajo.
+      - GENESIS_PN131_BMAX=24
       - VLLM_USE_FUSED_MOE_GROUPED_TOPK=1
       - VLLM_LOGGING_LEVEL=INFO
       - GENESIS_VERBOSE=0
@@ -359,8 +385,11 @@ services:
       - "/metrics,/health"
       - --enable-prompt-tokens-details
       - --trust-remote-code
+      # PN131 corre sobre TRITON_ATTN, no sobre FlashInfer: reemplaza el kernel de
+      # decode de la atencion por el propio (SK-18g en PTX). FlashInfer no expone
+      # el punto de enganche ni acepta un KV entero por token-cabeza.
       - --attention-backend
-      - FLASHINFER
+      - TRITON_ATTN
       - --moe-backend
       - flashinfer_trtllm
       - --generation-config
@@ -373,19 +402,17 @@ services:
       - float16
       - --mamba-ssm-cache-dtype
       - "float16"
-      # KV de la atencion. HAY UNA DEUDA ACA, anotada 2026-09-17: una nota de
-      # julio dice que fp8 degrada la calidad en este hibrido (corrupcion a baja
-      # tasa: parentesis que se caen, palabras truncadas) y que el W4A8
-      # productivo usaba "auto". Alguien lo volvio a fp8 despues, sin re-medir.
-      # Las opciones, con lo que ya esta medido:
-      #   auto (fp16)  sin degradacion, pero la KV cae a la mitad (~310k tokens)
-      #   fp8_e4m3     620k tokens, y la duda de calidad de la nota de julio
-      #   int8 (PN131) 620k tokens, misma velocidad que fp8 y 4x MENOS error
-      #   int4 (PN131) ~1,2M tokens, pero -27% prefill y -21% decode largo
-      # Se deja como estaba para no mezclarlo con la tanda de Marlin. Medir la
-      # calidad de ESTE checkpoint antes de moverlo.
+      # KV de la atencion en int8 asimetrico POR TOKEN-CABEZA, con el kernel propio
+      # de PN131. Reemplaza al fp8_e4m3 que habia antes, y no es un capricho:
+      #   * una nota de julio registra que fp8 DEGRADA la calidad en este hibrido
+      #     (corrupcion a baja tasa: parentesis que se caen, palabras truncadas)
+      #   * int8 por token-cabeza tiene 4x MENOS error de cuantizacion que fp8
+      #   * ocupa lo mismo (1 byte), asi que la KV no se achica
+      #   * y esta medida la paridad con FlashInfer+fp8 en decode y prefill
+      # Es el nombre exacto que mira PN131 para elegir su camino: con cualquier
+      # otro valor el parche no engancha y el KV cae al generico de vLLM.
       - --kv-cache-dtype
-      - "fp8_e4m3"
+      - "int8_per_token_head"
       # 10 -> 24 (2026-09-17). Medido: con 12 pedidos concurrentes el throughput agregado pasa
       # de 490 a 733 tok/s, con 16 de 604 a 815 y con 24 de 597 a 860 (+35% a +49%). Con 10 el
       # tope real del lote era 10 secuencias y los pedidos hacian cola; lo que parecia un
