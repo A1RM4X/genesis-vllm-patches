@@ -2442,13 +2442,14 @@ def apply_patch_N129() -> PatchResult:
     return _failed(name, reason)
 
 
-@register_patch("Genesis act_stats (telemetria de activaciones)")
+@register_patch("Genesis act_stats / escala estatica")
 def apply_patch_actstats() -> PatchResult:
     """Sonda apagada por omision: solo mide la distribucion de amax por token."""
     name = "Genesis act_stats"
     import os
-    if os.environ.get("GENESIS_ACT_STATS", "0") != "1":
-        return _skipped(name, "opt-in: GENESIS_ACT_STATS=1")
+    if (os.environ.get("GENESIS_ACT_STATS", "0") != "1"
+            and os.environ.get("GENESIS_ESCALA_ESTATICA", "0") != "1"):
+        return _skipped(name, "opt-in: GENESIS_ACT_STATS=1 o GENESIS_ESCALA_ESTATICA=1")
     if not _APPLY_MODE:
         return _applied(name, "dry-run: text-patch ready")
     try:

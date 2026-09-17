@@ -54,6 +54,10 @@ LO, HI, PASO = -20.0, 12.0, 0.25
 NCAJAS = int((HI - LO) / PASO)
 
 _hist: dict[str, torch.Tensor] = {}
+_maxabs: dict[str, torch.Tensor] = {}   # maximo exacto por sitio (EN GPU: leerlo sincroniza)
+# Histograma de log2(amax / rms) por token: dice si el amax de un token lo hace UN canal que pincha
+# (cresta alta -> la rotacion de Hadamard lo aplasta) o si la fila ya es plana (rotar no sirve).
+_cresta: dict[str, torch.Tensor] = {}
 _llamadas: dict[str, int] = {}
 _volcado = False
 _tot = 0
@@ -82,21 +86,49 @@ def registrar(x: torch.Tensor, nombre: str) -> None:
     """
     if not ACTIVO:
         return
+    # Durante la captura de grafos CUDA no se puede SINCRONIZAR con el host (revienta la captura).
+    # El histograma si se puede acumular: vive en un tensor reservado durante el prefill, que no es
+    # capturado, y escribirle desde adentro del grafo persiste entre reproducciones. Lo que NO se
+    # guarda durante la captura es el maximo exacto, porque quedaria apuntando al pool privado de
+    # la captura (la leccion de PN131).
+    capturando = torch.cuda.is_current_stream_capturing()
+    if capturando and nombre not in _hist:
+        return                      # sin histograma previo habria que reservar: no durante captura
     try:
         n = _llamadas.get(nombre, 0)
         if n >= TOPE:
             return
         _llamadas[nombre] = n + 1
         plano = x.reshape(-1, x.shape[-1])
-        amax = plano.abs().amax(dim=-1).float().clamp_min(1e-30)
+        # Las filas de relleno del prefill chunked traen memoria SIN INICIALIZAR, o sea NaN a
+        # veces: sin limpiarlas el maximo queda envenenado (y el histograma, sesgado).
+        amax = torch.nan_to_num(plano.abs().amax(dim=-1).float(), nan=0.0, posinf=0.0)
+        amax = amax.clamp_min(1e-30)
         caja = ((amax.log2() - LO) / PASO).long().clamp_(0, NCAJAS - 1)
         h = _hist.get(nombre)
         if h is None:
             h = torch.zeros(NCAJAS, dtype=torch.long, device=x.device)
             _hist[nombre] = h
         h.scatter_add_(0, caja, torch.ones_like(caja))
+        # cresta = amax / rms de la fila. Para una fila gaussiana de N=5120 da ~3,9 (log2 ~1,96);
+        # mucho mas que eso significa que el maximo lo pone un canal aislado.
+        rms = torch.nan_to_num(plano.float().pow(2).mean(-1), nan=1.0).clamp_min(1e-30).sqrt()
+        cr = ((amax / rms).log2() * 8.0).long().clamp_(0, NCAJAS - 1)   # 1/8 de bit por caja
+        hc = _cresta.get(nombre)
+        if hc is None:
+            if capturando:
+                return
+            hc = torch.zeros(NCAJAS, dtype=torch.long, device=x.device)
+            _cresta[nombre] = hc
+        hc.scatter_add_(0, cr, torch.ones_like(cr))
+        if not capturando:
+            m = amax.max()                  # se queda en GPU: leerlo aca sincronizaria
+            prev = _maxabs.get(nombre)
+            _maxabs[nombre] = m if prev is None else torch.maximum(prev, m)
         global _tot
         _tot += 1
+        if capturando:
+            return                  # el resto (volcado) sincroniza
         if _tot == 1:
             log.warning("act_stats: primera llamada, forma %s", tuple(plano.shape))
         if _tot % TOTAL == 0:
@@ -127,8 +159,24 @@ def volcar() -> None:
     """Se puede llamar varias veces: reescribe el archivo con lo acumulado hasta el momento."""
     if not _hist:
         return
-    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
-    datos = {n: _percentiles(h.cpu()) for n, h in _hist.items()}
+    # Con el PID, no por rank: en los workers de vLLM RANK no esta en el entorno, asi que los dos
+    # escribian el MISMO archivo y se pisaban a mitad de escritura (JSON truncado).
+    rank = f"{os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0'))}_{os.getpid()}"
+    datos = {}
+    for n, h in _hist.items():
+        d = _percentiles(h.cpu())
+        if d:
+            hc = _cresta.get(n)
+            if hc is not None:
+                ac = torch.cumsum(hc.cpu(), 0)
+                tt = int(ac[-1])
+                if tt:
+                    for pc in (50, 99):
+                        idx = int(torch.searchsorted(ac, max(1, tt * pc // 100)))
+                        d[f"cresta_p{pc}"] = round(min(idx, NCAJAS - 1) / 8.0, 3)
+            t = _maxabs.get(n)
+            d["amax"] = float(t) if t is not None else 0.0   # aca si se puede sincronizar
+        datos[n] = d
     ruta = f"{SALIDA}_{rank}.json"
     with open(ruta, "w") as f:
         json.dump(datos, f, indent=1)

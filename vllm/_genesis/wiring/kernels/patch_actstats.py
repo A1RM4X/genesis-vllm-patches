@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sonda de estadistica de activaciones (ver ``vllm._genesis.act_stats``).
+"""Sonda de activaciones y prueba de la escala estatica.
+
+Dos cosas en el mismo punto, las dos apagadas por omision:
+  * ``act_stats``: histograma de amax por token, para decidir si la escala puede ser fija;
+  * ``escala_estatica``: deja la activacion sobre la rejilla de la escala fija, para medir en el
+    servidor que calidad se pierde ANTES de escribir ningun kernel.
 
 Engancha en ``apply_weights`` del camino Marlin, que es donde todavia existe el objeto
 ``layer`` y por lo tanto se puede identificar cada lineal por su prefijo: la estadistica sale POR
@@ -28,10 +33,17 @@ VIEJO = (
 )
 NUEVO = (
     VIEJO
+    + "        _gas_nombre = getattr(layer, 'prefix', 'sin_nombre')  # " + MARKER + "\n"
     + "        from vllm._genesis import act_stats as _gas  # " + MARKER + "\n"
     + "        if _gas.activo():  # " + MARKER + "\n"
-    + "            torch.ops.genesis.act_stats(x.reshape(-1, x.shape[-1]), "
-      "getattr(layer, 'prefix', 'sin_nombre'))  # " + MARKER + "\n"
+    + "            torch.ops.genesis.act_stats(x.reshape(-1, x.shape[-1]), _gas_nombre)  # "
+      + MARKER + "\n"
+    + "        from vllm._genesis import escala_estatica as _gee  # " + MARKER + "\n"
+    + "        if _gee.activo():  # " + MARKER + "\n"
+    + "            _gee_s = _gee.escala_de(_gas_nombre)  # " + MARKER + "\n"
+    + "            if _gee_s > 0.0:  # " + MARKER + "\n"
+    + "                x = x.clone()  # " + MARKER + "\n"
+    + "                torch.ops.genesis.escala_estatica(x, _gee_s)  # " + MARKER + "\n"
 )
 
 

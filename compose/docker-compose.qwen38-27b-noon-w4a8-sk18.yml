@@ -49,6 +49,8 @@ services:
         ipv4_address: 172.20.0.228
         ipv6_address: fd00:172:20::13
     volumes:
+      # Escalas estaticas calibradas (solo se lee si GENESIS_ESCALA_ESTATICA=1)
+      - ./escalas:/escalas:ro
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
       # Tier 2 del cache de KV: NVMe
@@ -262,6 +264,11 @@ services:
       # P2P directa (13 GB/s, la hace el motor de copia y no gasta SM) mientras se calcula
       # el siguiente. Necesita el driver con P2P y iommu=pt.
       - GENESIS_ACT_STATS=${ACTSTATS:-0}   # telemetria: distribucion de amax por token
+      # Prueba de calidad de la escala estatica (no cambia el rendimiento: deja la activacion
+      # sobre la rejilla fija y sigue el camino de siempre).
+      - GENESIS_ESCALA_ESTATICA=${ESCEST:-0}
+      - GENESIS_ESCALA_ARCHIVO=${ESCEST_ARCHIVO:-/escalas/escalas.json}
+      - GENESIS_ESCALA_SITIOS=${ESCEST_SITIOS:-qkv_proj,in_proj_qkvz,gate_up_proj}
       - GENESIS_ENABLE_PN136_MLP_SOLAPADO=${PN136:-0}
       - GENESIS_PN136_TROZOS=${PN136_TROZOS:-4}
       - GENESIS_PN136_M_MIN=${PN136_MMIN:-1024}
