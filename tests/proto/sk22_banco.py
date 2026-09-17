@@ -22,16 +22,33 @@ TN = 64
 
 
 def empaquetar(q: torch.Tensor) -> torch.Tensor:
-    """q [K, N] en [0,15] -> [K/16, N*8] int32, 8 nibbles por entero a lo largo de K.
+    """q [K, N] en [0,15] -> el layout que consume el fragmento del mma, MEDIDO.
 
-    Es el layout que ya usa Marlin, para poder comparar con el mismo peso.
+    De tests/proto/sk22_layout.py, con las 256 posiciones sondeadas y cero discrepancias:
+
+        B: n = lane/4     k = (lane%4)*4 + byte + reg*16
+
+    El kernel lee UN int32 por lane y lo abre en dos registros: ``emp & 0x0F0F0F0F`` son los
+    nibbles bajos (reg 0) y ``(emp>>4) & 0x0F0F0F0F`` los altos (reg 1). O sea que el byte j del
+    entero que le toca al lane L tiene que llevar
+
+        nibble bajo:  q[kb + (L%4)*4 + j     ][n0 + L/4]      (reg 0)
+        nibble alto:  q[kb + (L%4)*4 + j + 16][n0 + L/4]      (reg 1)
+
+    con kb el K del tile. Salida [K/32, 32 lanes * (N/8 grupos)] int32.
     """
     K, N = q.shape
-    out = torch.zeros((K // 16, N * 8), dtype=torch.int32, device=q.device)
-    for i in range(8):
-        # los 8 nibbles de un int32 son 8 filas consecutivas de K
-        out[:, :] |= (q[i::8][: K // 16].to(torch.int32) << (4 * i))[:, :N].repeat(1, 8)[:, : N * 8]
-    return out
+    ktiles, ngrupos = K // 32, N // 8
+    out = torch.zeros((ktiles, ngrupos, 32), dtype=torch.int32, device=q.device)
+    qi = q.to(torch.int32)
+    for L in range(32):
+        n = L // 4
+        for j in range(4):
+            kb = (L % 4) * 4 + j
+            bajo = qi[kb::32][:ktiles][:, n::8][:, :ngrupos]          # [ktiles, ngrupos]
+            alto = qi[kb + 16::32][:ktiles][:, n::8][:, :ngrupos]
+            out[:, :, L] |= ((bajo & 0xF) | ((alto & 0xF) << 4)) << (8 * j)
+    return out.reshape(ktiles, ngrupos * 32).contiguous()
 
 
 def referencia(a, q, esc, factor, a_esc):
@@ -57,15 +74,17 @@ def main() -> None:
         a = (torch.randn(M, K, device=dev) * 24).round().clamp(-127, 127).to(torch.int8)
         q = torch.randint(0, 16, (K, N), dtype=torch.int32, device=dev)
         esc = torch.randint(-2000, 2000, (K // G, N), dtype=torch.int16, device=dev)
-        sumas = a.to(torch.int32).reshape(M, K // G, G).sum(2).t().contiguous()
+        sumas = a.reshape(M, K // G, G).sum(2, dtype=torch.int32).t().contiguous()
         a_esc = torch.full((M,), 1 / 127, dtype=torch.float32, device=dev)
         factor = 1.0 / 4096
         b = empaquetar(q)
         c = torch.zeros(M, N, dtype=torch.float16, device=dev)
 
-        k22.lanzar((N // TN, 1, 1),
+        # shared: A del tile (16x32) + ETAPAS buffers de B (TN/8 grupos x 32 enteros)
+        shmem = 3 * 16 * 32 + 3 * (TN // 8) * 32 * 4
+        k22.lanzar((N // TN, 1),
                    [a, b, esc, sumas, a_esc, c, M, N, K, factor],
-                   shared=16 * 32 + 3 * (32 // 16) * TN * 4)
+                   shared=shmem)
         torch.cuda.synchronize()
 
         ref = referencia(a, q, esc, factor, a_esc)

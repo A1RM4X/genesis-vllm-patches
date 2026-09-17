@@ -24,7 +24,10 @@
 // Layout
 // ------
 //   A      [M, K]        int8, filas contiguas
-//   B      [K/16, N*8]   int32, el mismo empaquetado que ya usa Marlin (8 nibbles por int32)
+//   B      [K/32, (N/8)*32]  int32, en el orden que consume el fragmento del mma (MEDIDO en
+//                            tests/proto/sk22_layout.py): para el grupo de 8 columnas g y el
+//                            lane L, el entero B[ktile][g*32 + L] lleva en su byte j el nibble
+//                            bajo de q[k=(L%4)*4+j][n=g*8+L/4] y el alto de q[k+16][n].
 //   esc    [K/G, N]      int16 con signo (PN130), G = 128
 //   sumas  [K/G, M]      int32, sum_k a_k por grupo — avanzar un grupo es sumar M
 //   C      [M, N]        fp16
@@ -55,6 +58,14 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) {
 // 41 cp.async.cg de 16 B, o sea que por ahi no se pierde nada.
 __device__ __forceinline__ void carga16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+}
+
+// Variante con src-size: si `bytes` es 0, cp.async rellena el destino de ceros sin tocar
+// memoria. Sirve para las filas f >= M del tile de A, que tienen que quedar en cero, sin
+// necesidad de un camino aparte ni de un __syncthreads() extra para limpiarlas.
+__device__ __forceinline__ void carga16p(uint32_t dst, const void* src, bool valido) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+               ::"r"(dst), "l"(src), "r"(valido ? 16 : 0));
 }
 
 __device__ __forceinline__ void commit() { asm volatile("cp.async.commit_group;\n"); }
@@ -98,29 +109,49 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
 
   // shared: A del tile (16 x KT) y B de las etapas del pipeline
   extern __shared__ char sh[];
-  int8_t* shA = reinterpret_cast<int8_t*>(sh);                   // 16 * KT
-  int32_t* shB = reinterpret_cast<int32_t*>(sh + 16 * KT);       // ETAPAS * (KT/16 * TN*8/8)
+  // A tambien va por el pipeline: recargarla sincronicamente en cada vuelta costaba el 40% del
+  // kernel (medido: 90 -> 53,5 us en 5120x5120), porque el ld.global + __syncthreads() de cada
+  // iteracion no tiene con que solaparse. Es chica (512 B por etapa), asi que entra de sobra.
+  constexpr int A_POR_ETAPA = 16 * KT;                           // 512 B
+  int8_t* shA = reinterpret_cast<int8_t*>(sh);                   // ETAPAS * A_POR_ETAPA
+  int32_t* shB = reinterpret_cast<int32_t*>(sh + ETAPAS * A_POR_ETAPA);
 
-  // B por etapa: KT filas de 16 => KT/16 bloques de int32, cada uno TN*8/8 = TN enteros
-  constexpr int B_POR_ETAPA = (KT / 16) * TN;
+  // B por etapa: un tile de K (32 filas) x TN columnas = TN/8 grupos de 8, y cada grupo son 32
+  // enteros (uno por lane). Son 256 int32 = 1 KiB con TN=64.
+  constexpr int GRUPOS = TN / 8;
+  constexpr int B_POR_ETAPA = GRUPOS * 32;
 
-  int32_t acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};   // 2 mma de n8 por warp => 16 columnas
-  const int col = n0 + warp * 16;                      // columnas que toca este warp
+  // DOS acumuladores, como hace Marlin: el del mma se resetea al cerrar cada grupo de K, y el
+  // escalado va juntando. Hace falta porque la escala y la correccion cambian POR GRUPO — con un
+  // solo acumulador sobre todo K, el resultado solo es correcto si hay un unico grupo.
+  int32_t acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};        // el del mma, por grupo
+  float acc_esc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};      // ya escalado, sobre todo K
+  const int col = n0 + warp * 16;   // 16 columnas por warp = 2 grupos de 8 del mma
 
   // ── prologo del pipeline ───────────────────────────────────────────────────────────────────
+  const int ngrupos_n = N / 8;                 // grupos de 8 columnas de toda la matriz
+  const int g0 = n0 / 8;                       // primer grupo de este bloque
   for (int e = 0; e < ETAPAS - 1; e++) {
-    int k = e * KT;
-    if (k < K && tid < B_POR_ETAPA / 4) {
-      carga16(smem_u32(&shB[e * B_POR_ETAPA + tid * 4]),
-              &B[(k / 16) * (N * 8) + (n0 * 8) + tid * 4]);
+    int kt = e;
+    if (kt * KT < K) {
+      if (tid < B_POR_ETAPA / 4)
+        carga16(smem_u32(&shB[e * B_POR_ETAPA + tid * 4]),
+                &B[(size_t)kt * ngrupos_n * 32 + g0 * 32 + tid * 4]);
+      if (tid < A_POR_ETAPA / 16) {
+        int f = tid / (KT / 16), c = (tid % (KT / 16)) * 16;
+        carga16p(smem_u32(&shA[e * A_POR_ETAPA + f * KT + c]),
+                 &A[(size_t)f * K + kt * KT + c], f < M);
+      }
     }
     commit();
   }
 
   const int ngrupos = K / G;
   int grupo_prev = -1;
-  int32_t corr = 0;          // 8 * sum_k a_k de la fila que le toca a este lane
-  int16_t s_col[2] = {0, 0};
+  // DOS correcciones, no una: los cuatro acumuladores del fragmento cubren las filas lane/4
+  // (g=0,1) y lane/4+8 (g=2,3), y cada una tiene su propia suma de A.
+  int32_t corr[2] = {0, 0};
+  int32_t s_col[2][2] = {{0, 0}, {0, 0}};   // [grupo j del mma][columna par/impar]
 
   // la fila de C que ve este lane, con el layout del mma m16n8k32
   const int fila = lane / 4;
@@ -128,33 +159,56 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   for (int k = 0; k < K; k += KT) {
     const int etapa = (k / KT) % ETAPAS;
 
-    // A del tile: lo cargan todos los hilos, es chico (16 x 32 = 512 B)
-    if (tid < 16 * KT / 4) {
-      int f = (tid * 4) / KT, c = (tid * 4) % KT;
-      const int8_t* src = &A[f * K + k + c];
-      int32_t v = (f < M && k + c < K) ? *reinterpret_cast<const int32_t*>(src) : 0;
-      *reinterpret_cast<int32_t*>(&shA[f * KT + c]) = v;
-    }
     esperar<ETAPAS - 2>();
     __syncthreads();
 
     // escalas y correccion: solo cuando cambia el grupo, no en cada iteracion
     const int grupo = k / G;
     if (grupo != grupo_prev) {
+      // cerrar el grupo anterior con SUS escalas antes de pisarlas
+      if (grupo_prev >= 0) {
+  #pragma unroll
+        for (int j = 0; j < 2; j++)
+  #pragma unroll
+          for (int g = 0; g < 4; g++) {
+            acc_esc[j][g] += float(acc[j][g] - corr[g / 2]) * float(s_col[j][g % 2]);
+            acc[j][g] = 0;
+          }
+      }
       grupo_prev = grupo;
-      s_col[0] = esc[grupo * N + col + (lane % 4) * 2];
-      s_col[1] = esc[grupo * N + col + (lane % 4) * 2 + 1];
-      corr = 8 * (sumas ? sumas[grupo * M + (fila < M ? fila : 0)] : 0);
+  #pragma unroll
+      for (int j = 0; j < 2; j++) {
+        int cb = col + j * 8 + (lane % 4) * 2;
+        s_col[j][0] = (cb < N) ? esc[grupo * N + cb] : 0;
+        s_col[j][1] = (cb + 1 < N) ? esc[grupo * N + cb + 1] : 0;
+      }
+  #pragma unroll
+      for (int h = 0; h < 2; h++) {
+        int f = lane / 4 + h * 8;
+        corr[h] = 8 * ((sumas && f < M) ? sumas[grupo * M + f] : 0);
+      }
     }
 
-    // A -> registros del mma
+    // A -> registros del mma, con el layout medido:
+    //   fila = lane/4 + (reg%2)*8      k = (lane%4)*4 + byte + (reg/2)*16
+    // Se arma leyendo de shared directo. ldmatrix pide un orden distinto y para 16 filas no
+    // compensa el reacomodo.
     uint32_t fa[4];
-    ldmatrix4(fa, smem_u32(&shA[(lane % 16) * KT + (lane / 16) * 16]));
+  #pragma unroll
+    for (int r = 0; r < 4; r++) {
+      int f = lane / 4 + (r % 2) * 8;
+      int kk = (lane % 4) * 4 + (r / 2) * 16;
+      fa[r] = *reinterpret_cast<const uint32_t*>(&shA[etapa * A_POR_ETAPA + f * KT + kk]);
+    }
 
-    // B: desempaque CRUDO (QServe) — dos instrucciones, sin el |MASK -zp ^MASK
+    // B: desempaque CRUDO (QServe) — dos instrucciones, sin el |MASK -zp ^MASK.
+    // El layout esta MEDIDO (tests/proto/sk22_layout.py, 256 posiciones, cero discrepancias):
+    // el lane L lee un solo int32 del grupo de 8 columnas g, y sus nibbles bajos son el
+    // registro 0 del fragmento (k = (L%4)*4 + byte) y los altos el registro 1 (k + 16).
   #pragma unroll
     for (int j = 0; j < 2; j++) {
-      int32_t emp = shB[etapa * B_POR_ETAPA + (warp * 16 + j * 8) + (lane % 8)];
+      int g = warp * 2 + j;                       // grupo de 8 columnas dentro del tile
+      int32_t emp = shB[etapa * B_POR_ETAPA + g * 32 + lane];
       uint32_t fb[2];
       fb[0] = emp & 0x0F0F0F0F;
       fb[1] = (emp >> 4) & 0x0F0F0F0F;
@@ -163,9 +217,16 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
 
     // siguiente etapa
     int kn = k + (ETAPAS - 1) * KT;
-    if (kn < K && tid < B_POR_ETAPA / 4) {
-      carga16(smem_u32(&shB[((kn / KT) % ETAPAS) * B_POR_ETAPA + tid * 4]),
-              &B[(kn / 16) * (N * 8) + (n0 * 8) + tid * 4]);
+    if (kn < K) {
+      const int en = (kn / KT) % ETAPAS;
+      if (tid < B_POR_ETAPA / 4)
+        carga16(smem_u32(&shB[en * B_POR_ETAPA + tid * 4]),
+                &B[(size_t)(kn / KT) * ngrupos_n * 32 + g0 * 32 + tid * 4]);
+      if (tid < A_POR_ETAPA / 16) {
+        int f = tid / (KT / 16), c = (tid % (KT / 16)) * 16;
+        carga16p(smem_u32(&shA[en * A_POR_ETAPA + f * KT + c]),
+                 &A[(size_t)f * K + kn + c], f < M);
+      }
     }
     commit();
     __syncthreads();
@@ -174,16 +235,30 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   // ── epilogo: correccion del offset, escalas y salida ───────────────────────────────────────
   // La correccion se resta ANTES de multiplicar por la escala: el termino que sobra es ~17x el
   // resultado, y multiplicarlo primero haria crecer el intermedio sin necesidad.
-  if (fila < M) {
-    const float ea = a_esc[fila] * factor;
+  {
+    // cerrar el ultimo grupo, que quedo abierto al salir del lazo
+  #pragma unroll
+    for (int j = 0; j < 2; j++)
+  #pragma unroll
+      for (int g = 0; g < 4; g++)
+        acc_esc[j][g] += float(acc[j][g] - corr[g / 2]) * float(s_col[j][g % 2]);
+
+    // la escala de activacion tambien es por fila: una para lane/4 y otra para lane/4+8
+    float ea2[2];
+  #pragma unroll
+    for (int h = 0; h < 2; h++) {
+      int f = lane / 4 + h * 8;
+      ea2[h] = (f < M ? a_esc[f] : 0.0f) * factor;
+    }
   #pragma unroll
     for (int j = 0; j < 2; j++) {
   #pragma unroll
       for (int g = 0; g < 4; g++) {
+        // C de m16n8: el lane tiene filas lane/4 y +8, columnas (lane%4)*2 y +1
         int c = col + j * 8 + (lane % 4) * 2 + (g % 2);
-        int f = fila + (g / 2) * 8;
+        int f = lane / 4 + (g / 2) * 8;
         if (f < M && c < N) {
-          float v = float(acc[j][g] - corr) * float(s_col[g % 2]) * ea;
+          float v = acc_esc[j][g] * ea2[g / 2];
           C[f * N + c] = __float2half(v);
         }
       }
