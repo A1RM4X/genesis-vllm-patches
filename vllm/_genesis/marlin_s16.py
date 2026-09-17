@@ -104,15 +104,22 @@ def _tiene_a_sums() -> bool:
     con un argumento de mas o de menos. Eso tiraba el arranque con
     "expected at most 19 argument(s) but received 20".
     """
-    global _TIENE_A_SUMS
-    if _TIENE_A_SUMS is None:
+    # El flag se guarda en el OP, no en un global del modulo: vLLM levanta los workers como
+    # procesos aparte y ademas el modulo puede quedar importado por mas de un camino, asi que un
+    # global se queda desincronizado y la llamada sale con un argumento de mas o de menos. El
+    # objeto del op es unico por proceso, que es justo el alcance que hace falta.
+    try:
+        op = torch.ops.genesis_marlin.marlin_gemm_s16
+    except Exception:
+        return False
+    v = getattr(op, "_genesis_a_sums", None)
+    if v is None:
+        v = any(a.name == "a_sums_or_none" for a in op.default._schema.arguments)
         try:
-            _TIENE_A_SUMS = any(
-                arg.name == "a_sums_or_none"
-                for arg in torch.ops.genesis_marlin.marlin_gemm_s16.default._schema.arguments)
+            op._genesis_a_sums = v
         except Exception:
-            return False          # sin op todavia: no se cachea, se vuelve a mirar
-    return _TIENE_A_SUMS
+            pass                  # si no deja, se vuelve a mirar el schema y listo
+    return v
 
 
 def procesar_escalas(s: torch.Tensor):
