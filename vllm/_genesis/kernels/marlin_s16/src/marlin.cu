@@ -153,7 +153,23 @@ typedef struct {
 // Con el doble de bloques para el mismo trabajo hay mas sincronizacion entre bloques, y eso se
 // come de sobra lo que aporta la ocupacion. Subirlo a 2 es correcto pero mas lento: no es una
 // cuestion de terminar de afinarlo.
-constexpr int MAX_BLOQUES_POR_SM = 1;
+//
+// RE-VERIFICADO (2026-09-17) con el reloj FIJO a 1400 MHz, porque las mediciones de arriba se
+// tomaron con el reloj libre y ese sesgo favorece al que usa menos SM. Se compilaron las dos
+// variantes del mismo fuente y se alternaron los procesos. Confirma la decision, con margen:
+//
+//     forma        M    bps=1   bps=2
+//      5120x5120   1     25,5    28,6   -12,5%
+//      5120x5120  16     26,0    29,1   -11,8%
+//     17408x5120   1     74,2    77,4    -4,3%
+//      7168x5120  32     40,0    57,2   -42,9%
+//
+// De 21 casos, bps=1 gana 10 y empata 10; el unico donde bps=2 sale adelante (7168, M=256,
+// +3,2%) tiene 7,2% de dispersion, o sea es ruido. Se parametriza con -D para poder repetirlo.
+#ifndef GENESIS_MAX_BLOQUES_POR_SM
+  #define GENESIS_MAX_BLOQUES_POR_SM 1
+#endif
+constexpr int MAX_BLOQUES_POR_SM = GENESIS_MAX_BLOQUES_POR_SM;
 
 thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority

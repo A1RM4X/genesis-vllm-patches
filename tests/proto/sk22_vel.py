@@ -97,7 +97,7 @@ def main() -> None:
                 ws.zero_()
                 torch.ops.genesis_marlin.marlin_gemm_s16(
                     a, None, b_q, None, esc.view(torch.float16), a_esc.reshape(M, 1),
-                    None, None, vacio, vacio, ws,
+                    None, None, None, None, None, ws,
                     scalar_types.uint4b8.id, M, N, K, True, False, True, False)
 
             def sk22():
