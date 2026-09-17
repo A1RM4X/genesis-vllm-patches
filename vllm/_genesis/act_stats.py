@@ -58,6 +58,10 @@ _maxabs: dict[str, torch.Tensor] = {}   # maximo exacto por sitio (EN GPU: leerl
 # Histograma de log2(amax / rms) por token: dice si el amax de un token lo hace UN canal que pincha
 # (cresta alta -> la rotacion de Hadamard lo aplasta) o si la fila ya es plana (rotar no sirve).
 _cresta: dict[str, torch.Tensor] = {}
+# Muestras crudas de activacion, para poder probar metodos OFFLINE sin reiniciar el servidor.
+MUESTRAS = os.environ.get("GENESIS_ACT_MUESTRAS", "")     # directorio donde dejarlas
+FILAS = int(os.environ.get("GENESIS_ACT_FILAS", "512"))   # filas por muestra
+_muestreado: set = set()
 _llamadas: dict[str, int] = {}
 _volcado = False
 _tot = 0
@@ -128,7 +132,18 @@ def registrar(x: torch.Tensor, nombre: str) -> None:
         global _tot
         _tot += 1
         if capturando:
-            return                  # el resto (volcado) sincroniza
+            return                  # el resto (volcado y muestreo) sincroniza
+        # Ojo: la PRIMERA llamada de cada sitio es la corrida de perfilado de vLLM, con entradas
+        # en CERO. Hay que esperar a que haya trafico de verdad, o la muestra sale vacia.
+        if (MUESTRAS and nombre not in _muestreado and plano.shape[0] >= FILAS
+                and _llamadas.get(nombre, 0) > 4 and float(plano.abs().amax()) > 0):
+            _muestreado.add(nombre)
+            try:
+                paso = max(1, plano.shape[0] // FILAS)
+                torch.save(plano[::paso][:FILAS].detach().cpu(),
+                           f"{MUESTRAS}/{nombre.replace('.', '_')}.pt")
+            except Exception as e:
+                log.warning("act_stats: no se pudo guardar la muestra (%s)", e)
         if _tot == 1:
             log.warning("act_stats: primera llamada, forma %s", tuple(plano.shape))
         if _tot % TOTAL == 0:

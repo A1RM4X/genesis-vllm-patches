@@ -86,3 +86,4 @@ perf.data
 perf.data.old
 *.nsys-rep
 *.ncu-rep
+compose/muestras/

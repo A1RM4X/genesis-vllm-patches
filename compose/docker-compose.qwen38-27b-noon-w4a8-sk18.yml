@@ -51,6 +51,7 @@ services:
     volumes:
       # Escalas estaticas calibradas (solo se lee si GENESIS_ESCALA_ESTATICA=1)
       - ./escalas:/escalas:ro
+      - ./muestras:/muestras
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
       # Tier 2 del cache de KV: NVMe
@@ -264,6 +265,7 @@ services:
       # P2P directa (13 GB/s, la hace el motor de copia y no gasta SM) mientras se calcula
       # el siguiente. Necesita el driver con P2P y iommu=pt.
       - GENESIS_ACT_STATS=${ACTSTATS:-0}   # telemetria: distribucion de amax por token
+      - GENESIS_ACT_MUESTRAS=${ACTMUESTRAS:-}   # si se pone, guarda muestras crudas ahi
       # Prueba de calidad de la escala estatica (no cambia el rendimiento: deja la activacion
       # sobre la rejilla fija y sigue el camino de siempre).
       - GENESIS_ESCALA_ESTATICA=${ESCEST:-0}
