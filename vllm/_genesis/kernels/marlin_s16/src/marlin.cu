@@ -424,7 +424,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   if (prob_n <= 4096) max_par = 16 * 8;
   int max_shared_mem_new = max_shared_mem;
   int rest_m = prob_m;
-  int max_thread_m_blocks = 4;
+  // Con el tile topeado en 64 filas, M>64 parte el problema y RELEE el peso entero en cada
+  // pasada: el tiempo salta 82% de golpe entre M=64 y M=70. Un tile de 128 filas lo arregla,
+  // pero solo mientras M no se aleje mucho de 64 — mas arriba el tile grande se come la shared,
+  // el bloque procesa menos columnas por vuelta y termina siendo peor que partir en dos.
+  // Medido sobre gate_up (17408x5120, us):
+  //     M       64     70     80     88     96    104    112    128    160    256
+  //   tope 4  74,8  136,2  137,2  138,2  139,3  185,3  186,4  190,5  269,3  383,0
+  //   tope 8  74,8   92,2   92,2  110,6  111,6  150,5  151,6  219,1  292,9  423,9
+  // El cruce esta entre 112 y 128, asi que la regla es por tramo y no un tope fijo.
+  int max_thread_m_blocks = (prob_m > 64 && prob_m <= 112) ? 8 : 4;
   while (rest_m) {
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;

@@ -17,7 +17,7 @@ nb=N*H//2+(H//G)*N*2
 print(f"gate_up {N}x{H} int4 = {nb/1e6:.0f} MB   ({os.path.basename(os.path.dirname(os.environ['S16_SO']))})")
 print(f"{'M':>5}{'us':>9}{'GB/s':>9}{'vs M=5':>9}")
 base=None
-for M in (5,20,40,60,64,80,120,160):
+for M in (5,64,70,80,88,96,104,112,128,144,160,256):
     x=torch.randn(M,H,dtype=torch.float16,device=dev)*0.1
     xq=(x*127).round().clamp(-127,127).to(torch.int8)
     a_s=torch.full((M,1),1/127,dtype=torch.float32,device=dev)

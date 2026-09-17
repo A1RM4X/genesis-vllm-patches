@@ -60,7 +60,13 @@ TEMPLATE = (
 
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128)]
 
-THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
+# Hasta 8 (tiles de 128 filas) y SIN SALTARSE NINGUNO: el selector calcula
+# thread_m_blocks = min(div_ceil(M,16), max_thread_m_blocks), asi que con M=80 pide 5. Generar
+# solo [.., 4, 6, 8] deja un agujero justo ahi y el kernel se cae para atras — fue exactamente
+# por eso que el primer intento de subir el tope no movio nada.
+# El motivo de subirlo: con el tile topeado en 64 filas, M>64 parte el problema y RELEE el peso
+# entero en cada pasada (medido sobre gate_up: 74,8 us a M=60 contra 137,2 a M=80).
+THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4, 5, 6, 7, 8]
 
 QUANT_CONFIGS = [
     # Genesis PN130: solo GPTQ/AutoRound INT4 simetrico con activaciones INT8.
@@ -69,7 +75,7 @@ QUANT_CONFIGS = [
         "b_type": "kU4B8",
         "c_type": ["kFloat16"],
         "thread_configs": THREAD_CONFIGS,
-        "thread_m_blocks": [1, 2, 3, 4],
+        "thread_m_blocks": [1, 2, 3, 4, 5, 6, 7, 8],
         "group_blocks": [-1, 8],
     },
 ]
