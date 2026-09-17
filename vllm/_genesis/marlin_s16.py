@@ -35,6 +35,11 @@ _AQUI = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_AQUI, "kernels", "marlin_s16")
 BUILD = os.environ.get("GENESIS_MARLIN_S16_BUILD", "/root/.cache/vllm/genesis_marlin_s16")
 _cargado = False
+# La firma del op cambio cuando PN140 sumo `a_sums_or_none` antes de `workspace`. Una .so vieja
+# en la cache y un fuente nuevo (o al reves) dejaban la llamada con un argumento corrido, y el
+# error era "Expected a value of type 'Tensor' for argument 'workspace' but instead found int".
+# Se resuelve mirando el schema al cargar, asi que las dos firmas andan.
+_TIENE_A_SUMS = False
 
 
 def activo() -> bool:
@@ -72,10 +77,17 @@ def cargar() -> bool:
     torch.ops.load_library(so)
     from torch.library import register_fake
 
+    global _TIENE_A_SUMS
+    _TIENE_A_SUMS = any(
+        arg.name == "a_sums_or_none"
+        for arg in torch.ops.genesis_marlin.marlin_gemm_s16.default._schema.arguments)
+
     @register_fake("genesis_marlin::marlin_gemm_s16")
     def _fake(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
-              workspace, b_q_type_id, size_m, size_n, size_k, is_k_full=True,
-              use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False):
+              *resto):
+        # `resto` absorbe el a_sums_or_none que puede o no estar; lo unico que se necesita para
+        # el fake es la forma de la salida.
+        size_m, size_n = resto[2], resto[4]
         dtype = a.dtype
         if dtype not in (torch.half, torch.bfloat16):
             dtype = b_scales.dtype
@@ -96,11 +108,12 @@ def procesar_escalas(s: torch.Tensor):
 
 def marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
                 workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
-                use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False):
-    """Misma firma que ``vllm._custom_ops.marlin_gemm``."""
+                use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False, a_sums=None):
+    """Misma firma que ``vllm._custom_ops.marlin_gemm``, mas el ``a_sums`` opcional de PN140."""
+    extra = (a_sums,) if _TIENE_A_SUMS else ()
     return torch.ops.genesis_marlin.marlin_gemm_s16(
         a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
-        workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
+        *extra, workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
         use_fp32_reduce, is_zp_float)
 
 
