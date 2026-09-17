@@ -53,9 +53,32 @@ __device__ __forceinline__ void dequant_qserve(int q, int* out) {
   out[1] = (q >> 4) & 0x0F0F0F0F;
 }
 
+// ── 5) QServe COMPLETO: desempaque crudo + la correccion del offset en el acumulador ────────
+// Lo de arriba mide solo el desempaque. Aca se suma lo que cuesta la correccion, que es lo que
+// decide si la ganancia neta existe: por cada acumulador hay que restar 8 * suma_a * escala.
+// suma_a viene precalculada (un valor por fila y por grupo de K), asi que en el lazo es una
+// multiplicacion y una resta sobre los 4 acumuladores del fragmento.
+// OJO con la FRECUENCIA: la correccion NO va por cada desempaque. Es por (fila, grupo de K), y
+// Marlin ya recorre los grupos aparte — con thread_k_blocks=8 y group_blocks=8 hay UN grupo por
+// tile, o sea una correccion cada 32 mma. Medirla por cada 8 elementos la hace parecer 6x mas
+// cara de lo que es: da 1,28x en vez de ~1,9x.
+#define CADA 32
+
+__device__ __forceinline__ void dequant_qserve_crudo(int q, int* out) {
+  out[0] = q & 0x0F0F0F0F;
+  out[1] = (q >> 4) & 0x0F0F0F0F;
+}
+
+__device__ __forceinline__ void correccion_offset(int suma_a, int esc, int* acc) {
+  int corr = 8 * suma_a * esc;
+#pragma unroll
+  for (int j = 0; j < 4; j++) acc[j] -= corr;
+}
+
 template <int MODO>
 __global__ void banco(const int* __restrict__ entrada, int* __restrict__ salida, int n) {
   int acc0 = 0, acc1 = 0;
+  int accq[4] = {0, 0, 0, 0};   // acumulador del mma, para el modo QServe completo
   int base = blockIdx.x * blockDim.x + threadIdx.x;
   int q = entrada[base % n];
   int s = 0x01010101 * ((base & 7) + 1);
@@ -67,10 +90,20 @@ __global__ void banco(const int* __restrict__ entrada, int* __restrict__ salida,
     if constexpr (MODO == 1) dequant_liquid(q ^ i, s, a, out);
     if constexpr (MODO == 2) dequant_marlin_mas_escala(q ^ i, s, out);
     if constexpr (MODO == 3) dequant_qserve(q ^ i, out);
+    // El acumulador es PERSISTENTE entre vueltas y se usa al final, asi que el compilador no
+    // puede tirar la correccion. En la primera version acc[0]^acc[2] daba siempre 0 y nvcc la
+    // borraba entera: t4 salia identico a t3, que fue la pista.
+    if constexpr (MODO == 4) {
+      dequant_qserve_crudo(q ^ i, out);
+      if ((i % CADA) == 0) correccion_offset(s + i, (i & 255) + 1, accq);
+    }
     acc0 += out[0];
     acc1 += out[1];
   }
-  salida[base] = acc0 ^ acc1;
+  if constexpr (MODO == 4)
+    salida[base] = accq[0] ^ accq[1] ^ accq[2] ^ accq[3] ^ acc0 ^ acc1;
+  else
+    salida[base] = acc0 ^ acc1;
 }
 
 template <int MODO>
@@ -100,6 +133,7 @@ int main() {
   float t1 = medir<1>(d_in, d_out, n, bloques, hilos);
   float t2 = medir<2>(d_in, d_out, n, bloques, hilos);
   float t3 = medir<3>(d_in, d_out, n, bloques, hilos);
+  float t4 = medir<4>(d_in, d_out, n, bloques, hilos);
 
   double elem = (double)bloques * hilos * REP * 8;  // 8 elementos por vuelta
   printf("desempaque int4 -> int8, %d bloques x %d hilos x %d vueltas\n", bloques, hilos, REP);
@@ -111,8 +145,11 @@ int main() {
          elem / (t2 * 1e6), "and/or/sub/xor/mul");
   printf("  %-34s %8.3f ms   %6.2f Gelem/s   %s\n", "QServe (nibble crudo, exacto)", t3,
          elem / (t3 * 1e6), "and/shr");
+  printf("  %-34s %8.3f ms   %6.2f Gelem/s   %s\n", "QServe + correccion (lo real)", t4,
+         elem / (t4 * 1e6), "and/shr + correccion 1 cada 32");
   printf("\n  LiquidQuant contra Marlin (sin escala): %.2fx   (cuesta 3,85%% de error)\n", t0 / t1);
-  printf("  QServe      contra Marlin (sin escala): %.2fx   (exacto, sin perdida)\n", t0 / t3);
+  printf("  QServe solo desempaque:                %.2fx\n", t0 / t3);
+  printf("  QServe con la correccion (NETO):       %.2fx   (exacto, sin perdida)\n", t2 / t4);
   cudaFree(d_in);
   cudaFree(d_out);
   return 0;
