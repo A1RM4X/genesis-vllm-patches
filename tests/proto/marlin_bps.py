@@ -15,8 +15,10 @@ import torch
 sys.path.insert(0, "/usr/local/lib/python3.12/dist-packages")
 
 G = 128
-FORMAS = [(17408, 5120), (5120, 5120), (7168, 5120)]
-MES = [1, 8, 16, 32, 64, 128, 256]
+FORMAS = [tuple(int(x) for x in f.split("x")) for f in
+          os.environ.get("FORMAS", "17408x5120").split(",")]
+MES = [int(x) for x in os.environ.get("MES",
+       "32,48,64,70,80,88,96,104,112,128,160,256").split(",")]
 
 
 def main() -> None:

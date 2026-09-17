@@ -493,12 +493,30 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   // pasada: el tiempo salta 82% de golpe entre M=64 y M=70. Un tile de 128 filas lo arregla,
   // pero solo mientras M no se aleje mucho de 64 — mas arriba el tile grande se come la shared,
   // el bloque procesa menos columnas por vuelta y termina siendo peor que partir en dos.
-  // Medido sobre gate_up (17408x5120, us):
-  //     M       64     70     80     88     96    104    112    128    160    256
-  //   tope 4  74,8  136,2  137,2  138,2  139,3  185,3  186,4  190,5  269,3  383,0
-  //   tope 8  74,8   92,2   92,2  110,6  111,6  150,5  151,6  219,1  292,9  423,9
-  // El cruce esta entre 112 y 128, asi que la regla es por tramo y no un tope fijo.
-  int max_thread_m_blocks = (prob_m > 64 && prob_m <= 112) ? 8 : 4;
+  // RE-MEDIDO 2026-09-17 con el RELOJ FIJO (la tabla anterior se tomo con el reloj libre y el
+  // tramo que proponia, hasta 112, resulto MUY caro). El motivo aparecio con ncu: con
+  // thread_m_blocks >= 6 el kernel toca los 255 registros y DERRAMA a memoria local, y el
+  // trafico explota. Con tmb=7 (M=104-112) son 23,4 M de sectores leidos de local y 845 MB de
+  // DRAM para un peso de 44,6 MB. Empezo a pasar cuando la reduccion en int32 sumo frag_c_tmp,
+  // que es un segundo juego de acumuladores.
+  //
+  //     M                64     70     80     88     96    104    112    128
+  //   registros         242    255    255    255    255    255    255    242
+  //   sectores local      0   878k   878k  7,5 M  7,5 M  23,4M  23,4M      0
+  //   tope 4          137,1  223,9  216,4  230,8  253,0  259,6  256,6  258,0
+  //   tope 5          135,2  166,3  167,1  244,2  262,4  269,8  264,4  260,8
+  //   tope 8 (antes)  136,3  164,9  167,1  306,8  333,9 1277,0 1274,2  261,7
+  //
+  // O sea: tmb=5 derrama poco y todavia conviene hasta M=80; de ahi en mas hay que partir en
+  // dos pasadas antes que derramar. El tramo va hasta 80, no hasta 112.
+#ifndef GENESIS_TOPE_M
+  #define GENESIS_TOPE_M 5
+#endif
+#ifndef GENESIS_TOPE_M_HASTA
+  #define GENESIS_TOPE_M_HASTA 80
+#endif
+  int max_thread_m_blocks =
+      (prob_m > 64 && prob_m <= GENESIS_TOPE_M_HASTA) ? GENESIS_TOPE_M : 4;
   while (rest_m) {
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;

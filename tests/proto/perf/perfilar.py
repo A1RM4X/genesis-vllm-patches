@@ -26,6 +26,8 @@ METRICAS = [
     ("launch__block_size",                                       "hilos por bloque", "d"),
     ("launch__waves_per_multiprocessor",                         "olas por SM", "f"),
     ("launch__registers_per_thread",                             "registros por hilo", "d"),
+    ("l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",            "DERRAME: lecturas local", "d"),
+    ("l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",            "DERRAME: escrituras local", "d"),
     ("launch__occupancy_per_register_count",                     "ocupacion max x registros", "f"),
     ("launch__occupancy_per_shared_mem_size",                    "ocupacion max x shared", "f"),
     ("sm__warps_active.avg.pct_of_peak_sustained_active",        "OCUPACION LOGRADA %", "f"),

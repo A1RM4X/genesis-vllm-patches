@@ -28,6 +28,7 @@ mod = cpp_extension.load(
     extra_cuda_cflags=["-O3", "-std=c++17", "-DTORCH_TARGET_VERSION=0x020c000000000000", "-DUSE_CUDA",
                        "-DMARLIN_NAMESPACE_NAME=marlin", "-Xcompiler", "-fvisibility=default"]
     + (["-DGENESIS_QSERVE_CRUDO"] if os.environ.get("GENESIS_QSERVE_CRUDO") == "1" else [])
-    + ["-DGENESIS_MAX_BLOQUES_POR_SM=" + os.environ.get("GENESIS_MAX_BLOQUES_POR_SM", "1")],
+    + ["-DGENESIS_MAX_BLOQUES_POR_SM=" + os.environ.get("GENESIS_MAX_BLOQUES_POR_SM", "1")]
+    + ["-DGENESIS_TOPE_M=" + os.environ.get("GENESIS_TOPE_M", "8")],
     is_python_module=False, verbose=True)
 print(f"listo en {time.time()-t0:.0f}s:", hasattr(torch.ops.genesis_marlin, "marlin_gemm_s16"))
