@@ -18,18 +18,40 @@ sys.path.insert(0, "/w/tests/proto")
 
 G, TN = 128, 64
 FORMAS = [(17408, 5120), (5120, 5120), (7168, 5120)]
-MES = [1, 16]
+MES = [1, 4, 16]
 
 
-def medir(fn, rep=50):
-    for _ in range(10):
-        fn()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(rep):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / rep * 1e6
+def calentar(fns, ms=400):
+    """Sube el reloj antes de medir. Sin esto la placa arranca en 210 MHz y la medicion cae en
+    plena rampa: se vieron 84,0 y 95,5 us para la MISMA configuracion, 13% de diferencia."""
+    fin = time.perf_counter() + ms / 1e3
+    while time.perf_counter() < fin:
+        for f in fns:
+            for _ in range(20):
+                f()
+        torch.cuda.synchronize()
+
+
+def medir_par(fa, fb, rep=100, tandas=5):
+    """Mide las dos alternativas INTERCALADAS, tanda a tanda, y devuelve las medianas. Asi las
+    dos ven el mismo estado termico y de reloj; medir una entera y despues la otra no lo asegura."""
+    ta, tb = [], []
+    for _ in range(tandas):
+        for fn, acc in ((fa, ta), (fb, tb)):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(rep):
+                fn()
+            torch.cuda.synchronize()
+            acc.append((time.perf_counter() - t0) / rep * 1e6)
+    return ta, tb
+
+
+def estado():
+    import subprocess
+    q = subprocess.run(["nvidia-smi", "-i", "0", "--query-gpu=clocks.sm,power.draw",
+                        "--format=csv,noheader,nounits"], capture_output=True, text=True)
+    return q.stdout.strip().replace(" ", "")
 
 
 def main() -> None:
@@ -54,7 +76,8 @@ def main() -> None:
     print(f"  W={W} TN={TNv} KPI={KPI} ETAPAS={ET}  shared={shmem}B  "
           f"etapa={por_etapa}B  bloques={5120 // TNv}  "
           f"warps/SM={5120 / 1312:.1f}")
-    print(f"{'forma':>14}{'M':>4}{'marlin':>8}{'sk22':>8}{'GB/s mar':>10}{'GB/s sk':>9}")
+    print(f"{'forma':>14}{'M':>4}{'marlin':>8}{'sk22':>8}{'GB/s mar':>10}{'GB/s sk':>9}"
+          f"{'cociente':>9}{'disp':>9}")
     for N, K in FORMAS:
         torch.manual_seed(1234)
         q = torch.randint(0, 16, (K, N), dtype=torch.int32, device=dev)
@@ -81,11 +104,16 @@ def main() -> None:
                 k22.lanzar((N // TNv, 1), [a, b22, esc, sumas, a_esc, c, M, N, K, 1 / 4096],
                            shared=shmem)
 
-            tm, ts = medir(marlin), medir(sk22)
+            calentar((marlin, sk22), ms=150)
+            ta, tb = medir_par(marlin, sk22)
+            ta2, tb2 = sorted(ta), sorted(tb)
+            tm, ts = ta2[len(ta2) // 2], tb2[len(tb2) // 2]
+            dm, ds = (ta2[-1] - ta2[0]) / ta2[0], (tb2[-1] - tb2[0]) / tb2[0]
             # techo: el peso int4 hay que traerlo entero de DRAM, a 670 GB/s sostenidos
             by = N * K / 2                       # el peso int4, que hay que traer entero
             print(f"{f'{N}x{K}':>14}{M:>4}{tm:>8.1f}{ts:>8.1f}"
-                  f"{by / tm / 1e3:>10.0f}{by / ts / 1e3:>9.0f}")
+                  f"{by / tm / 1e3:>10.0f}{by / ts / 1e3:>9.0f}"
+                  f"{tm / ts:>8.2f}x{max(dm, ds):>8.1%}")
         del q, esc, b22, b_q, ws
         torch.cuda.empty_cache()
 
