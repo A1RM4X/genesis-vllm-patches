@@ -28,9 +28,19 @@ def caso(M, N, K, nombre, aleatorio=False, factor=1.0):
     a_esc = torch.ones(M, dtype=torch.float32, device=dev)
     b = empaquetar(q, TN)
     c = torch.zeros(M, N, dtype=torch.float16, device=dev)
-    k22.lanzar((N // TN, 1), [a, b, esc, sumas, a_esc, c, M, N, K, factor],
-               shared=3 * (16 * 128 + 4 * (TN // 8) * 32 * 4))
+    shmem = 3 * (16 * 128 + 4 * (TN // 8) * 32 * 4)
+    k22.lanzar((N // TN, 1), [a, b, esc, sumas, a_esc, c, M, N, K, factor], shared=shmem)
     torch.cuda.synchronize()
+    # repetir la MISMA llamada: si el resultado cambia hay registros sin inicializar o una
+    # carrera. Es el chequeo que destapo el bug de `corr` en Marlin.
+    primero = c.clone()
+    inestable = 0.0
+    for _ in range(3):
+        c.zero_()
+        k22.lanzar((N // TN, 1), [a, b, esc, sumas, a_esc, c, M, N, K, factor], shared=shmem)
+        torch.cuda.synchronize()
+        inestable = max(inestable, float((c.float() - primero.float()).abs().max()))
+    c = primero
     # referencia exacta
     ref = torch.zeros(M, N, dtype=torch.float64, device=dev)
     for g in range(ng):
@@ -43,7 +53,8 @@ def caso(M, N, K, nombre, aleatorio=False, factor=1.0):
     # fp16 tiene 11 bits de mantisa: el redondeo de la salida es el unico error admisible
     ok = d == 0 or d / max(m, 1e-9) < 2 ** -10
     print(f"  {nombre:<34} M={M:3d} N={N:5d} K={K:5d}  max|dif|={d:10.1f}  "
-          f"rel={d/max(m,1):.2e}  {'OK' if ok else 'MAL'}")
+          f"rel={d/max(m,1):.2e}  {'OK' if ok else 'MAL'}"
+          f"   {'estable' if inestable == 0 else f'CARRERA {inestable}'}")
 
 
 caso(1, 64, 32, "1 tile K, M=1")
