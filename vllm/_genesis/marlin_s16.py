@@ -39,11 +39,7 @@ _cargado = False
 # en la cache y un fuente nuevo (o al reves) dejaban la llamada con un argumento corrido, y el
 # error era "Expected a value of type 'Tensor' for argument 'workspace' but instead found int".
 # Se resuelve mirando el schema al cargar, asi que las dos firmas andan.
-# Aridad del op, resuelta UNA vez en cargar(). No puede resolverse adentro de marlin_gemm:
-# esa funcion corre dentro de una region trazada por Dynamo, que no sabe iterar
-# `_schema.arguments` ("missing tp_iter") y hornea como constante cualquier condicion que se le
-# ponga. Por eso marlin_gemm no lleva NINGUNA logica: solo la llamada al op.
-_IDX_M = 2                # posicion de size_m dentro de *resto, en el fake
+
 
 
 def activo() -> bool:
@@ -55,9 +51,43 @@ def _so() -> str | None:
     return c[0] if c else None
 
 
+def _huella() -> str:
+    """Hash de las fuentes del kernel. Si cambia, la .so de la cache ya no sirve."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in sorted(glob.glob(os.path.join(_SRC, "src", "*")) +
+                    glob.glob(os.path.join(_SRC, "inc", "*")) +
+                    [os.path.join(_SRC, "torch_bindings.cpp")]):
+        if os.path.isfile(f):
+            h.update(os.path.basename(f).encode())
+            with open(f, "rb") as fh:
+                h.update(fh.read())
+    return h.hexdigest()[:16]
+
+
 def construir() -> str:
-    """Compila la extension si no esta. Devuelve la ruta de la .so."""
+    """Compila la extension si no esta, o si el fuente cambio. Devuelve la ruta de la .so.
+
+    El chequeo de huella no es un lujo: una .so vieja en la cache con un fuente nuevo deja la
+    llamada con un argumento corrido (a PN140 le sumo `a_sums_or_none` antes de `workspace`), y
+    eso tira el arranque con "expected at most 19 argument(s) but received 20" — o, peor, lo
+    dejaba pasar en silencio por un camino distinto.
+    """
     so = _so()
+    marca = os.path.join(BUILD, "huella.txt")
+    if so:
+        try:
+            with open(marca) as f:
+                vieja = f.read().strip()
+        except OSError:
+            vieja = ""
+        if vieja == _huella():
+            return so
+        log.warning("[PN130] el fuente cambio (%s -> %s): se recompila", vieja or "sin marca",
+                    _huella())
+        for viejo in glob.glob(os.path.join(BUILD, "*.so")):
+            os.remove(viejo)
+        so = None
     if so:
         return so
     env = dict(os.environ, GENESIS_MARLIN_S16_BUILD=BUILD, TORCH_CUDA_ARCH_LIST="8.6")
@@ -66,6 +96,11 @@ def construir() -> str:
     so = _so()
     if r.returncode != 0 or not so:
         raise RuntimeError("compilacion de genesis_marlin_s16 fallo:\n" + (r.stdout + r.stderr)[-3000:])
+    try:
+        with open(os.path.join(BUILD, "huella.txt"), "w") as f:
+            f.write(_huella())
+    except OSError:
+        pass
     return so
 
 
@@ -81,12 +116,7 @@ def cargar() -> bool:
     torch.ops.load_library(so)
     from torch.library import register_fake
 
-    global marlin_gemm, _IDX_M
-    tiene = any(a.name == "a_sums_or_none"
-                for a in torch.ops.genesis_marlin.marlin_gemm_s16.default._schema.arguments)
-    marlin_gemm = _gemm_con_a_sums if tiene else _gemm_sin_a_sums
-    _IDX_M = 3 if tiene else 2
-    log.info("[PN130] op con a_sums: %s", tiene)
+    log.info("[PN130] .so cargada desde %s", so)
 
     @register_fake("genesis_marlin::marlin_gemm_s16")
     def _fake(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
@@ -94,7 +124,7 @@ def cargar() -> bool:
         # `resto` es (a_sums?, workspace, b_type_id, size_m, size_n, size_k, ...): el a_sums
         # puede o no estar, asi que el indice se corre. Lo unico que necesita el fake es la
         # forma de la salida.
-        size_m, size_n = resto[_IDX_M], resto[_IDX_M + 1]
+        size_m, size_n = resto[3], resto[4]   # (a_sums, workspace, b_type_id, m, n)
         dtype = a.dtype
         if dtype not in (torch.half, torch.bfloat16):
             dtype = b_scales.dtype
@@ -113,30 +143,20 @@ def procesar_escalas(s: torch.Tensor):
     return s, factor
 
 
-def _gemm_sin_a_sums(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
-                     g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
-                     use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False,
-                     a_sums=None):
-    """Firma previa a PN140. Sin condicionales: esto se traza con Dynamo."""
-    return torch.ops.genesis_marlin.marlin_gemm_s16(
-        a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
-        workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
-        use_fp32_reduce, is_zp_float)
+def marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx,
+                perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
+                use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False, a_sums=None):
+    """Misma firma que ``vllm._custom_ops.marlin_gemm``, mas el ``a_sums`` de PN140.
 
-
-def _gemm_con_a_sums(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
-                     g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full=True,
-                     use_atomic_add=False, use_fp32_reduce=False, is_zp_float=False,
-                     a_sums=None):
-    """Firma con el a_sums_or_none de PN140, en su posicion (antes de workspace)."""
+    SIN condicionales: esto corre adentro de una region trazada por Dynamo, que hornea como
+    constante cualquier decision que se tome aca (y ni siquiera sabe iterar `_schema.arguments`,
+    falla con "missing tp_iter"). Que la .so coincida con el fuente lo garantiza `construir()`,
+    que la recompila cuando cambia el hash de las fuentes.
+    """
     return torch.ops.genesis_marlin.marlin_gemm_s16(
         a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
         a_sums, workspace, b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
         use_fp32_reduce, is_zp_float)
-
-
-# cargar() la reemplaza por la variante que corresponda a la .so que encontro
-marlin_gemm = _gemm_sin_a_sums
 
 
 ACTIVO_Y_CARGADO = False
