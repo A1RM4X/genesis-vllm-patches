@@ -333,7 +333,7 @@ services:
       # inferencia del worker), asi que cae a 10 y el servidor se muere al llegar
       # el lote 11: "RuntimeError: PN131: lote 12 > GENESIS_PN131_BMAX 10".
       # Tiene que ACOMPAÑAR a --max-num-seqs de mas abajo.
-      - GENESIS_PN131_BMAX=24
+      - GENESIS_PN131_BMAX=10
       - VLLM_USE_FUSED_MOE_GROUPED_TOPK=1
       - VLLM_LOGGING_LEVEL=INFO
       - GENESIS_VERBOSE=0
@@ -413,13 +413,12 @@ services:
       # otro valor el parche no engancha y el KV cae al generico de vLLM.
       - --kv-cache-dtype
       - "int8_per_token_head"
-      # 10 -> 24 (2026-09-17). Medido: con 12 pedidos concurrentes el throughput agregado pasa
-      # de 490 a 733 tok/s, con 16 de 604 a 815 y con 24 de 597 a 860 (+35% a +49%). Con 10 el
-      # tope real del lote era 10 secuencias y los pedidos hacian cola; lo que parecia un
-      # "acantilado a 12 pedidos" era eso. Verificado sobre el patron real de carga (un hilo de
-      # 80k mas 6 subagentes de 6k): CERO preempciones, que es el riesgo de subirlo.
+      # Vuelve a 10 para la prueba de saturacion de KV (2026-09-17). Con 24 el
+      # throughput agregado era 35-49% mayor, pero PN131 reserva acumuladores por
+      # slot y con 10 queda mas KV libre. GENESIS_PN131_BMAX de arriba tiene que
+      # seguir a este numero.
       - --max-num-seqs
-      - "24"
+      - "10"
       - --tensor-parallel-size
       - "2"
       - --max-model-len
