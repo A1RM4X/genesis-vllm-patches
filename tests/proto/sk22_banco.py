@@ -21,7 +21,7 @@ G = 128
 TN = 64
 
 
-def empaquetar(q: torch.Tensor) -> torch.Tensor:
+def empaquetar(q: torch.Tensor, tn: int = TN) -> torch.Tensor:
     """q [K, N] en [0,15] -> el layout que consume el fragmento del mma, MEDIDO.
 
     De tests/proto/sk22_layout.py, con las 256 posiciones sondeadas y cero discrepancias:
@@ -48,7 +48,11 @@ def empaquetar(q: torch.Tensor) -> torch.Tensor:
             bajo = qi[kb::32][:ktiles][:, n::8][:, :ngrupos]          # [ktiles, ngrupos]
             alto = qi[kb + 16::32][:ktiles][:, n::8][:, :ngrupos]
             out[:, :, L] |= ((bajo & 0xF) | ((alto & 0xF) << 4)) << (8 * j)
-    return out.reshape(ktiles, ngrupos * 32).contiguous()
+    # ...y se reordena por tile de N: [n_tile][k_tile][TN/8 grupos * 32]. Es el mismo repack
+    # que hace Marlin al cargar el modelo, y es lo que deja a cada bloque leyendo CONTIGUO.
+    gpt = tn // 8                                        # grupos de 8 columnas por tile de N
+    out = out.reshape(ktiles, ngrupos // gpt, gpt * 32)  # [kt, n_tile, ...]
+    return out.permute(1, 0, 2).contiguous().reshape(-1)
 
 
 def referencia(a, q, esc, factor, a_esc):

@@ -44,7 +44,9 @@
   #define ETAPAS 3         // profundidad del pipeline de cp.async sobre B
 #endif
 #define G 128              // group_size de las escalas
-#define WARPS 4
+#ifndef WARPS
+  #define WARPS 4
+#endif
 #define HILOS (WARPS * 32)
 #define KT 32              // lo que consume UN mma.m16n8k32 — fijo, es la instruccion
 #ifndef KPI
@@ -111,7 +113,6 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   const int tid = threadIdx.x;
   const int warp = tid / 32;
   const int lane = tid % 32;
-  const int n0 = blockIdx.x * TN;        // primera columna de este bloque
 
   // shared: A del tile (16 x KT) y B de las etapas del pipeline
   extern __shared__ char sh[];
@@ -132,13 +133,15 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
   // DOS acumuladores, como hace Marlin: el del mma se resetea al cerrar cada grupo de K, y el
   // escalado va juntando. Hace falta porque la escala y la correccion cambian POR GRUPO — con un
   // solo acumulador sobre todo K, el resultado solo es correcto si hay un unico grupo.
+  const int ntiles = (N + TN - 1) / TN;
+  for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+  const int n0 = tile * TN;
   int32_t acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};        // el del mma, por grupo
   float acc_esc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};      // ya escalado, sobre todo K
   const int col = n0 + warp * 16;   // 16 columnas por warp = 2 grupos de 8 del mma
 
   // ── prologo del pipeline ───────────────────────────────────────────────────────────────────
-  const int ngrupos_n = N / 8;                 // grupos de 8 columnas de toda la matriz
-  const int g0 = n0 / 8;                       // primer grupo de este bloque
+  const size_t base_b = (size_t)tile * (K / KT) * B_POR_TILE;   // tramo de este tile
 
   // Trae a la etapa `e` el bloque de K que empieza en `k`. B no es contiguo entre tiles de mma
   // (cada uno salta ngrupos_n*32), asi que se carga tile por tile; adentro de cada tile si.
@@ -151,7 +154,7 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
       // multiplo de KPI no lee fuera de rango ni necesita un lazo de cola aparte
       bool ok = k + kt * KT < K;
       carga16p(smem_u32(&shB[e * B_POR_ETAPA + kt * B_POR_TILE + j]),
-               &B[(size_t)(k / KT + (ok ? kt : 0)) * ngrupos_n * 32 + g0 * 32 + j], ok);
+               &B[base_b + (size_t)(k / KT + (ok ? kt : 0)) * B_POR_TILE + j], ok);
     }
     constexpr int A_VEC = KPI / 16;            // cargas de 16 B por fila de A
   #pragma unroll
@@ -163,6 +166,7 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
     }
   };
 
+  __syncthreads();   // el tile anterior todavia podia estar leyendo shared
   for (int e = 0; e < ETAPAS - 1; e++) {
     traer(e, e * KPI);
     commit();
@@ -279,5 +283,6 @@ extern "C" __global__ __launch_bounds__(HILOS) void sk22_gemm_w4a8(
         }
       }
     }
+  }
   }
 }

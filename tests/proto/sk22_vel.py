@@ -18,7 +18,7 @@ sys.path.insert(0, "/w/tests/proto")
 
 G, TN = 128, 64
 FORMAS = [(17408, 5120), (5120, 5120), (7168, 5120)]
-MES = [1, 4, 16]
+MES = [1, 16]
 
 
 def medir(fn, rep=50):
@@ -40,19 +40,26 @@ def main() -> None:
     torch.ops.load_library(os.environ["S16_SO"])
     ET = int(os.environ.get("ETAPAS", "3"))
     KPI = int(os.environ.get("KPI", "128"))
+    W = int(os.environ.get("WARPS", "4"))
+    TNv = W * 16                      # cada warp cubre 16 columnas: TN queda atado a WARPS
     k22 = Kernel("sk22_gemm_w4a8.cu", "sk22_gemm_w4a8",
-                 defs=[f"-DTN={TN}", f"-DETAPAS={ET}", f"-DKPI={KPI}"], warps=4)
+                 defs=[f"-DTN={TNv}", f"-DETAPAS={ET}", f"-DKPI={KPI}", f"-DWARPS={W}"],
+                 warps=W)
     dev = "cuda"
-    shmem = ET * (16 * KPI + (KPI // 32) * (TN // 8) * 32 * 4)
+    shmem = ET * (16 * KPI + (KPI // 32) * (TNv // 8) * 32 * 4)
+    # bytes que una etapa pide de golpe, y los que pueden estar en vuelo a la vez
+    por_etapa = 16 * KPI + (KPI // 32) * (TNv // 8) * 32 * 4
     vacio = torch.empty(0, dtype=torch.int32, device=dev)
 
-    print(f"{'forma':>14}{'M':>4}{'marlin us':>11}{'sk22 us':>10}{'cociente':>10}"
-          f"{'techo us':>10}{'marlin':>8}{'sk22':>7}")
+    print(f"  W={W} TN={TNv} KPI={KPI} ETAPAS={ET}  shared={shmem}B  "
+          f"etapa={por_etapa}B  bloques={5120 // TNv}  "
+          f"warps/SM={5120 / 1312:.1f}")
+    print(f"{'forma':>14}{'M':>4}{'marlin':>8}{'sk22':>8}{'GB/s mar':>10}{'GB/s sk':>9}")
     for N, K in FORMAS:
         torch.manual_seed(1234)
         q = torch.randint(0, 16, (K, N), dtype=torch.int32, device=dev)
         esc = torch.randint(-2000, 2000, (K // G, N), dtype=torch.int16, device=dev)
-        b22 = empaquetar(q)
+        b22 = empaquetar(q, TNv)
         # Marlin come su propio empaquetado; para VELOCIDAD alcanza con bits del mismo tamaño
         b_q = torch.randint(-(2**31), 2**31 - 1, (K // 16, N * 16 // 8),
                             dtype=torch.int32, device=dev)
@@ -71,14 +78,14 @@ def main() -> None:
                     scalar_types.uint4b8.id, M, N, K, True, False, True, False)
 
             def sk22():
-                k22.lanzar((N // TN, 1), [a, b22, esc, sumas, a_esc, c, M, N, K, 1 / 4096],
+                k22.lanzar((N // TNv, 1), [a, b22, esc, sumas, a_esc, c, M, N, K, 1 / 4096],
                            shared=shmem)
 
             tm, ts = medir(marlin), medir(sk22)
             # techo: el peso int4 hay que traerlo entero de DRAM, a 670 GB/s sostenidos
-            techo = (N * K / 2) / 670e9 * 1e6
-            print(f"{f'{N}x{K}':>14}{M:>4}{tm:>11.1f}{ts:>10.1f}{tm / ts:>9.2f}x"
-                  f"{techo:>10.1f}{techo / tm:>7.0%}{techo / ts:>7.0%}")
+            by = N * K / 2                       # el peso int4, que hay que traer entero
+            print(f"{f'{N}x{K}':>14}{M:>4}{tm:>8.1f}{ts:>8.1f}"
+                  f"{by / tm / 1e3:>10.0f}{by / ts / 1e3:>9.0f}")
         del q, esc, b22, b_q, ws
         torch.cuda.empty_cache()
 

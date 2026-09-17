@@ -26,7 +26,7 @@ def caso(M, N, K, nombre, aleatorio=False, factor=1.0):
     ng = max(K // G, 1)
     sumas = a.reshape(M, ng, -1).sum(2, dtype=torch.int32).t().contiguous()
     a_esc = torch.ones(M, dtype=torch.float32, device=dev)
-    b = empaquetar(q)
+    b = empaquetar(q, TN)
     c = torch.zeros(M, N, dtype=torch.float16, device=dev)
     k22.lanzar((N // TN, 1), [a, b, esc, sumas, a_esc, c, M, N, K, factor],
                shared=3 * (16 * 128 + 4 * (TN // 8) * 32 * 4))
