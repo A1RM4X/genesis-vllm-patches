@@ -115,6 +115,7 @@ def main() -> None:
     from vllm import _custom_ops as ops  # noqa: F401
     from vllm.scalar_type import scalar_types
 
+    print()
     for M in (1, 5):
         b_q = torch.randint(-(2**31), 2**31 - 1, (H // 16, N * 16 // 8),
                             dtype=torch.int32, device=dev)
@@ -122,7 +123,29 @@ def main() -> None:
         ws = torch.zeros(N // 64 * 16, dtype=torch.int32, device=dev)
         x = torch.randn(M, H, dtype=torch.float16, device=dev) * 0.1
         vacio = torch.empty(0, dtype=torch.int32, device=dev)
+        xq = (x * 127).round().clamp(-127, 127).to(torch.int8)
+        a_s = torch.full((M, 1), 1 / 127, dtype=torch.float32, device=dev)
+        gs = torch.ones(1, dtype=torch.float32, device=dev)
 
+        # ── lo que corre HOY: peso fp8, activacion fp16 -> HMMA + dequant en fp ─────────────
+        nb8 = N * H + (H // G) * N * 2
+        b_q8 = torch.randint(-(2**31), 2**31 - 1, (H // 16, N * 16 // 4),
+                             dtype=torch.int32, device=dev)
+        ws8 = torch.zeros(N // 64 * 16, dtype=torch.int32, device=dev)
+
+        def correr_fp8():
+            return torch.ops._C.marlin_gemm(
+                x, None, b_q8, None, b_s, None, None, None, vacio, vacio, ws8,
+                scalar_types.float8_e4m3fn.id, M, N, H, True, False, True, False)
+
+        try:
+            t8 = medir(correr_fp8, a.rep)
+            print(f"{'HOY  fp8 + act fp16 (HMMA)  M=' + str(M):<34} {t8:9.1f} "
+                  f"{nb8/t8/1e3:8.1f} {100*nb8/t8/1e3/techo_gbs:11.0f}%   {nb8/1e6:.0f} MB")
+        except Exception as e:
+            print(f"{'fp8 M=' + str(M):<34} falla: {str(e)[:60]}")
+
+        # ── solo el peso a int4, activacion sigue en fp16 -> HMMA igual ────────────────────
         def correr():
             return torch.ops._C.marlin_gemm(
                 x, None, b_q, None, b_s, None, None, None, vacio, vacio, ws,
@@ -130,32 +153,21 @@ def main() -> None:
 
         try:
             t = medir(correr, a.rep)
-            print(f"{'marlin vLLM (sm_80) M=' + str(M):<34} {t:9.1f} {nb/t/1e3:8.1f} "
-                  f"{100*nb/t/1e3/techo_gbs:11.0f}%")
+            print(f"{'int4 + act fp16 (HMMA)      M=' + str(M):<34} {t:9.1f} {nb/t/1e3:8.1f} "
+                  f"{100*nb/t/1e3/techo_gbs:11.0f}%   {nb/1e6:.0f} MB")
         except Exception as e:
-            print(f"{'marlin vLLM M=' + str(M):<34} falla: {str(e)[:60]}")
+            print(f"{'int4+fp16 M=' + str(M):<34} falla: {str(e)[:60]}")
 
-        # PN130: mismo GEMM pero con escalas int16 con signo y activacion int8, compilado sm_86
-        if os.environ.get("GENESIS_BANCO_S16", "1") == "1":
-            try:
-                from vllm._genesis import marlin_s16 as m16
-                if not m16.ACTIVO_Y_CARGADO:
-                    m16.cargar()
-                xs = (x * 127).round().clamp(-127, 127).to(torch.int8)
-                a_s = torch.ones((M, 1), dtype=torch.float32, device=dev) / 127
-                b_s16, factor = m16.procesar_escalas(b_s)
-                gs = factor.reshape(1).cuda()
-
-                def correr_s16():
-                    return m16.marlin_gemm(
-                        xs, None, b_q, None, b_s16, a_s, gs, None, vacio, vacio, ws,
-                        scalar_types.uint4b8, M, N, H)
-
-                t16 = medir(correr_s16, a.rep)
-                print(f"{'PN130 int16/int8 (sm_86) M=' + str(M):<34} {t16:9.1f} "
-                      f"{nb/t16/1e3:8.1f} {100*nb/t16/1e3/techo_gbs:11.0f}%")
-            except Exception as e:
-                print(f"{'PN130 M=' + str(M):<34} falla: {str(e)[:70]}")
+        # ── int4 + activacion int8 + escalas int16: IMMA puro, cero fp (PN130) ─────────────
+        try:
+            t4 = medir(lambda: torch.ops._C.marlin_gemm(
+                xq, None, b_q, None, b_s, a_s, gs, None, vacio, vacio, ws,
+                scalar_types.uint4b8.id, M, N, H, True, False, True, False), a.rep)
+            print(f"{'int4 + act int8 (IMMA)      M=' + str(M):<34} {t4:9.1f} {nb/t4/1e3:8.1f} "
+                  f"{100*nb/t4/1e3/techo_gbs:11.0f}%   {nb/1e6:.0f} MB")
+        except Exception as e:
+            print(f"{'int4+int8 M=' + str(M):<34} falla: {str(e)[:70]}")
+        print()
 
 
 if __name__ == "__main__":
