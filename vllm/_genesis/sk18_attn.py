@@ -331,8 +331,17 @@ def _get_bufs(dev, nh, bs, G=6):
             cfg = get_current_vllm_config()
             maxlen = int(cfg.model_config.max_model_len)
             bmax = int(cfg.scheduler_config.max_num_seqs)
-        except Exception:
+        except Exception as e:
+            # El contexto de configuracion de vLLM no siempre esta activo cuando se arman los
+            # buffers (esto corre en la primera inferencia del worker). Caer a un 10 en SILENCIO
+            # hacia que el servidor se muriera recien al llegar el lote 11:
+            #   RuntimeError: PN131: lote 12 > GENESIS_PN131_BMAX 10
+            # Con --max-num-seqs 24 eso pasa apenas hay carga. Ahora avisa y se puede fijar.
             maxlen, bmax = 262144, 10
+            log.warning(
+                "PN131: no se pudo leer la config de vLLM (%s); usando bmax=%d. Si "
+                "--max-num-seqs es mayor, fijar GENESIS_PN131_BMAX o el lote lo va a tirar.",
+                type(e).__name__, bmax)
         bmax = int(os.environ.get("GENESIS_PN131_BMAX", bmax))
         nchmax = (maxlen + bs - 1) // bs
         b = _bufs[dev.index] = _Bufs(dev, bmax, nchmax, nh, bs, G)
