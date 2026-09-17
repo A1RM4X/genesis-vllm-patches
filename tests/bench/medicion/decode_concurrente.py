@@ -37,7 +37,10 @@ def pedir(i, salida, etiqueta):
 
 print(f"{'concurrentes':>13}{'tok/s agregado':>16}{'tok/s por pedido':>18}{'escala':>9}")
 base = None
-ESCALERA = [1, 2, 4, 6, 8, 12, 16]
+# Hasta 6, que es el patron real (un hilo largo + subagentes). Mas arriba el dato existe y esta
+# anotado —  con 12 el throughput CAE de 611 a 404 tok/s porque Marlin relee el peso con M>64 —
+# pero no es lo que manda hoy: pasar 12 pedidos a la vez no es el caso de uso.
+ESCALERA = [1, 2, 4, 6]
 for n in ESCALERA:
     if n > MAX:
         break

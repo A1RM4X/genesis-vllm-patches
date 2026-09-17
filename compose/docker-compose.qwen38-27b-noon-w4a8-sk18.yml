@@ -271,6 +271,12 @@ services:
       - GENESIS_ESCALA_ESTATICA=${ESCEST:-0}
       - GENESIS_ESCALA_ARCHIVO=${ESCEST_ARCHIVO:-/escalas/escalas.json}
       - GENESIS_ESCALA_SITIOS=${ESCEST_SITIOS:-qkv_proj,in_proj_qkvz,gate_up_proj}
+      # PN139: lm_head en int4 por grupo. Esta AL TECHO de DRAM en fp8 (646 MB por GPU a
+      # 862 GB/s), asi que la unica via es leer menos bytes: en int4 son 328 MB y el banco mide
+      # 749 -> 380 us por lanzamiento. Son 5 lanzamientos por paso: 1844 us, 6,5% del decode.
+      # OJO: el lm_head es UNO SOLO, compartido con el MTP, asi que toca los logits de verdad.
+      - GENESIS_ENABLE_PN139_LM_HEAD_INT4=${PN139:-0}
+      - GENESIS_PN139_SOLO_BORRADOR=${PN139_BORRADOR:-0}
       # PN137: suavizado por grupo plegado en las escalas del GPTQ y en la RMSNorm previa.
       # Exacto, todo en boot, cero costo en ejecucion, y mas preciso que el dinamico.
       - GENESIS_ENABLE_PN137_SUAVE=${PN137:-0}

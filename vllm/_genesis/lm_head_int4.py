@@ -12,12 +12,16 @@ En int4 el mismo peso son 328 MB. Medido en ``tests/proto/banco_lmhead.py`` sobr
 (N=124160, K=5120): **749 us contra 380 por lanzamiento**. Son 1844 us/paso si se cambian los
 cinco, o 1475 si se cambia solo el borrador.
 
-Por que el borrador primero
----------------------------
-Degradar el ``lm_head`` del borrador **no puede corromper la salida**: el modelo grande verifica
-cada token propuesto con su propio ``lm_head`` intacto. Lo unico que puede pasar es que baje la
-tasa de aceptacion, que se mide en minutos con ``aceptacion_por_carga.py``. El del modelo
-principal si toca los logits de verdad y va despues, con la suite de calidad.
+El borrador NO se puede separar
+-------------------------------
+La idea original era tocar solo el ``lm_head`` del borrador, que no puede corromper la salida
+porque el modelo grande verifica cada token con el suyo. **No se puede**: con PN348 (el vendor de
+vllm#44644) el MTP no tiene ``lm_head`` propio — ``qwen3_5_mtp.py:303`` le pone un
+``PPMissingLayer()`` y usa el del modelo principal. Es UN SOLO objeto llamado 5 veces por paso.
+
+O sea que el ahorro es el completo (1844 us/paso) pero el riesgo tambien: esto toca los logits
+de verdad. Hay que validarlo con las agujas, la suite de calidad y la aceptacion, no solo con la
+aceptacion.
 
 La cuantizacion
 ---------------
@@ -48,8 +52,12 @@ def activo() -> bool:
 
 
 def solo_borrador() -> bool:
-    """Por defecto solo el borrador: es el cambio que no puede tocar la calidad de salida."""
-    return os.environ.get("GENESIS_PN139_SOLO_BORRADOR", "1") == "1"
+    """Queda por si algun checkpoint trae un lm_head dedicado para el MTP; con este NO pasa.
+
+    Por defecto apagado justamente porque en este modelo filtrar por el borrador dejaria el parche
+    sin efecto: el lm_head es uno solo y compartido.
+    """
+    return os.environ.get("GENESIS_PN139_SOLO_BORRADOR", "0") == "1"
 
 
 def _es_del_borrador(prefijo: str) -> bool:
@@ -134,3 +142,79 @@ def aplicar(layer, x: torch.Tensor, bias=None) -> torch.Tensor:
         input_size_per_partition=layer.pn139_k,
         output_size_per_partition=layer.pn139_n,
         is_k_full=True, bias=bias)
+
+
+class Genesis_INT4_LMHead_EmbeddingMethod:
+    """``quant_method`` del ``lm_head`` en int4 por grupo. Duck-typed, como el de PN77.
+
+    Se apoya en el mismo enganche que PN77 (el walker de ``process_weights_after_loading``), asi
+    que hereda sus guardas ya probadas: idempotencia, pesos atados, recarga con TP.
+    """
+
+    def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
+                       input_size, output_size, params_dtype, **extra):
+        """Igual que ``UnquantizedEmbeddingMethod``: el peso entra en fp16 y recien se cuantiza en
+        ``process_weights_after_loading``, cuando ya se resolvieron el sharding y los pesos atados."""
+        from vllm.model_executor.utils import set_weight_attrs
+        w = torch.nn.Parameter(
+            torch.empty(sum(output_partition_sizes), input_size_per_partition,
+                        dtype=params_dtype),
+            requires_grad=False)
+        set_weight_attrs(w, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", w)
+        set_weight_attrs(w, extra)
+
+    def process_weights_after_loading(self, layer) -> None:
+        prefijo = getattr(layer, "prefix", "") or getattr(layer, "_genesis_prefijo", "")
+        try:
+            if not preparar(layer, prefijo):
+                layer.quant_method = _original()
+                layer.quant_method.process_weights_after_loading(layer)
+        except Exception as e:      # nunca romper el arranque por esto
+            log.error("PN139: fallo al cuantizar el lm_head (%s: %s) — se deja como estaba",
+                      type(e).__name__, e)
+            layer.quant_method = _original()
+
+    def apply(self, layer, x, bias=None):
+        if not getattr(layer, MARCA, False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
+        return aplicar(layer, x, bias)
+
+    def embedding(self, layer, input_):
+        """El lm_head no se usa como tabla de embedding; si alguien lo intenta, es un bug."""
+        raise RuntimeError("PN139: el lm_head cuantizado no puede usarse como embedding")
+
+
+def _original():
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+    return UnquantizedEmbeddingMethod()
+
+
+def maybe_swap(layer, metodo_actual, prefijo: str = ""):
+    """Se llama desde el mismo walker que usa PN77. Devuelve el metodo que hay que usar.
+
+    Tiene prioridad sobre el fp8 de PN77 cuando aplica: int4 son la mitad de bytes que fp8 y el
+    kernel esta contra la memoria, asi que es directamente el doble de rapido.
+    """
+    try:
+        if not activo():
+            return metodo_actual
+        if isinstance(metodo_actual, Genesis_INT4_LMHead_EmbeddingMethod):
+            return metodo_actual
+        if solo_borrador() and not _es_del_borrador(prefijo):
+            return metodo_actual
+        w = getattr(layer, "weight", None)
+        if w is None or w.dim() != 2 or w.dtype not in (torch.float16, torch.bfloat16):
+            return metodo_actual
+        if w.shape[1] % G:
+            return metodo_actual
+        nuevo = Genesis_INT4_LMHead_EmbeddingMethod()
+        layer.quant_method = nuevo
+        layer._genesis_prefijo = prefijo
+        return nuevo
+    except Exception as e:
+        log.warning("PN139: el swap fallo (%s) — se sigue con el metodo original",
+                    type(e).__name__)
+        return metodo_actual

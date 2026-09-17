@@ -130,6 +130,11 @@ def _is_lm_head(layer) -> bool:
     return cls_name == "ParallelLMHead" or cls_name.endswith("LMHead")
 
 
+def _nombre_de(layer) -> str:
+    """El walker no pasa el nombre del modulo, asi que se busca donde vLLM lo deja si existe."""
+    return (getattr(layer, "prefix", "") or getattr(layer, "_genesis_prefijo", "") or "")
+
+
 def maybe_swap_pn77_quant_method(layer, current_method):
     """Hook invoked from text-patched `process_weights_after_loading` walker.
 
@@ -144,9 +149,20 @@ def maybe_swap_pn77_quant_method(layer, current_method):
     NEVER raises — fallback to original on any failure.
     """
     try:
-        if not _is_enabled():
-            return current_method
         if not _is_lm_head(layer):
+            return current_method
+        # PN139 primero: int4 es la mitad de bytes que fp8 y el kernel esta contra la memoria, asi
+        # que es el doble de rapido. Si no aplica, devuelve el metodo que le pasaron y sigue el
+        # camino de PN77 de siempre.
+        try:
+            from vllm._genesis.lm_head_int4 import maybe_swap as _pn139_swap
+            m = _pn139_swap(layer, current_method, _nombre_de(layer))
+            if m is not current_method:
+                return m
+        except Exception as _e139:
+            log.warning("[PN139] el swap crasheo (%s) — se sigue con PN77",
+                        type(_e139).__name__)
+        if not _is_enabled():
             return current_method
         # Only swap pristine UnquantizedEmbeddingMethod (don't override real quant)
         from vllm.model_executor.layers.vocab_parallel_embedding import (

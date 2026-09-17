@@ -1289,6 +1289,25 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN139": {
+        "title": "lm_head en int4 por grupo (hoy fp8 por PN77)",
+        "env_flag": "GENESIS_ENABLE_PN139_LM_HEAD_INT4",
+        "default_on": False,
+        "category": "perf",
+        "credit": (
+            "Genesis-original 2026-09-17. El lm_head es 3,74 ms de los 28,2 del paso "
+            "de decode en solo 5 lanzamientos (1 del modelo + 4 del borrador MTP), y "
+            "esta AL TECHO de DRAM: 646 MB de peso fp8 por GPU a 862 GB/s contra un "
+            "techo medido de 833. No hay nada que mejorarle al kernel, la unica via "
+            "es que lea menos bytes. En int4 son 328 MB; medido en la forma exacta, "
+            "749 us contra 380 por lanzamiento (tests/proto/banco_lmhead.py), o sea "
+            "1844 us/paso, 6,5% del decode. El lm_head es UNO SOLO compartido con el "
+            "MTP (qwen3_5_mtp.py:303 le pone un PPMissingLayer), asi que esto toca "
+            "los logits de verdad: validar con agujas, suite y aceptacion."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN137": {
         "title": "Suavizado por grupo plegado en los pesos (SmoothQuant exacto)",
         "env_flag": "GENESIS_ENABLE_PN137_SUAVE",
