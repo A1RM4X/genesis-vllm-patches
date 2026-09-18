@@ -64,6 +64,13 @@ GENESIS_P34_MARKER = "Genesis P34 Mamba zero-collapse deadlock guard v7.0"
 # Both introduce an `aligned = ...` intermediate with a > 0 check — if
 # either appears in the file we self-retire.
 UPSTREAM_DRIFT_MARKERS = [
+    # Upstream ya trae la guarda: el bloque se reescribio como
+    #     aligned_end = end // block_size * block_size
+    #     if aligned_end > start or block_size <= max_prefill_tokens:
+    # Ese `> start` ES el arreglo de PR #40757 — el colapso a 0 ya no puede pasar. Esta
+    # asi en v0.27.1 y en v0.29.0, o sea que P34 viene salteandose desde antes de la
+    # migracion; lo que faltaba era decirlo en voz alta en vez de fallar por ancla.
+    "aligned_end = end // block_size * block_size",
     # Signature of the upstream fix, variant 1 (fanghao566 PR #40757).
     "aligned = num_new_tokens // block_size * block_size",
     # Alternate variable name variant.
@@ -116,6 +123,7 @@ def _make_patcher() -> TextPatcher | None:
             ),
         ],
         upstream_drift_markers=UPSTREAM_DRIFT_MARKERS,
+
     )
 
 

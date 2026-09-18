@@ -348,7 +348,27 @@ def _get_bufs(dev, nh, bs, G=6):
     return b
 
 
+_geom_avisado = False
+
+
 def _geom(kv_cache):
+    # La forma esperada es (bloques, cabezas, tokens_por_bloque, contenido), que es lo que
+    # daba `TritonAttentionBackend.get_kv_cache_shape` — "K y V empaquetados en el eje de
+    # contenido: logico (B, H, N, 2*hs)". En vLLM v0.29.0 ese metodo ya no existe: la forma
+    # la decide un layout central (LBNHC / LBHNC / BLHNC / ...), y si el orden de ejes o el
+    # rango cambian, desempaquetar a ciegas escribe el KV en offsets equivocados y el modelo
+    # genera basura SIN fallar. Por eso se anuncia una vez y se verifica el rango.
+    global _geom_avisado
+    if not _geom_avisado:
+        _geom_avisado = True
+        log.info("[PN131] forma del KV: %s  strides=%s  dtype=%s",
+                 tuple(kv_cache.shape), tuple(kv_cache.stride()), kv_cache.dtype)
+    if kv_cache.dim() != 4:
+        raise RuntimeError(
+            f"[PN131] el KV vino con {kv_cache.dim()} ejes {tuple(kv_cache.shape)}; se "
+            "esperaban 4 (bloques, cabezas, tokens, contenido). El layout de KV cambio: "
+            "hay que revisar `escribir()` y el indexado del kernel antes de seguir."
+        )
     nb, nh, bs, cont = kv_cache.shape
     blk = kv_cache.stride(0) * kv_cache.element_size()
     raw = torch.as_strided(kv_cache, (nb, blk), (blk, 1))

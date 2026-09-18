@@ -34,6 +34,11 @@ import urllib.request
 
 RAW = "https://raw.githubusercontent.com/vllm-project/vllm/{tag}/vllm/{rel}"
 
+# Decision real del dispatcher por patch_id, y a que patch_id pertenece cada patcher.
+_decisiones: dict[str, tuple[bool, str]] = {}
+_duenio: dict[str, str] = {}
+_ultimo_id: list[str] = []
+
 
 def _wiring_dir() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent / "wiring"
@@ -56,10 +61,15 @@ def recolectar() -> list[tuple[str, str, list[tuple[str, str, bool]], list[str]]
     from vllm._genesis.wiring import text_patch as tp
 
     recogido: list[tuple[str, str, list[tuple[str, str, bool]], list[str]]] = []
+    _decisiones.clear()
+    _ultimo_id.clear()
 
     real_apply = tp.TextPatcher.apply
 
     def espia(self):
+        # El apply() del wiring llama a should_apply() antes de construir sus patchers,
+        # asi que el ultimo id consultado es el duenio de este patcher.
+        _duenio[self.patch_name] = _ultimo_id[-1] if _ultimo_id else ""
         recogido.append((
             self.patch_name, self.target_file,
             [(s.name, s.anchor, s.required) for s in self.sub_patches],
@@ -71,11 +81,24 @@ def recolectar() -> list[tuple[str, str, list[tuple[str, str, bool]], list[str]]
     # con espiar TextPatcher.apply alcanza para las dos formas.
     tp.TextPatcher.apply = espia
 
-    # El dispatcher decide por variables de entorno; aca queremos ver TODAS las anclas,
-    # incluso las de parches que hoy estan apagados.
+    # Queremos ver TODAS las anclas, incluso las de parches apagados — pero tambien saber
+    # cuales de esos parches CORRERIAN de verdad en este entorno, que es lo unico que
+    # decide si un ancla rota importa. Asi que se consulta la decision real del dispatcher
+    # y recien despues se fuerza el paso. Ojo: "prendido" no es lo mismo que tener un
+    # GENESIS_ENABLE_*=1 en el compose; muchos parches se aplican por defecto.
     from vllm._genesis import dispatcher
     real_should = dispatcher.should_apply
-    dispatcher.should_apply = lambda *a, **k: (True, "preflight: forzado")
+
+    def espia_should(patch_id, *a, **k):
+        try:
+            decision, motivo = real_should(patch_id, *a, **k)
+        except Exception as e:                       # noqa: BLE001
+            decision, motivo = True, f"consulta fallo ({type(e).__name__})"
+        _decisiones[str(patch_id)] = (bool(decision), motivo)
+        _ultimo_id.append(str(patch_id))
+        return True, "preflight: forzado"
+
+    dispatcher.should_apply = espia_should
 
     try:
         for m in _modulos():
@@ -160,6 +183,7 @@ def verificar(arbol: str, explicar: bool = False) -> int:
     rotos = ambiguos = ok = 0
     sin_archivo: list[str] = []
     obsoletos: list[str] = []
+    criticos: list[str] = []
     for parche, target, subs, derivas in datos:
         rel = _rel_vllm(target)
         f = raiz / rel
@@ -195,7 +219,17 @@ def verificar(arbol: str, explicar: bool = False) -> int:
                 ambiguos += 1
                 malas.append(f"AMBIGUO  {nombre}: {c} ocurrencias")
         if malas:
-            print(f"\n{parche}  [{rel}]")
+            pid = _duenio.get(parche, "")
+            corre, motivo = _decisiones.get(pid, (None, ""))
+            if corre:
+                criticos.append(parche)
+                sello = f"CORRE AQUI ({pid}: {motivo})"
+            elif corre is None:
+                criticos.append(parche)
+                sello = "no se pudo saber si corre — tratado como critico"
+            else:
+                sello = f"apagado aca ({motivo})"
+            print(f"\n{parche}  [{rel}]\n    -> {sello}")
             for m in malas:
                 print(f"    {m}")
 
@@ -212,7 +246,14 @@ def verificar(arbol: str, explicar: bool = False) -> int:
 
     print(f"\nResumen: {ok} anclas OK, {rotos} rotas, {ambiguos} ambiguas, "
           f"{len(obsoletos)} parches obsoletos, {len(sin_archivo)} archivos ausentes.")
-    return 1 if (rotos or ambiguos) else 0
+    if criticos:
+        print(f"\nCRITICOS — {len(criticos)} parches que SI corren en este entorno y tienen "
+              f"anclas rotas en la version destino:")
+        for c in criticos:
+            print(f"    {c}")
+    else:
+        print("\nNinguno de los parches que corren en este entorno queda con anclas rotas.")
+    return 1 if criticos else 0
 
 
 def main() -> int:

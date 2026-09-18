@@ -151,6 +151,16 @@ ANCHOR_CORE_NEW = '''            logger.info_once("GPU KV cache size: %s tokens"
 '''
 
 
+# v0.29.0 se llevo esto a `update_kv_cache_capacity()`: los dos `logger.info_once` se
+# fusionaron en uno solo y el bloque bajo de 12 espacios de indentacion a 4. El ancla
+# vieja no existe mas. El punto de insercion es el mismo — justo despues de que se
+# conoce num_tokens — y las variables que usa el informe (vllm_config, num_tokens)
+# siguen en alcance.
+ANCHOR_CORE_OLD_V029 = '    logger.info_once(\n        "GPU KV cache size: %s tokens, "\n        "Maximum concurrency for %s tokens per request: %.2fx",\n        f"{num_tokens:,}",\n        f"{max_model_len:,}",\n        max_concurrency,\n    )\n'
+
+ANCHOR_CORE_NEW_V029 = ANCHOR_CORE_OLD_V029 + '    # _GENESIS_PN83_ANALISIS_ARRANQUE\n    # Ultimo punto del arranque donde ya se sabe TODO: config completa mas el tamaño\n    # real de la cache en tokens. Aca se junta con el desglose de memoria que dejo el\n    # worker y se escribe el informe para humanos. El loop es por-rank: el guard emite\n    # UNA vez.\n    try:\n        from vllm._genesis import analisis_arranque as _g83\n\n        if not getattr(_g83, "_informe_emitido", False):\n            _g83._informe_emitido = True\n            _g83.emitir_informe(vllm_config, num_tokens)\n    except Exception:\n        pass  # el informe es opcional; nunca puede tumbar el arranque\n'
+
+
 def _is_disabled() -> bool:
     return os.environ.get("GENESIS_DISABLE_PN83", "").strip().lower() in (
         "1",
@@ -189,8 +199,8 @@ def _patcher_core() -> TextPatcher | None:
         sub_patches=[
             TextPatch(
                 name="pn83_emit_report",
-                anchor=ANCHOR_CORE_OLD,
-                replacement=ANCHOR_CORE_NEW,
+                anchor=[ANCHOR_CORE_OLD, ANCHOR_CORE_OLD_V029],
+                replacement=[ANCHOR_CORE_NEW, ANCHOR_CORE_NEW_V029],
                 required=True,
             ),
         ],

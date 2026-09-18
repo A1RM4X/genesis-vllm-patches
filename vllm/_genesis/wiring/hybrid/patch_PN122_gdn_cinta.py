@@ -221,6 +221,46 @@ MU_POST_NEW = (
     + MU_POST_OLD
 )
 
+# ─────────────── v0.29.0: el early-return que marcaba el request antes de tiempo ───────────────
+# PN122 pone `num_speculative_blocks = 0`: ese es TODO su beneficio (libera K bloques de estado
+# GDN por request del pool). En v0.29.0 upstream agrego una linea adentro del early-return de
+# `MambaManager.allocate_new_blocks`:
+#
+#     if num_required_blocks <= len(req_blocks) and not has_partial_hit:
+#         self._allocated_block_reqs.add(request_id)      # <-- nueva en v0.29.0
+#         return []
+#
+# Unas lineas mas abajo, `blocks_allocated = request_id in self._allocated_block_reqs` decide
+# como se fija `last_state_block_idx`, y ESE indice es el que `remove_skipped_blocks` usa para
+# liberar el bloque de estado viejo y reemplazarlo por el bloque nulo.
+#
+# Con K > 0 el early-return casi no se toma, porque `num_required_blocks` lleva los K bloques de
+# sobra sumados. Con K = 0 se toma seguido: el request queda marcado antes de tiempo,
+# `last_state_block_idx` apunta al bloque equivocado y se libera un bloque que todavia tiene el
+# estado GDN vivo. El paso siguiente lee estado nulo, el modelo se corrompe y emite EOS — que es
+# exactamente lo que se medio (2 tokens con PN122 prendido, 40 con GENESIS_PN122_SIN_LIBERAR=1,
+# que es la misma cinta y el mismo kernel pero conservando los bloques).
+#
+# Saltear ese `add` con la cinta activa es inocuo: la marca existe para no volver a sumar
+# `num_speculative_blocks` a un request ya alocado, y con PN122 ese numero es 0.
+MGR_IMPORT_OLD = "from vllm.v1.core.block_pool import BlockPool\n"
+MGR_IMPORT_NEW = (
+    MGR_IMPORT_OLD
+    + "from vllm._genesis import gdn_cinta as _g122  # " + MARKER + "\n"
+)
+
+MGR_EARLY_OLD = (
+    "            if num_required_blocks <= len(req_blocks) and not has_partial_hit:\n"
+    "                self._allocated_block_reqs.add(request_id)\n"
+    "                return []\n"
+)
+MGR_EARLY_NEW = (
+    "            if num_required_blocks <= len(req_blocks) and not has_partial_hit:\n"
+    "                if not _g122.activo():  # " + MARKER + "\n"
+    "                    self._allocated_block_reqs.add(request_id)\n"
+    "                return []\n"
+)
+
 _PATCHES = [
     ("model_executor/layers/mamba/abstract.py", [
         ("pn122_abs_import", ABS_IMPORT_OLD, ABS_IMPORT_NEW),
@@ -237,6 +277,12 @@ _PATCHES = [
         ("pn122_att_calc", ATT_CALC_OLD, ATT_CALC_NEW),
         ("pn122_att_cg", ATT_CG_OLD, ATT_CG_NEW),
         ("pn122_att_ret", ATT_RET_OLD, ATT_RET_NEW),
+    ]),
+    # Opcional a proposito: estas dos anclas solo existen en v0.29.0+. En v0.27.1 no hay nada
+    # que arreglar y los sub-parches se saltan sin ruido (required=False).
+    ("v1/core/single_type_kv_cache_manager.py", [
+        ("pn122_mgr_import", MGR_IMPORT_OLD, MGR_IMPORT_NEW, False),
+        ("pn122_mgr_early_return", MGR_EARLY_OLD, MGR_EARLY_NEW, False),
     ]),
     ("v1/worker/mamba_utils.py", [
         ("pn122_mu_import", MU_IMPORT_OLD, MU_IMPORT_NEW),
@@ -258,8 +304,9 @@ def _patchers() -> list[TextPatcher] | None:
             patch_name=f"PN122 cinta GDN ({rel.rsplit('/', 1)[-1]})",
             target_file=str(target),
             marker=MARKER,
-            sub_patches=[TextPatch(name=n, anchor=o, replacement=r, required=True)
-                         for n, o, r in subs],
+            sub_patches=[TextPatch(name=e[0], anchor=e[1], replacement=e[2],
+                                   required=(e[3] if len(e) > 3 else True))
+                         for e in subs],
             upstream_drift_markers=[],
         ))
     return out

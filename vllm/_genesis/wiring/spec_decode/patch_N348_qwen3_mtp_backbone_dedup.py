@@ -181,6 +181,25 @@ PN348_LMHEAD_OLD = (
     '            else:\n'
     '                self.lm_head = ParallelLMHead(\n'
 )
+# v0.29.0 reordeno el bloque: ahora aloca el ParallelLMHead siempre y recien despues lo
+# ata a embed_tokens con `tie_weights`, en vez de decidir antes cual de los dos usar. El
+# ancla vieja (que arrancaba por el `if config.tie_word_embeddings`) desaparecio.
+# La variante nueva engancha en las dos primeras lineas y deja intacto todo lo de abajo:
+# cuando el MTP comparte backbone con el target, el lm_head es del target y no hay que
+# alocar nada; si no, cae al camino de upstream sin tocarlo.
+PN348_LMHEAD_OLD_V029 = (
+    '        if get_pp_group().is_last_rank:\n'
+    '            self.lm_head = ParallelLMHead(\n'
+)
+
+PN348_LMHEAD_NEW_V029 = (
+    '        if get_pp_group().is_last_rank and self.model.share_backbone_input_output:\n'
+    '            # [Genesis PN348] target owns lm_head — skip allocation.\n'
+    '            self.lm_head = PPMissingLayer()\n'
+    '        elif get_pp_group().is_last_rank:\n'
+    '            self.lm_head = ParallelLMHead(\n'
+)
+
 PN348_LMHEAD_NEW = (
     '        if get_pp_group().is_last_rank:\n'
     '            if self.model.share_backbone_input_output:\n'
@@ -250,8 +269,8 @@ def apply() -> tuple[str, str]:
             ),
             TextPatch(
                 name="pn348_lm_head_fallthrough",
-                anchor=PN348_LMHEAD_OLD,
-                replacement=PN348_LMHEAD_NEW,
+                anchor=[PN348_LMHEAD_OLD, PN348_LMHEAD_OLD_V029],
+                replacement=[PN348_LMHEAD_NEW, PN348_LMHEAD_NEW_V029],
                 required=True,
             ),
             TextPatch(

@@ -58,6 +58,64 @@ A1_NEW = (
     "    )\n"
 )
 
+# v0.29.0 agrego el keep-alive de SSE: el `return StreamingResponse(content=generator, ...)`
+# de una linea paso a envolver el generador en `with_sse_keep_alive(...)`. El ancla vieja
+# terminaba justo en esa linea, asi que dejo de aparecer entera. Esta variante repite el
+# cuerpo nuevo y mete nuestro wrapper ADENTRO del de keep-alive, que es el orden correcto:
+# el tracker tiene que ver los chunks reales del modelo, no los pings de keep-alive.
+A1_OLD_V029 = (
+    "    generator = await handler.create_chat_completion(request, raw_request)\n"
+    "\n"
+    "    if isinstance(generator, ErrorResponse):\n"
+    "        return JSONResponse(\n"
+    "            content=generator.model_dump(), status_code=generator.error.code\n"
+    "        )\n"
+    "\n"
+    "    elif isinstance(generator, ChatCompletionResponse):\n"
+    "        return JSONResponse(\n"
+    "            content=generator.model_dump(),\n"
+    "            headers=metrics_header(metrics_header_format),\n"
+    "        )\n"
+    "\n"
+    "    args = getattr(raw_request.app.state, \"args\", None)\n"
+    "    keep_alive_interval = getattr(args, \"sse_keep_alive_interval\", 0)\n"
+    "    return StreamingResponse(\n"
+    "        content=with_sse_keep_alive(generator, float(keep_alive_interval)),\n"
+    "        media_type=\"text/event-stream\",\n"
+    "    )\n"
+)
+
+A1_NEW_V029 = (
+    "    # " + GENESIS_PN89_MARKER + "\n"
+    "    " + _IMPORT + "\n"
+    "    _tracker = _g89.create_tracker(request)\n"
+    "    generator = await handler.create_chat_completion(request, raw_request)\n"
+    "\n"
+    "    if isinstance(generator, ErrorResponse):\n"
+    "        _g89.finish_request(_tracker, None, status=generator.error.code)\n"
+    "        return JSONResponse(\n"
+    "            content=generator.model_dump(), status_code=generator.error.code\n"
+    "        )\n"
+    "\n"
+    "    elif isinstance(generator, ChatCompletionResponse):\n"
+    "        _g89.finish_request(_tracker, generator, status=200)\n"
+    "        return JSONResponse(\n"
+    "            content=generator.model_dump(),\n"
+    "            headers=metrics_header(metrics_header_format),\n"
+    "        )\n"
+    "\n"
+    "    args = getattr(raw_request.app.state, \"args\", None)\n"
+    "    keep_alive_interval = getattr(args, \"sse_keep_alive_interval\", 0)\n"
+    "    return StreamingResponse(\n"
+    "        content=with_sse_keep_alive(\n"
+    "            _g89.wrap_streaming_generator(generator, _tracker),\n"
+    "            float(keep_alive_interval),\n"
+    "        ),\n"
+    "        media_type=\"text/event-stream\",\n"
+    "    )\n"
+)
+
+
 B1_OLD = "def attach_router(app: FastAPI):\n    app.include_router(router)\n"
 B1_NEW = (
     "def attach_router(app: FastAPI):\n"
@@ -80,8 +138,8 @@ def apply() -> tuple[str, str]:
         sub_patches=[
             TextPatch(
                 name="pn89_create_chat_completion_hook",
-                anchor=A1_OLD,
-                replacement=A1_NEW,
+                anchor=[A1_OLD, A1_OLD_V029],
+                replacement=[A1_NEW, A1_NEW_V029],
                 required=True,
             ),
             TextPatch(

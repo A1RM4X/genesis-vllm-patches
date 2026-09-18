@@ -82,27 +82,44 @@ class TextPatch:
               vLLM: se usa la primera que aparezca en el archivo. Tenerlas todas juntas en
               el TextPatch (en vez de elegir al construirlo) es lo que deja al pre-vuelo
               de migracion ver que el parche si tiene ancla para la version destino.
-      replacement: What to substitute for `anchor`.
+      replacement: What to substitute for `anchor`. Si ``anchor`` es una lista de
+              variantes, esto puede ser una lista emparejada por indice (lo normal: si
+              cambio la region, cambio el reemplazo); un string solo vale para todas.
       required: If True, failure of this sub-patch aborts the parent group.
                 If False (default), sibling sub-patches still run.
     """
     name: str
     anchor: str | list[str]
-    replacement: str
+    replacement: str | list[str]
     required: bool = False
 
-    def ancla_en(self, texto: str) -> str:
-        """La variante de ancla presente en ``texto``; la primera si no hay ninguna.
+    def par_en(self, texto: str) -> tuple[str, str]:
+        """El par (ancla, reemplazo) que corresponde a ``texto``.
 
-        Devolver la primera cuando no matchea ninguna es a proposito: el sub-parche sigue
+        Con variantes por version, el reemplazo casi siempre tambien cambia, asi que
+        ``replacement`` puede ser una lista emparejada por indice con ``anchor``. Si es
+        un string solo, sirve para todas las variantes.
+
+        Cuando no matchea ninguna se devuelve la primera: el sub-parche tiene que seguir
         fallando como corresponde, y el mensaje nombra un ancla concreta.
         """
-        if isinstance(self.anchor, str):
-            return self.anchor
-        for v in self.anchor:
-            if v in texto:
-                return v
-        return self.anchor[0]
+        anclas = [self.anchor] if isinstance(self.anchor, str) else list(self.anchor)
+        if isinstance(self.replacement, str):
+            repuestos = [self.replacement] * len(anclas)
+        else:
+            repuestos = list(self.replacement)
+            if len(repuestos) != len(anclas):
+                raise ValueError(
+                    f"sub-patch {self.name!r}: {len(anclas)} anclas pero "
+                    f"{len(repuestos)} reemplazos — tienen que emparejarse por indice"
+                )
+        for a, r in zip(anclas, repuestos):
+            if a in texto:
+                return a, r
+        return anclas[0], repuestos[0]
+
+    def ancla_en(self, texto: str) -> str:
+        return self.par_en(texto)[0]
 
 
 @dataclass
@@ -174,7 +191,7 @@ class TextPatcher:
         self.applied_sub_patches = applied_patches
 
         for sp in self.sub_patches:
-            ancla = sp.ancla_en(modified)
+            ancla, repuesto = sp.par_en(modified)
             if ancla not in modified:
                 # Anchor drift: not a crash, but we must decide whether to abort.
                 if sp.required:
@@ -197,7 +214,7 @@ class TextPatcher:
                     ),
                 )
 
-            modified = modified.replace(ancla, sp.replacement, 1)
+            modified = modified.replace(ancla, repuesto, 1)
             applied_patches.append(sp.name)
 
         if not applied_patches:
@@ -385,7 +402,7 @@ class MultiFilePatchTransaction:
             # allowed to be missing.
             preview = src
             for sp in patcher.sub_patches:
-                ancla = sp.ancla_en(preview)
+                ancla, repuesto = sp.par_en(preview)
                 if ancla not in preview:
                     if sp.required:
                         return False, (
@@ -406,7 +423,7 @@ class MultiFilePatchTransaction:
                     )
                 # Apply replacement to preview so subsequent sub-patches
                 # see the post-replacement state.
-                preview = preview.replace(ancla, sp.replacement, 1)
+                preview = preview.replace(ancla, repuesto, 1)
         return True, ""
 
     def apply_or_skip(self) -> tuple[str, str]:

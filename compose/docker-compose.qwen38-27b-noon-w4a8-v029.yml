@@ -1,7 +1,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # noon-at-cgn/Qwen3.8-27B-Uncensored-W4A16-AutoRound servido como W4A8
 # KV de atencion en INT8 por token-cabeza (PN131 / SK-18g)
+#
 # ⚠ VARIANTE DE MIGRACION A vLLM v0.29.0 — el compose principal sigue en v0.27.1
+#   Los dos NO pueden correr juntos: cada uno se lleva las dos placas enteras. Por eso
+#   comparte el IP 172.20.0.228 (litellm y open-webui apuntan ahi y no hay que tocarlos)
+#   pero cambia el nombre del contenedor, el puerto publicado (8321) y TODAS las cachés
+#   JIT: el cambio de version invalida torch.compile, Triton, Inductor y la .so de Marlin,
+#   y mezclarlas seria arrastrar artefactos compilados contra la otra version.
+#
+#   Antes de migrar se corrio el pre-vuelo de anclajes contra las fuentes de v0.29.0:
+#     python -m vllm._genesis.preflight_anclajes --bajar v0.29.0 --arbol /tmp/v029
+#   De los 40 parches que este compose prende, 0 quedan con anclas rotas. Ninguno de los
+#   de kernel se movio (marlin_utils.py es identico entre las dos versiones). PN19, PN88 y
+#   PN90 ahora se saltan solos porque upstream absorbio lo que hacian — ver mas abajo.
 # 2x RTX 3090 (GA102, sm_86), TP=2, MTP nativo K=3
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -71,6 +83,12 @@ services:
       - GENESIS_KV_DISK_ORPHAN_CHECK_SECS=3600
       - GENESIS_KV_DISK_TARGET_RATIO=0.85
       - GENESIS_PN81_ASYNC=1
+      # PN88/PN90: en v0.29.0 upstream reescribio el subsistema de tiering y se llevo las
+      # dos ideas adentro (TieringMetricsTracker para las metricas por tier; cascada a
+      # nivel de request con parking en pending_cascade_keys para el gateo de escritura).
+      # Quedan en 1 porque este compose tiene que seguir sirviendo para 0.27.1, pero en
+      # 0.29.0 los parches lo detectan y se saltan con mensaje claro — no pelean con lo de
+      # upstream. Pendiente: que el dashboard lea las metricas nativas de tiering.
       - GENESIS_ENABLE_PN88_KV_TIER_METRICS=1
       - GENESIS_KV_AGENTS=coach,primary,primary_low,primary_high,primary_nothink,planner,planner_nothink,coder,verifier,utility,explorer,vision,art
       - GENESIS_ENABLE_PN90_KV_DISK_WRITE_GATING=1
@@ -231,6 +249,17 @@ services:
       - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=0
       # PN122: el rollback del MTP en GDN usa una cinta en vez de K copias del
       # estado. Medido: ~18 bloques GDN por request con K=3.
+      # PN122 (cinta GDN: rollback del MTP sin bloques especulativos). PRENDIDO.
+      # Se rompio en la migracion a v0.29.0 y se arreglo. Lo que pasaba: PN122 pone
+      # num_speculative_blocks=0 — ese es todo su beneficio, libera K bloques de estado GDN por
+      # request — y v0.29.0 agrego un `self._allocated_block_reqs.add(request_id)` adentro del
+      # early-return de MambaManager.allocate_new_blocks. Con K=0 ese early-return se toma mucho
+      # mas seguido, el request quedaba marcado antes de tiempo, last_state_block_idx apuntaba al
+      # bloque equivocado y remove_skipped_blocks liberaba un bloque con el estado GDN vivo: el
+      # modelo emitia EOS al segundo token. El arreglo saltea ese `add` con la cinta activa, que
+      # es inocuo porque la marca existe para no re-sumar num_speculative_blocks, y vale 0.
+      # Medido despues del arreglo: 40 tokens correctos y la KV de vuelta en 628.186 tokens
+      # (contra 611.410 con PN122 apagado) — el ahorro son +16.776 tokens de KV.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo
@@ -278,6 +307,8 @@ services:
       - GENESIS_ENABLE_PN80_GDN_H_BUDGET_PROBE=0
       - GENESIS_ENABLE_PN25_SILU_INDUCTOR_SAFE=1
       - GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1
+      # PN19: upstream ya trae `_scoped_allocator_max_split(max_split_size_mb=20)` — de
+      # hecho ya lo traia en 0.27.1, asi que este parche viene saltandose hace rato.
       - GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1
       - GENESIS_PN80_EVERY=2000
       - GENESIS_PN80_MIN_T=256
@@ -466,8 +497,20 @@ services:
       # la KV -> se desalojan prefijos -> el turno siguiente re-prefillea 50-100k
       # tokens. Medido: 2,5x mas prefill despues de KV>85%, y el hit rate del
       # prefix cache queda en 50% cuando deberia estar cerca de 90%.
+      # ── El tier L2 en RAM: 12 GiB -> 2 GiB ────────────────────────────────
+      # v0.29.0 agrego `check_shm_free_space` antes del ftruncate Y ahora PUEBLA la
+      # region (MADV_POPULATE_WRITE). v0.27.1 no chequeaba y tmpfs no reserva en el
+      # ftruncate, asi que los 12 GiB eran nominales y solo se ocupaba lo que se tocaba:
+      # el arranque pasaba sin que nadie viera el problema. Con TP=2 son un scheduler
+      # mas DOS regiones de worker — 36 GiB pedidos en una maquina de 30.
+      #
+      # Que bajen a 2 GiB no pierde nada, y esta medido: L2 y L3 devuelven CERO hits, y
+      # es estructural. Un hit de prefijo necesita los cuatro grupos de KV, y g0-g2 son
+      # GDN con estado recurrente: no hay nada que rescatar de un tier externo. El tier
+      # queda chico solo para que el conector exista (PN81/PN88/PN90/PN91 cuelgan de el).
+      # Tambien es lo que corresponde a la regla del proyecto: nada en RAM de la placa.
       - --kv-transfer-config
-      - '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"spec_name": "TieringOffloadingSpec", "cpu_bytes_to_use": 12884901888, "eviction_policy": "arc", "store_threshold": 1, "secondary_tiers": [{"type": "fs", "root_dir": "/kv-offload", "n_read_threads": 4, "n_write_threads": 4}]}}'
+      - '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"spec_name": "TieringOffloadingSpec", "cpu_bytes_to_use": 2147483648, "eviction_policy": "arc", "store_threshold": 1, "secondary_tiers": [{"type": "fs", "root_dir": "/kv-offload", "n_read_threads": 4, "n_write_threads": 4}]}}'
       # NO usar --enable-dbo aca. Es micro-batching con solapamiento, que es
       # justo lo que queriamos, pero vLLM lo tiene atado al all2all de MoE:
       #   "Microbatching currently only supports the deepep_low_latency,
