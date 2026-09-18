@@ -101,9 +101,23 @@ def debug_builder(num_spec_decodes, nacc, slots, sidx, cu, seq_lens) -> None:
 
 
 def num_speculative_blocks(vllm_config) -> int:
-    """Lo que upstream pone en ``MambaSpec.num_speculative_blocks``."""
-    sc = vllm_config.speculative_config
-    k = sc.num_speculative_tokens if sc else 0
+    """Lo que upstream pone en ``MambaSpec.num_speculative_blocks``.
+
+    Hay que reproducir la cuenta de cada version, porque con la cinta apagada este valor
+    TIENE que ser exactamente el de upstream:
+
+    * v0.27.1: ``speculative_config.num_speculative_tokens if speculative_config else 0``
+    * v0.29.0: ``0 if cache_config.use_kda_recoverssm else num_speculative_tokens`` — el
+      atajo subio a ``vllm_config`` y aparecio la rama de RecoverSSM, que verifica la
+      ventana entera contra un solo checkpoint y por eso nunca escribe los slots por
+      token de draft.
+    """
+    k = getattr(vllm_config, "num_speculative_tokens", None)
+    if k is None:                                   # v0.27.1 y anteriores
+        sc = vllm_config.speculative_config
+        k = sc.num_speculative_tokens if sc else 0
+    if getattr(vllm_config.cache_config, "use_kda_recoverssm", False):
+        k = 0                                       # v0.29.0: RecoverSSM no usa esos slots
     # Diagnostico: GENESIS_PN122_SIN_LIBERAR=1 conserva los bloques especulativos
     # (cinta y kernel activos, sin ahorro) para aislar el efecto de sacarlos.
     if os.environ.get("GENESIS_PN122_SIN_LIBERAR", "0") == "1":

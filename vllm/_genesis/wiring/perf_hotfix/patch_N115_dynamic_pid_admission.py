@@ -69,32 +69,30 @@ STEP_RECORD_NEW = (
 # fuera del `while`: el bucle de waiting es camino caliente y hacer el import
 # por iteración es un lookup en sys.modules por request.
 
-ADMISSION_GATE_OLD = (
+# Tres anclas chicas en vez de un bloque de 14 lineas. El bloque largo abarcaba el
+# encabezado del `while` entero, y en v0.29.0 upstream le metio adentro un
+# `if input_budget <= draft_slots: break`: el ancla desaparecio y PN115 se apagaba solo.
+# Cada pieza se ancla ahora en las lineas que de verdad necesita tocar, que son las mismas
+# en v0.27.1 y en v0.29.0 (verificado: una ocurrencia de cada una en las dos versiones).
+
+# 1) El import izado: una vez por schedule(), no una vez por request en el bucle caliente.
+GATE_IMPORT_OLD = (
     "            step_skipped_waiting = create_request_queue(self.policy)\n"
-    "\n"
-    "            while (self.waiting or self.skipped_waiting) and token_budget > 0:\n"
-    "                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not\n"
-    "                # in `running` but still hold a model-runner request slot.\n"
+)
+GATE_IMPORT_NEW = (
+    GATE_IMPORT_OLD
+    + "            # " + GENESIS_PN115_MARKER + " — import izado: una vez por\n"
+    "            # schedule(), no una vez por request en el bucle caliente.\n"
+    "            from vllm._genesis import dynamic_pid_gating as _g115\n"
+)
+
+# 2) El bypass de prioridad, en el `break` por slots de runner llenos.
+GATE_BYPASS_OLD = (
     "                num_running = len(self.running) + self.num_waiting_for_streaming_input\n"
     "                if num_running >= self.max_num_running_reqs:\n"
     "                    break\n"
-    "\n"
-    "                request_queue = self._select_waiting_queue_for_scheduling()\n"
-    "                assert request_queue is not None\n"
-    "\n"
-    "                request = request_queue.peek_request()\n"
-    "                request_id = request.request_id\n"
 )
-
-ADMISSION_GATE_NEW = (
-    "            step_skipped_waiting = create_request_queue(self.policy)\n"
-    "            # " + GENESIS_PN115_MARKER + " — import izado: una vez por\n"
-    "            # schedule(), no una vez por request en el bucle caliente.\n"
-    "            from vllm._genesis import dynamic_pid_gating as _g115\n"
-    "\n"
-    "            while (self.waiting or self.skipped_waiting) and token_budget > 0:\n"
-    "                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not\n"
-    "                # in `running` but still hold a model-runner request slot.\n"
+GATE_BYPASS_NEW = (
     "                num_running = len(self.running) + self.num_waiting_for_streaming_input\n"
     "                if num_running >= self.max_num_running_reqs:\n"
     "                    # " + GENESIS_PN115_MARKER + " Bypass de prioridad:\n"
@@ -120,19 +118,23 @@ ADMISSION_GATE_NEW = (
     "                    encoder_compute_budget += _g115_enc\n"
     "                    req_index += _g115_idx\n"
     "                    break\n"
-    "\n"
-    "                request_queue = self._select_waiting_queue_for_scheduling()\n"
-    "                assert request_queue is not None\n"
-    "\n"
+)
+
+# 3) La admision por headroom de KV, apenas se conoce el request de la cabeza.
+GATE_HEADROOM_OLD = (
     "                request = request_queue.peek_request()\n"
     "                request_id = request.request_id\n"
-    "\n"
+)
+GATE_HEADROOM_NEW = (
+    GATE_HEADROOM_OLD
+    + "\n"
     "                # " + GENESIS_PN115_MARKER + " Admision por headroom de KV.\n"
     "                if _g115.should_gate_waiting(request, self):\n"
     "                    request_queue.pop_request()\n"
     "                    step_skipped_waiting.prepend_request(request)\n"
     "                    continue\n"
 )
+
 
 
 def _make_patcher() -> TextPatcher | None:
@@ -152,9 +154,21 @@ def _make_patcher() -> TextPatcher | None:
                 required=True,
             ),
             TextPatch(
-                name="pn115_admission_gate",
-                anchor=ADMISSION_GATE_OLD,
-                replacement=ADMISSION_GATE_NEW,
+                name="pn115_gate_import",
+                anchor=GATE_IMPORT_OLD,
+                replacement=GATE_IMPORT_NEW,
+                required=True,
+            ),
+            TextPatch(
+                name="pn115_gate_bypass",
+                anchor=GATE_BYPASS_OLD,
+                replacement=GATE_BYPASS_NEW,
+                required=True,
+            ),
+            TextPatch(
+                name="pn115_gate_headroom",
+                anchor=GATE_HEADROOM_OLD,
+                replacement=GATE_HEADROOM_NEW,
                 required=True,
             ),
         ],

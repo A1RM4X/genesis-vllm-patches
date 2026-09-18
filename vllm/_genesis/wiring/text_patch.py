@@ -77,15 +77,32 @@ class TextPatch:
 
     Attributes:
       name: Short identifier for logs.
-      anchor: Exact substring that must appear in the file (pre-patch).
+      anchor: Exact substring that must appear in the file (pre-patch). Puede ser una
+              LISTA de variantes cuando upstream reescribio la region entre versiones de
+              vLLM: se usa la primera que aparezca en el archivo. Tenerlas todas juntas en
+              el TextPatch (en vez de elegir al construirlo) es lo que deja al pre-vuelo
+              de migracion ver que el parche si tiene ancla para la version destino.
       replacement: What to substitute for `anchor`.
       required: If True, failure of this sub-patch aborts the parent group.
                 If False (default), sibling sub-patches still run.
     """
     name: str
-    anchor: str
+    anchor: str | list[str]
     replacement: str
     required: bool = False
+
+    def ancla_en(self, texto: str) -> str:
+        """La variante de ancla presente en ``texto``; la primera si no hay ninguna.
+
+        Devolver la primera cuando no matchea ninguna es a proposito: el sub-parche sigue
+        fallando como corresponde, y el mensaje nombra un ancla concreta.
+        """
+        if isinstance(self.anchor, str):
+            return self.anchor
+        for v in self.anchor:
+            if v in texto:
+                return v
+        return self.anchor[0]
 
 
 @dataclass
@@ -157,7 +174,8 @@ class TextPatcher:
         self.applied_sub_patches = applied_patches
 
         for sp in self.sub_patches:
-            if sp.anchor not in modified:
+            ancla = sp.ancla_en(modified)
+            if ancla not in modified:
                 # Anchor drift: not a crash, but we must decide whether to abort.
                 if sp.required:
                     return TextPatchResult.SKIPPED, TextPatchFailure(
@@ -170,16 +188,16 @@ class TextPatcher:
                 )
                 continue
 
-            if modified.count(sp.anchor) != 1:
+            if modified.count(ancla) != 1:
                 return TextPatchResult.SKIPPED, TextPatchFailure(
                     reason="ambiguous_anchor",
                     detail=(
                         f"sub-patch {sp.name!r}: anchor appears "
-                        f"{modified.count(sp.anchor)} times (expected 1)"
+                        f"{modified.count(ancla)} times (expected 1)"
                     ),
                 )
 
-            modified = modified.replace(sp.anchor, sp.replacement, 1)
+            modified = modified.replace(ancla, sp.replacement, 1)
             applied_patches.append(sp.name)
 
         if not applied_patches:
@@ -367,7 +385,8 @@ class MultiFilePatchTransaction:
             # allowed to be missing.
             preview = src
             for sp in patcher.sub_patches:
-                if sp.anchor not in preview:
+                ancla = sp.ancla_en(preview)
+                if ancla not in preview:
                     if sp.required:
                         return False, (
                             f"file {i} ({patcher.target_file}): "
@@ -377,7 +396,7 @@ class MultiFilePatchTransaction:
                     continue  # optional anchor missing — skip in preview
                 # Anchor uniqueness: ambiguous_anchor would silently apply
                 # to first-occurrence-only at commit time.
-                count = preview.count(sp.anchor)
+                count = preview.count(ancla)
                 if sp.required and count > 1:
                     return False, (
                         f"file {i} ({patcher.target_file}): required anchor "
@@ -387,7 +406,7 @@ class MultiFilePatchTransaction:
                     )
                 # Apply replacement to preview so subsequent sub-patches
                 # see the post-replacement state.
-                preview = preview.replace(sp.anchor, sp.replacement, 1)
+                preview = preview.replace(ancla, sp.replacement, 1)
         return True, ""
 
     def apply_or_skip(self) -> tuple[str, str]:

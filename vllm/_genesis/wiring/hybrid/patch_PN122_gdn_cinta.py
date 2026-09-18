@@ -46,6 +46,17 @@ ABS_SPEC_NEW = (
     "            # ya no necesita K copias del estado en el pool.\n"
     "            num_speculative_blocks=_g122.num_speculative_blocks(vllm_config),\n"
 )
+
+# En v0.29.0 upstream reescribio la expresion: el atajo de num_speculative_tokens subio a
+# vllm_config y aparecio la rama de RecoverSSM. El reemplazo es el mismo — la cuenta de
+# upstream la reproduce `gdn_cinta.num_speculative_blocks`, rama de RecoverSSM incluida.
+ABS_SPEC_OLD_V029 = (
+    "            num_speculative_blocks=(\n"
+    "                0\n"
+    "                if vllm_config.cache_config.use_kda_recoverssm\n"
+    "                else vllm_config.num_speculative_tokens\n"
+    "            ),\n"
+)
 ABS_BIND_OLD = "        self.kv_cache = tuple(states)\n"
 ABS_BIND_NEW = (
     "        self.kv_cache = tuple(states)\n"
@@ -213,7 +224,7 @@ MU_POST_NEW = (
 _PATCHES = [
     ("model_executor/layers/mamba/abstract.py", [
         ("pn122_abs_import", ABS_IMPORT_OLD, ABS_IMPORT_NEW),
-        ("pn122_abs_spec_blocks", ABS_SPEC_OLD, ABS_SPEC_NEW),
+        ("pn122_abs_spec_blocks", [ABS_SPEC_OLD, ABS_SPEC_OLD_V029], ABS_SPEC_NEW),
         ("pn122_abs_bind", ABS_BIND_OLD, ABS_BIND_NEW),
     ]),
     ("model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py", [

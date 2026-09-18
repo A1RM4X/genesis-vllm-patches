@@ -13,9 +13,14 @@ split_ba() slices per TP rank) are unaffected.
 
 Anchor stability
 ----------------
-Anchor is the entire 9-line `else:` block of the Qwen3.5 branch in
-`mamba/gdn/qwen_gdn_linear_attn.py` (v0.27.1). Verified against the
-v0.27.1 tree — matches exactly once (see test_pn50_*.py).
+Anchor is the `else:` block of the Qwen3.5 branch in
+`mamba/gdn/qwen_gdn_linear_attn.py`, hasta `b, a = self.split_ba(ba)`.
+Termina ahi a proposito: v0.27.1 seguia con dos `.contiguous()` que v0.29.0
+saco, y tenerlos en el ancla la rompia en la migracion. Cortar antes no la hace
+ambigua — hay un segundo bloque igual mas abajo, pero cierra con
+`b, a = ba.chunk(2, dim=-1)`, asi que la ultima linea sigue distinguiendolos.
+En v0.27.1 los dos `.contiguous()` quedan despues del if/else que insertamos:
+son no-ops sobre tensores ya contiguos.
 
 Models affected (per Genesis 7-config matrix):
   * 27B Lorbus INT4 (TQ k8v4, FP8 short, FP8 long, NGRAM, DFlash) — APPLIES
@@ -60,9 +65,7 @@ ANCHOR_OLD = (
     "            z_size = self.value_dim // self.tp_size\n"
     "            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)\n"
     "            z = z.reshape(z.size(0), -1, self.head_v_dim)\n"
-    "            b, a = self.split_ba(ba)\n"
-    "            b = b.contiguous()\n"
-    "            a = a.contiguous()"
+    "            b, a = self.split_ba(ba)"
 )
 
 ANCHOR_NEW = (

@@ -82,28 +82,18 @@ GENESIS_P66_MARKER = "Genesis P66 cudagraph_capture_sizes spec-decode divisibili
 # (lines 1530-1536 in upstream fe9c3d6c5). Insert filter AFTER SP block
 # but BEFORE valid_max_size computation.
 
+# El ancla es SOLO el comentario que precede al truncado de max_cudagraph_capture_size.
+# Antes abarcaba tambien el bloque de sequence-parallelism de arriba, y en v0.29.0 upstream
+# le metio dos lineas de comentario adentro: el ancla larga desaparecio y el filtro se
+# apagaba solo. El comentario es unico en el archivo en v0.27.1 y en v0.29.0, y da el mismo
+# punto de insercion — despues de que cudagraph_capture_sizes quedo definitiva (SP incluido)
+# y antes de que se trunque el maximo.
 P66_OLD = (
-    "            if (\n"
-    "                self.parallel_config.tensor_parallel_size > 1\n"
-    "                and self.compilation_config.pass_config.enable_sp\n"
-    "            ):\n"
-    "                cudagraph_capture_sizes = self.update_sizes_for_sequence_parallelism(\n"
-    "                    cudagraph_capture_sizes\n"
-    "                )\n"
-    "\n"
     "            # user-specific compilation_config.max_cudagraph_capture_size get\n"
     "            # truncated to valid_max_size when they are inconsistent.\n"
 )
 
 P66_NEW = (
-    "            if (\n"
-    "                self.parallel_config.tensor_parallel_size > 1\n"
-    "                and self.compilation_config.pass_config.enable_sp\n"
-    "            ):\n"
-    "                cudagraph_capture_sizes = self.update_sizes_for_sequence_parallelism(\n"
-    "                    cudagraph_capture_sizes\n"
-    "                )\n"
-    "\n"
     "            # [Genesis P66] Filter cudagraph_capture_sizes for spec-decode\n"
     "            # uniform_decode_query_len divisibility. Without this filter,\n"
     "            # capture phase produces mixed-q_len batches (e.g. [4,4,2]) where\n"

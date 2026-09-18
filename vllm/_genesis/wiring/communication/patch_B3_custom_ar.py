@@ -76,11 +76,15 @@ B3_INIT_NEW = (
     "        max_size=32 * 1024 * 1024,\n"
 )
 
+# Ojo con alargar esta ancla. Hasta v0.27.1 el `inp_size = ...` venia pegado al
+# `return False` y estaba incluido aca; en v0.29.0 upstream metio un chequeo de dtype en el
+# medio y el ancla larga dejo de aparecer — el parche se apagaba solo, en silencio. Se queda
+# en las tres lineas de la cabecera, que son las estables, y el bypass entra justo despues,
+# antes de cualquier guarda nueva que upstream agregue mas abajo.
 B3_SHOULD_OLD = (
     "    def should_custom_ar(self, inp: torch.Tensor):\n"
     "        if self.disabled or self.world_size > 8:\n"
     "            return False\n"
-    "        inp_size = inp.numel() * inp.element_size()\n"
 )
 
 B3_SHOULD_NEW = (
@@ -94,7 +98,6 @@ B3_SHOULD_NEW = (
     "        import os as _os\n"
     "        if getattr(self, '_IS_CAPTURING', False) and _os.environ.get('GENESIS_B3_CAPTURA', '0') != '1':\n"
     "            return False\n"
-    "        inp_size = inp.numel() * inp.element_size()\n"
 )
 
 B3_REGISTER_OLD = (

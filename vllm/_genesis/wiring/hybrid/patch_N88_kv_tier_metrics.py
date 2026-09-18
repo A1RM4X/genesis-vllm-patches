@@ -363,6 +363,12 @@ def _fs_io_patcher() -> TextPatcher | None:
             TextPatch(name="pn88_io_bytes_read", anchor=E2_OLD,
                       replacement=E2_NEW, required=True),
         ],
+        upstream_drift_markers=[
+            # v0.29.0 reescribio el manejo del short-read (limpieza del archivo antes de
+            # levantar el OSError). Ver la nota del patcher de fs/manager.py: con el
+            # tiering nuevo la contabilidad de bytes la lleva TieringMetricsTracker.
+            "must not mask the short-read error",
+        ],
     )
 
 
@@ -389,10 +395,14 @@ def _fs_patcher() -> TextPatcher | None:
                       replacement=A3_NEW, required=True),
         ],
         upstream_drift_markers=[
-            # Si upstream le pone telemetria propia al tier de disco, este
-            # parche sobra y se pelearia con la de ellos -> SKIP limpio.
-            "transfer_size",
-            "record_transfer",
+            # Si upstream le pone telemetria propia al tier de disco, este parche sobra y
+            # se pelearia con la de ellos -> SKIP limpio. Paso en v0.29.0: el subsistema
+            # de tiering se reescribio con `TieringMetricsTracker`, que cubre punto por
+            # punto lo que hacia PN88 (on_lookup, on_job_registered, on_job_finished,
+            # on_promotion_allocation_failure). Los dos marcadores de abajo son de esa
+            # reescritura y no existen en v0.27.1.
+            "_lookup_manager.mark_miss",
+            "failed promotion can mark only its failed",
         ],
     )
 
@@ -410,6 +420,11 @@ def _tiering_patcher() -> TextPatcher | None:
                       replacement=B1_NEW, required=True),
             TextPatch(name="pn88_lookup_secondary", anchor=B2_OLD,
                       replacement=B2_NEW, required=True),
+        ],
+        upstream_drift_markers=[
+            # v0.29.0: `TieringMetricsTracker` ya instrumenta los dos lookups (primario y
+            # secundarios) con `self._metrics.on_lookup(...)`. Duplicarlo contaria dos veces.
+            "TieringMetricsTracker",
         ],
     )
 

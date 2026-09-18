@@ -389,6 +389,13 @@ def _tiering_patcher() -> TextPatcher | None:
                 required=True,
             ),
         ],
+        upstream_drift_markers=[
+            # v0.29.0 se llevo la idea entera adentro: la cascada pasa a nivel de request
+            # (`request_level_tiers`) y las claves que todavia no estan listas se estacionan
+            # en `pending_cascade_keys` en vez de forzar el store por bloque. Aplicar PN90
+            # encima seria gatear dos veces la misma escritura.
+            "pending_cascade_keys",
+        ],
     )
 
 
