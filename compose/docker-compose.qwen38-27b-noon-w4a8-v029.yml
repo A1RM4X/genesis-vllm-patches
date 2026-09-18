@@ -363,6 +363,16 @@ services:
       # que lee la KV en int8. Sin esto, --kv-cache-dtype int8_per_token_head no
       # tiene quien lo atienda.
       - GENESIS_ENABLE_PN131_SK18=1
+      # PN131 por el registro nativo de backends en vez de por cirugia de texto.
+      # Antes: 5 anclas dentro de triton_attn.py, un archivo que upstream movio 81 lineas
+      # entre v0.27.1 y v0.29.0. Ahora: UNA ancla en el cuerpo de load_general_plugins()
+      # — identico en las dos versiones — y el resto por herencia (BackendSK18 / ImplSK18 /
+      # BuilderSK18 en vllm/_genesis/sk18_backend.py). Si upstream renombra algo que
+      # reemplazamos, revienta al importar y dice cual, en vez de saltearse en silencio.
+      # Verificada la paridad contra el camino de anclas, tres medidas:
+      #   decode 43,4 vs 43,2 tok/s | KV 611.402 vs 611.402 | "decode entero ACTIVO" en los dos
+      # Poner en 0 para volver al camino de anclas (los dos son excluyentes).
+      - GENESIS_PN131_NATIVO=1
       #
       # PN124: TRITON_ATTN viene sin afinar para Ampere y pierde 40% de prefill y
       # 3-4x de decode largo. Dos causas, las dos arregladas aca: BLOCK_M=16 deja
@@ -486,6 +496,11 @@ services:
       #
       # Ojo: los 173 MiB son el peor caso de ESTE patron (10 pedidos de 55k). Otro
       # perfil de carga puede necesitar mas — si aparece un OOM, bajar a 0.91.
+      # 0.915, igual que en v0.27.1. Se probo bajarlo a 0.90 por si la presion de memoria
+      # explicaba los arranques que salen con el modelo roto, y NO: cuatro ciclos completos
+      # de down+up por variante, 4 sanos de 4 en las dos. Lo unico que cambia es la KV:
+      #   0.915 -> 611.402 tokens     0.90 -> 590.623 tokens     (cuesta 20.779)
+      # Asi que se queda en 0.915 y el arranque no determinista se caza por otro lado.
       - --gpu-memory-utilization
       - "0.915"
       - --limit-mm-per-prompt

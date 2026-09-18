@@ -477,8 +477,18 @@ def _espejar(impl, layer, ks, k16, v16, slot, n, dev, nh, bs, c):
 
 
 # ─────────────────────────────── forward ──────────────────────────────────
+_aviso_decode = [False, False]
+
+
 def forward(impl, layer, query, kv_cache, md, output):
+    # Un aviso por camino, la primera vez. Sirve para no tener que deducir de la velocidad si
+    # SK-18 esta corriendo de verdad: con el enganche por anclas o por subclase registrada, lo
+    # que importa es que ESTA linea aparezca.
     qsl = getattr(md, "genesis_qsl_cpu", None)
+    if not _aviso_decode[0]:
+        _aviso_decode[0] = True
+        log.warning("[PN131] decode entero ACTIVO (qsl_cpu %s)",
+                    "presente" if qsl is not None else "AUSENTE — cae al camino generico")
     if qsl is not None:
         qsl = qsl.numpy() if hasattr(qsl, "numpy") else np.asarray(qsl)
         nreq = len(qsl) - 1

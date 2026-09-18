@@ -13,6 +13,8 @@ Ver ``vllm._genesis.sk18_attn``. Engancha en ``triton_attn.py``:
 
 from __future__ import annotations
 
+import os
+
 from vllm._genesis.guards import resolve_vllm_file, vllm_install_root
 from vllm._genesis.wiring.text_patch import TextPatch, TextPatcher, result_to_wiring_status
 
@@ -52,6 +54,66 @@ UPD_NEW = (
 )
 
 
+# El enganche del camino nativo: UNA ancla, en el cuerpo de `load_general_plugins()`.
+# Ese archivo es IDENTICO en v0.27.1 y v0.29.0, la funcion corre en TODOS los procesos
+# (servidor y workers) y una sola vez por proceso. Es lo que reemplaza a las cinco anclas
+# fragiles de triton_attn.py: todo lo demas pasa a resolverse por herencia.
+PLUG_OLD = (
+    "    plugins = load_plugins_by_group(group=DEFAULT_PLUGINS_GROUP)\n"
+    "    # general plugins, we only need to execute the loaded functions\n"
+    "    for func in plugins.values():\n"
+    "        func()\n"
+)
+PLUG_NEW = (
+    "    # " + MARKER + " registros de Genesis que TIENEN que correr dentro de este proceso:\n"
+    "    # apply_all corre aparte y hace exec, asi que lo que registre en memoria se pierde.\n"
+    "    try:\n"
+    "        from vllm._genesis import plugins_arranque as _genesis_plug\n"
+    "        _genesis_plug.cargar()\n"
+    "    except Exception:\n"
+    "        pass\n"
+    + PLUG_OLD
+)
+
+
+def _nativo() -> tuple[str, str]:
+    """PN131 por el registro de backends de vLLM, en vez de por las cinco anclas de texto.
+
+    Es el mismo PN131 — ver ``vllm._genesis.sk18_backend`` — pero enganchado por donde v0.29.0
+    dice que hay que engancharse. Los dos caminos hacen lo mismo y NO pueden convivir: si se
+    registra el backend por subclase y ademas se parchea el texto, el decode queda envuelto dos
+    veces. Por eso son excluyentes y no dos parches distintos.
+
+    Vale la pena porque el camino de anclas falla CALLADO: si upstream mueve una linea, el
+    parche se saltea, la atencion cae al kernel generico y lo unico que se nota es que anda mas
+    lento. La subclase, en cambio, revienta al importar si el padre dejo de definir lo que
+    reemplaza. Y el ancla que queda es una sola, en un archivo que upstream no toco entre
+    versiones.
+    """
+    try:
+        from vllm.v1.attention.backends.registry import register_backend  # noqa: F401
+    except Exception as e:                                               # noqa: BLE001
+        return "skipped", (f"esta version de vLLM no tiene registro de backends "
+                           f"({type(e).__name__}): usar el camino de anclas")
+
+    destino = resolve_vllm_file("plugins/__init__.py")
+    if destino is None:
+        return "failed", "no encontre vllm/plugins/__init__.py para enganchar el registro"
+    p = TextPatcher(
+        patch_name="PN131 registro nativo (plugins/__init__.py)", target_file=str(destino),
+        marker=MARKER,
+        sub_patches=[TextPatch(name="pn131_plug_hook", anchor=PLUG_OLD, replacement=PLUG_NEW,
+                               required=True)],
+        upstream_drift_markers=[])
+    result, failure = p.apply()
+    estado, msg = result_to_wiring_status(
+        result, failure, applied_message="registro nativo enganchado", patch_name=p.patch_name)
+    if estado != "applied":
+        return estado, msg
+    return "applied", ("PN131 entra por register_backend desde load_general_plugins "
+                       "(1 ancla en vez de 5, el resto por herencia)")
+
+
 def apply() -> tuple[str, str]:
     from vllm._genesis.dispatcher import log_decision, should_apply
 
@@ -59,6 +121,8 @@ def apply() -> tuple[str, str]:
     log_decision("PN131", decision, reason)
     if not decision:
         return "skipped", reason
+    if os.environ.get("GENESIS_PN131_NATIVO", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return _nativo()
     if vllm_install_root() is None:
         return "skipped", "vllm install root no localizable"
     target = resolve_vllm_file("v1/attention/backends/triton_attn.py")
