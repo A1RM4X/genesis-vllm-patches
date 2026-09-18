@@ -61,6 +61,52 @@ FINA_NEW = (
 )
 
 
+# ── Guarda: no cachear mas bloques que hashes hay ─────────────────────────────────────
+# El bug, capturado por el volcado de diagnostico en DOS crashes con la misma firma exacta:
+#
+#     num_cached_blocks = 55        num_full_blocks = 56       len(block_hashes) = 55
+#     num_cached_blocks = 22        num_full_blocks = 23       len(block_hashes) = 22
+#
+# siempre en el grupo de Mamba (block_size=816) y siempre UN bloque de mas. De ahi
+# `new_block_hashes = block_hashes[num_cached_blocks:]` sale VACIA, el bucle indexa [0] y
+# el EngineCore muere con IndexError.
+#
+# El bloque de mas viene de upstream a proposito: en `kv_cache_coordinator.cache_blocks`,
+# para grupos con use_eagle (y "mtp" cuenta como eagle),
+#     num_tokens_to_cache = min(num_finalized, aligned + manager.block_size)
+# o sea que habilita a cachear una pagina PASADO el borde alineado. Pero la lista de hashes
+# del request solo llega hasta el borde, asi que ese bloque no tiene hash.
+#
+# Recortar es lo correcto, no un parche defensivo cualquiera: ese bloque es exactamente el
+# que el lado de BUSQUEDA ya descarta (`drop_eagle_block`, que es de lo que trata este mismo
+# PN127). Cachearlo no serviria para nada aunque hubiera hash — nadie lo va a matchear. Y
+# `num_cached_block` queda consistente porque se recorta ANTES de guardarlo.
+#
+# Cuando hay hashes de sobra el min() no hace nada, asi que es inocuo para los demas grupos.
+GUARDA_OLD = (
+    "        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)\n"
+    "        num_full_blocks = num_tokens // self.block_size\n"
+    "\n"
+    "        if num_cached_blocks >= num_full_blocks:\n"
+    "            return\n"
+)
+GUARDA_NEW = (
+    "        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)\n"
+    "        num_full_blocks = num_tokens // self.block_size\n"
+    "        # " + MARKER + " no se puede cachear un bloque sin hash.\n"
+    "        try:\n"
+    "            _g127_hashes = resolve_block_hashes(\n"
+    "                request.block_hashes, self.block_pool.hash_block_size, self.block_size\n"
+    "            )\n"
+    "            num_full_blocks = min(num_full_blocks, len(_g127_hashes))\n"
+    "        except Exception:\n"
+    "            pass\n"
+    "\n"
+    "        if num_cached_blocks >= num_full_blocks:\n"
+    "            return\n"
+)
+
+
 def apply() -> tuple[str, str]:
     from vllm._genesis.dispatcher import log_decision, should_apply
 
@@ -75,7 +121,9 @@ def apply() -> tuple[str, str]:
         return "failed", "single_type_kv_cache_manager.py no encontrado"
     p = TextPatcher(
         patch_name="PN127 MambaManager drop_eagle_block", target_file=str(target), marker=MARKER,
-        sub_patches=[TextPatch(name="pn127_gruesa", anchor=GRUESA_OLD, replacement=GRUESA_NEW, required=True),
+        sub_patches=[TextPatch(name="pn127_guarda_hashes", anchor=GUARDA_OLD,
+                               replacement=GUARDA_NEW, required=False),
+                     TextPatch(name="pn127_gruesa", anchor=GRUESA_OLD, replacement=GRUESA_NEW, required=True),
                      TextPatch(name="pn127_fina", anchor=FINA_OLD, replacement=FINA_NEW, required=True)],
         upstream_drift_markers=["drop_eagle_block and max_num_blocks > 0"])
     result, failure = p.apply()
