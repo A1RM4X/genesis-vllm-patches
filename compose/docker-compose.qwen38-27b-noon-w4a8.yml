@@ -423,8 +423,26 @@ services:
       - "2"
       - --max-model-len
       - "262144"
+      # 0.90 -> 0.915 (2026-09-17), buscado POR MEDICION, no por regla del pulgar.
+      # El margen que hay que dejar no es "por las dudas": los buffers de PN131 (el
+      # espejo int8 de la ventana reciente) crecen MIENTRAS corre, despues de que
+      # vLLM ya reservo su parte, asi que la VRAM libre BAJA a medida que la KV se
+      # llena. Con 0.90 iba de 907 MiB al 50% de KV a 587 MiB al 89%.
+      #
+      # Se busco el borde saturando la KV al maximo en cada escalon:
+      #     0.90    KV 625.788 tok   pico 92%    10/10 OK   587 MiB libres
+      #     0.915   KV 647.367 tok   pico 98%    10/10 OK   173 MiB libres
+      #     0.93    KV 668.147 tok   OOM al 80% de KV, engine muerto
+      #             ("Tried to allocate 48 MiB. GPU 0 has 22.31 MiB free")
+      #
+      # 0.915 son 21.579 tokens mas de KV que 0.90, con la KV al 98% y el servidor
+      # entero. SUBIR MAS NO ENTRA: 0.93 ya revienta, y el salto entre uno y otro
+      # es de solo 0,015.
+      #
+      # Ojo: los 173 MiB son el peor caso de ESTE patron (10 pedidos de 55k). Otro
+      # perfil de carga puede necesitar mas — si aparece un OOM, bajar a 0.91.
       - --gpu-memory-utilization
-      - "0.90"
+      - "0.915"
       - --limit-mm-per-prompt
       - '{"image":2,"video":0}'
       - --mm-processor-kwargs
