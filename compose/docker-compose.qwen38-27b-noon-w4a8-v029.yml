@@ -123,7 +123,11 @@ services:
       # Medido: +8,9% de decode (167,7 -> 182,6 tok/s) con la calidad intacta.
       # Se cuelga del mismo walker que PN77 y tiene prioridad sobre el, asi que
       # PN77 tiene que quedar PRENDIDO: es el enganche.
-      - GENESIS_ENABLE_PN139_LM_HEAD_INT4=1
+      # PN139 (lm_head a int4 g128): apagado POR PRECAUCION mientras se investiga el
+      # arranque no determinista de v0.29.0 (ver el bloque de PN122 abajo). NO esta probado
+      # que PN139 sea la causa — al contrario, hubo un arranque roto con PN139 ya apagado.
+      # En v0.27.1 sigue prendido y andando (+8,9% de decode, 318 MB contra 646 por GPU).
+      - GENESIS_ENABLE_PN139_LM_HEAD_INT4=0
 
       # ── APAGADOS A PROPOSITO, con el motivo medido ─────────────────────────
       # Sin esto nadie sabe si ya se probo, y se reintenta cada seis meses.
@@ -250,16 +254,25 @@ services:
       # PN122: el rollback del MTP en GDN usa una cinta en vez de K copias del
       # estado. Medido: ~18 bloques GDN por request con K=3.
       # PN122 (cinta GDN: rollback del MTP sin bloques especulativos). PRENDIDO.
-      # Se rompio en la migracion a v0.29.0 y se arreglo. Lo que pasaba: PN122 pone
-      # num_speculative_blocks=0 — ese es todo su beneficio, libera K bloques de estado GDN por
-      # request — y v0.29.0 agrego un `self._allocated_block_reqs.add(request_id)` adentro del
-      # early-return de MambaManager.allocate_new_blocks. Con K=0 ese early-return se toma mucho
-      # mas seguido, el request quedaba marcado antes de tiempo, last_state_block_idx apuntaba al
-      # bloque equivocado y remove_skipped_blocks liberaba un bloque con el estado GDN vivo: el
-      # modelo emitia EOS al segundo token. El arreglo saltea ese `add` con la cinta activa, que
-      # es inocuo porque la marca existe para no re-sumar num_speculative_blocks, y vale 0.
-      # Medido despues del arreglo: 40 tokens correctos y la KV de vuelta en 628.186 tokens
-      # (contra 611.410 con PN122 apagado) — el ahorro son +16.776 tokens de KV.
+      #
+      # ATENCION AL MEDIR EN v0.29.0: el arranque es NO DETERMINISTA. Con la MISMA config,
+      # algunos arranques dejan el modelo roto — el chat corta a los 2 tokens con content
+      # vacio — y otros andan perfecto. Dentro de un arranque es estable: 5 de 5 iguales.
+      # Se comprobo reiniciando el mismo compose sin tocar nada: paso de 2 tokens a 60.
+      # Por eso NINGUNA atribucion de un solo arranque vale aca. Se necesita repetir el
+      # arranque N veces por variante y contar; asi se encontro el bug analogo de PN118
+      # ("modelo mal en ~50% de arranques" por una cache que mezclaba ranks), y PN118 hoy
+      # esta apagado, o sea que esto es otra cosa.
+      #
+      # Lo que SI esta verificado de PN122 en v0.29.0, porque es deterministico y medible:
+      # v0.29.0 le agrego `self._allocated_block_reqs.add(request_id)` al early-return de
+      # MambaManager.allocate_new_blocks. PN122 pone num_speculative_blocks=0 (de ahi sale
+      # todo su beneficio), y con K=0 ese early-return se toma mucho mas seguido, asi que el
+      # request queda marcado antes de tiempo; `blocks_allocated` cambia de rama y con el
+      # cambia `last_state_block_idx`, que es el indice con el que remove_skipped_blocks
+      # libera el bloque de estado viejo. El sub-parche saltea ese `add` con la cinta activa,
+      # que es inocuo porque la marca existe para no re-sumar num_speculative_blocks y vale 0.
+      # Medido y reproducible: KV 628.186 tokens con PN122, 611.402 sin el. +16.776 tokens.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo
