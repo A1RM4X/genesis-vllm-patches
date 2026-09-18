@@ -99,6 +99,12 @@ def _nativo() -> tuple[str, str]:
     destino = resolve_vllm_file("plugins/__init__.py")
     if destino is None:
         return "failed", "no encontre vllm/plugins/__init__.py para enganchar el registro"
+    # La puerta la pone PN143, que va siempre. Si ya esta, no escribir de nuevo: el ancla
+    # sigue presente adentro del reemplazo, asi que reaplicar duplicaria la llamada.
+    from pathlib import Path
+
+    if "plugins_arranque" in Path(destino).read_text(encoding="utf-8"):
+        return "applied", ("PN131 entra por register_backend; la puerta ya la puso PN143")
     p = TextPatcher(
         patch_name="PN131 registro nativo (plugins/__init__.py)", target_file=str(destino),
         marker=MARKER,

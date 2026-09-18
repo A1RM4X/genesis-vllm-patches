@@ -1278,6 +1278,17 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN143": {
+        "title": "Enganche de Genesis en cada proceso de vLLM (load_general_plugins)",
+        "env_flag": "GENESIS_ENABLE_PN143_ENGANCHE_PLUGINS",
+        "default_on": True,
+        "category": "infra",
+        "credit": (
+            "Genesis-original 2026-09-18. Infraestructura, no optimizacion: apply_all corre en un proceso aparte y hace exec, asi que todo registro en memoria se pierde. Nacio adentro de PN131 y quedaba apagado con el, lo que se cobro una sesion de diagnostico de DFlash2 (el hook de propose no imprimia porque cargar() nunca corria). Una sola ancla, en un archivo identico entre v0.27.1 y v0.29.0."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN128": {
         "title": "Input-prep async espera el postproceso del spec decode (GDN+MTP)",
         "env_flag": "GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER",

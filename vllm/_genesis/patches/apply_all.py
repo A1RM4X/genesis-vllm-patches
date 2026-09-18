@@ -2406,6 +2406,30 @@ def apply_patch_N127() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN143 enganche de proceso")
+def apply_patch_PN143() -> PatchResult:
+    """PN143: cargar() de Genesis corre dentro de CADA proceso de vLLM."""
+    name = "PN143 enganche de proceso"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    from vllm._genesis.dispatcher import log_decision, should_apply
+
+    decision, reason = should_apply("PN143")
+    log_decision("PN143", decision, reason)
+    if not decision:
+        return _skipped(name, reason)
+    try:
+        from vllm._genesis.wiring import patch_PN143_enganche_plugins
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN143_enganche_plugins.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN142 DFlash2 usable en v0.29.0")
 def apply_patch_PN142() -> PatchResult:
     """PN142 DFlash2 en v0.29.0: vllm#51581 (abierto) + port de fa5017a5."""

@@ -72,6 +72,15 @@ def cargar() -> None:
             log.error("[DIAG] no se pudo enganchar la firma de lm_head (%s: %s)",
                       type(e).__name__, e)
 
+    if _prendido("GENESIS_DIAG_DFLASH"):
+        try:
+            from vllm._genesis.diag_dflash import enganchar as _eng_dflash
+
+            _eng_dflash()
+        except Exception as e:                                   # noqa: BLE001
+            log.error("[DIAG] no se pudo enganchar el borrador DFlash (%s: %s)",
+                      type(e).__name__, e)
+
     if _prendido("GENESIS_ENABLE_PN131_SK18") and _prendido("GENESIS_PN131_NATIVO"):
         try:
             from vllm._genesis.sk18_backend import registrar

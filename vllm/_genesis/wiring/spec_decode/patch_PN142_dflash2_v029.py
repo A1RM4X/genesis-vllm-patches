@@ -63,7 +63,7 @@ MARKER = "[Genesis PN142: DFlash2 en v0.29.0]"
 # ───────────────────── 1) vllm#51581: decuantizar antes de rebanar ─────────────────────
 
 HELPER = '''def _dense_kv_rows(attn):
-    """Filas [q_size:] de la proyeccion qkv como matriz densa.  """ + MARKER + """
+    """Filas [q_size:] de la proyeccion qkv como matriz densa. [Genesis PN142]
 
     Arregla vllm#51581 (ABIERTO): qwen3_dflash.py no sabe de cuantizacion y rebana
     `.weight` directo. Corre desde load_weights, o sea ANTES del repack de Marlin, asi que
@@ -76,6 +76,10 @@ HELPER = '''def _dense_kv_rows(attn):
     qkv = attn.qkv_proj
     w = getattr(qkv, "weight", None)
     if w is not None and w.dim() == 2:
+        import os as _os
+        if _os.environ.get("GENESIS_PN142_DIAG") == "1" and not globals().get("_g142_av1"):
+            globals()["_g142_av1"] = True
+            print("[PN142 DIAG] camino DENSO: weight %s %s" % (tuple(w.shape), w.dtype), flush=True)
         return w[attn.q_size:]
     packed, scale = qkv.weight_packed, qkv.weight_scale
     # weight_shape solo guarda el ultimo shard cargado de una qkv fusionada: usar los tensores.
@@ -88,7 +92,16 @@ HELPER = '''def _dense_kv_rows(attn):
     dense = (q.to(torch.float32).reshape(out_f, in_f // group, group)
              * scale.to(torch.float32)[..., None]).reshape(out_f, in_f)
     fuera = scale.dtype if scale.dtype.is_floating_point else torch.bfloat16
-    return dense.to(fuera)[attn.q_size:]
+    salida = dense.to(fuera)[attn.q_size:]
+    import os as _os
+    if _os.environ.get("GENESIS_PN142_DIAG") == "1" and not globals().get("_g142_av2"):
+        globals()["_g142_av2"] = True
+        print("[PN142 DIAG] camino CUANTIZADO: packed %s %s | scale %s %s | bits=%d grupo=%d "
+              "| denso %s min=%.4g max=%.4g | salida %s"
+              % (tuple(packed.shape), packed.dtype, tuple(scale.shape), scale.dtype, bits, group,
+                 tuple(dense.shape), float(dense.min()), float(dense.max()), tuple(salida.shape)),
+              flush=True)
+    return salida
 
 
 '''
@@ -162,6 +175,24 @@ _ARCHIVOS = [
 ]
 
 
+def _helper_compila() -> str | None:
+    """El codigo que se INYECTA tiene que compilar por si solo. Devuelve el error, o None.
+
+    No es un lujo: la primera version llevaba `\"\"\" + MARKER + \"\"\"` adentro del literal,
+    asi que se inyecto tal cual y vLLM murio con "NameError: name 'MARKER' is not defined" en
+    los dos workers de TP — pero recien al CARGAR EL MODELO, mucho despues de que el parche
+    dijera "applied". Compilarlo aca mueve ese fallo al momento de aplicar, que es donde se
+    puede leer.
+    """
+    import ast
+
+    try:
+        ast.parse(HELPER)
+    except SyntaxError as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def apply() -> tuple[str, str]:
     from vllm._genesis.dispatcher import log_decision, should_apply
 
@@ -171,6 +202,9 @@ def apply() -> tuple[str, str]:
         return "skipped", reason
     if vllm_install_root() is None:
         return "skipped", "vllm install root no localizable"
+    mal = _helper_compila()
+    if mal is not None:
+        return "failed", f"el helper _dense_kv_rows no compila, no se inyecta nada: {mal}"
 
     patchers = []
     for rel, subs in _ARCHIVOS:
