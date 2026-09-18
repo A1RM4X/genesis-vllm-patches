@@ -31,16 +31,6 @@
 #   de SMs (82) y reparte el trabajo con stream-K. Los GEMM de decode corren al
 #   81-106% del techo de DRAM, o sea que ahi NO queda margen de kernel.
 #
-# ⚠ NO USAR EN PRODUCCION TODAVIA — el MTP esta muerto en v0.29.0
-#   Medido en arranques verificados sanos por el healthcheck, mismo prompt:
-#     con MTP 42,9 tok/s | sin MTP 58,9 | con MTP y sin --async-scheduling 43,1
-#   O sea que el MTP no aporta y ADEMAS cuesta 27%: corre el borrador y no le aceptan nada.
-#   Contra la linea base de v0.27.1: coding 152 -> 40,9 tok/s, y concurrencia ~870 tok/s a
-#   20-24 pedidos -> 295 a 16. Prueba independiente del contador: prod_tetris dio 32.000
-#   tokens en 31.270 chunks SSE (1,02 por chunk); con MTP sano la relacion es ~3,4.
-#   Descartado: --async-scheduling, y el bug conocido del ignore de quantization_config.
-#   Ver la tarea "el MTP no acepta nada y CUESTA 27%".
-#
 # MEDIDO EN ESTA MAQUINA (no son estimaciones)
 #   prefill          2200-2750 tok/s de 1k a 50k de contexto
 #   decode 1 pedido  115-120 tok/s hasta 10k, 92-99 a 50k
@@ -283,7 +273,20 @@ services:
       # libera el bloque de estado viejo. El sub-parche saltea ese `add` con la cinta activa,
       # que es inocuo porque la marca existe para no re-sumar num_speculative_blocks y vale 0.
       # Medido y reproducible: KV 628.186 tokens con PN122, 611.402 sin el. +16.776 tokens.
-      - GENESIS_ENABLE_PN122_GDN_CINTA=1
+      # PN122 (cinta GDN): APAGADO EN v0.29.0 — con MTP CORROMPE LA SALIDA.
+      # Medido con prod_tetris, que compila y corre el codigo generado:
+      #   MTP + PN122=1 .... 167,1 tok/s pero 0 de 3 corridas dieron codigo valido
+      #                      (dos sin cerrar el bloque, una con SyntaxError)
+      #   MTP + PN122=0 .... 148,8 tok/s y codigo correcto, 790 lineas, 6/6 pruebas
+      #   sin MTP .......... 56,3 tok/s y codigo correcto, 2 de 2
+      # PN122 es el rollback del estado recurrente de GDN tras los drafts RECHAZADOS.
+      # Si ese rollback no es exacto, el estado queda viejo y la degradacion se acumula a
+      # lo largo de la generacion: rapido y sutilmente mal, que es lo peor de los dos.
+      # Nunca se valido en v0.29.0 — la biseccion con la que se "arreglo" antes (el
+      # early-return de allocate_new_blocks) resulto medida con una sola corrida y se
+      # retracto. Ese arreglo sigue puesto y es correcto por su cuenta, pero no alcanza.
+      # Costo de apagarlo: se pierde el ahorro de -9 bloques GDN por request.
+      - GENESIS_ENABLE_PN122_GDN_CINTA=0
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo
       # habia medido mal): el cruce esta entre 4992 (0,93x) y 5824 (1,04x).
@@ -312,7 +315,27 @@ services:
       - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
       - GENESIS_P68_P69_LONG_CTX_THRESHOLD_CHARS=1000
       - GENESIS_P69_REMINDER_STYLE=qwen3_coder
-      - GENESIS_ENABLE_P58_ASYNC_PLACEHOLDER_FIX=1
+      # P58 (fix del placeholder -1 del async scheduler, backport de vllm#40768):
+      # APAGADO EN v0.29.0 — era lo que mataba el MTP. Con P58 prendido el decode
+      # especulativo no acepta NADA y encima cuesta 27%; apagandolo el coding pasa de
+      # 40,9 a 167,1 tok/s. Aislado midiendo: se apagaron los cuatro parches de
+      # spec-decode juntos (144,7 tok/s), despues P58+PN128 (144,9) y despues solo
+      # P58 (144,6): es P58 solo, y P107/PN108/PN128/B5 son inocentes.
+      #
+      # Por que rompe: su `_consume_spec_decode_tokens_for_step` decide cuantos tokens
+      # especulativos agendar con
+      #     num_new_tokens + num_computed_tokens - num_tokens - num_output_placeholders
+      # y si da <= 0 devuelve None, o sea NINGUN draft. Esa contabilidad quedo vieja
+      # contra el scheduler.py de v0.29.0, que cambio 373 lineas. Las cinco anclas
+      # siguen enganchando, asi que el parche "aplica" y falla en silencio.
+      #
+      # Se puede apagar porque upstream ya maneja el caso: async_scheduler.py es
+      # IDENTICO entre v0.27.1 y v0.29.0 y ya dimensiona los placeholders por los
+      # tokens realmente agendados (`[-1] * num_spec_tokens_to_schedule`) y saltea los
+      # chunks de prefill. Verificado con la bateria que dispara el bug que P58 cubre
+      # — contexto largo, prefill por trozos y concurrencia hasta 24 — sin un crash.
+      # En v0.27.1 sigue PRENDIDO: ahi el parche hace su trabajo.
+      - GENESIS_ENABLE_P58_ASYNC_PLACEHOLDER_FIX=0
       - GENESIS_ENABLE_P59_QWEN3_TOOL_RECOVERY=1
       - GENESIS_ENABLE_P107_MTP_TRUNCATION_DETECTOR=1
       # PN114: guardas aritmeticas de limites en la copia de alineacion mamba.
@@ -660,7 +683,10 @@ services:
       - --scheduling-policy
       - priority
       - --speculative-config
-      - '{"method":"mtp","num_speculative_tokens":3}'
+      # K=4, no 3: medido en coding con P58 apagado, K=4 da 167,1 tok/s contra 155,8
+      # de K=3 (4,47 tokens aceptados por chunk contra 3,85). En prosa simple K=3 gana
+      # por poco (144,6 vs 139,9), asi que la eleccion es por el caso de uso real.
+      - '{"method":"mtp","num_speculative_tokens":4}'
       - --host
       - "0.0.0.0"
       - --port
