@@ -2406,6 +2406,24 @@ def apply_patch_N127() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN142 DFlash2 usable en v0.29.0")
+def apply_patch_PN142() -> PatchResult:
+    """PN142 DFlash2 en v0.29.0: vllm#51581 (abierto) + port de fa5017a5."""
+    name = "PN142 DFlash2 usable en v0.29.0"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.spec_decode import patch_PN142_dflash2_v029
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN142_dflash2_v029.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN128 orden async spec decode GDN/MTP")
 def apply_patch_N128() -> PatchResult:
     """PN128 orden async spec decode GDN/MTP."""

@@ -248,6 +248,16 @@ services:
       # PN127 vllm#48375: MambaManager no reusa el estado de la ultima pagina (borrador rechazado).
       - GENESIS_ENABLE_PN127_MAMBA_DROP_EAGLE=1
       # PN128: input-prep async espera el postproceso del spec decode (Xid 31 VIRT_WRITE).
+      # PN142: las dos mitades que le faltan a DFlash2 en v0.29.0 — vllm#51581 (ABIERTO:
+      # qwen3_dflash.py rebana .weight sin saber de cuantizacion, y con un borrador
+      # cuantizado revienta o corrompe en silencio) y el port de fa5017a5 (aterrizo en main
+      # un dia DESPUES del corte de v0.29.0; sin el, dflash/dspark reciben el retroceso de
+      # eagle y toda busqueda de prefix-cache y de offload converge a 0).
+      # APAGADO: sin un checkpoint de borrador DFlash2 no sirve de nada. Para usarlo hace
+      # falta uno (club-3090 usa gratex/Qwen3.8-27B-DFlash2-W4A16-g128-sym-GPTQ) y cambiar
+      # --speculative-config al metodo dflash. Con MTP, la mitad de fa5017a5 no cambia nada:
+      # "mtp" esta en el conjunto que SI preserva la KV del target.
+      - GENESIS_ENABLE_PN142_DFLASH2=0
       - GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER=1
       # PN129: buffer de decode de FlashInfer sin pin (Xid 31 VIRT_READ con >=4 requests MTP; visto 2026-09-13).
       - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=0

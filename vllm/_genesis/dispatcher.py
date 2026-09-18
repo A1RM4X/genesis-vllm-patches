@@ -1267,6 +1267,17 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN142": {
+        "title": "DFlash2 usable en v0.29.0 (vllm#51581 + port de fa5017a5)",
+        "env_flag": "GENESIS_ENABLE_PN142_DFLASH2",
+        "default_on": False,
+        "category": "spec_decode",
+        "credit": (
+            "Portado de club-3090 (b9fa3115, ce7816ec), validado por ellos en imagen. Dos mitades que upstream todavia no trae: vllm#51581 (ABIERTO, qwen3_dflash.py rebana .weight sin saber de cuantizacion -> revienta o corrompe en silencio con un borrador cuantizado) y fa5017a5 (aterrizo en main un dia DESPUES del corte de v0.29.0; sin el, dflash/dspark reciben el retroceso de eagle y toda busqueda de prefix-cache y offload converge a 0). OJO: el bundle dflash2 VIEJO no se debe re-cablear en v0.29.0+."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN128": {
         "title": "Input-prep async espera el postproceso del spec decode (GDN+MTP)",
         "env_flag": "GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER",
