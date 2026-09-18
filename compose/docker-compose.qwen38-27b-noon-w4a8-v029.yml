@@ -31,6 +31,16 @@
 #   de SMs (82) y reparte el trabajo con stream-K. Los GEMM de decode corren al
 #   81-106% del techo de DRAM, o sea que ahi NO queda margen de kernel.
 #
+# ⚠ NO USAR EN PRODUCCION TODAVIA — el MTP esta muerto en v0.29.0
+#   Medido en arranques verificados sanos por el healthcheck, mismo prompt:
+#     con MTP 42,9 tok/s | sin MTP 58,9 | con MTP y sin --async-scheduling 43,1
+#   O sea que el MTP no aporta y ADEMAS cuesta 27%: corre el borrador y no le aceptan nada.
+#   Contra la linea base de v0.27.1: coding 152 -> 40,9 tok/s, y concurrencia ~870 tok/s a
+#   20-24 pedidos -> 295 a 16. Prueba independiente del contador: prod_tetris dio 32.000
+#   tokens en 31.270 chunks SSE (1,02 por chunk); con MTP sano la relacion es ~3,4.
+#   Descartado: --async-scheduling, y el bug conocido del ignore de quantization_config.
+#   Ver la tarea "el MTP no acepta nada y CUESTA 27%".
+#
 # MEDIDO EN ESTA MAQUINA (no son estimaciones)
 #   prefill          2200-2750 tok/s de 1k a 50k de contexto
 #   decode 1 pedido  115-120 tok/s hasta 10k, 92-99 a 50k
