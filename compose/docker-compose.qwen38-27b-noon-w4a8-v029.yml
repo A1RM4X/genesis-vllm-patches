@@ -362,6 +362,7 @@ services:
       # PN131 (SK-18g): el decode de la atencion en un kernel entero propio (PTX)
       # que lee la KV en int8. Sin esto, --kv-cache-dtype int8_per_token_head no
       # tiene quien lo atienda.
+      - GENESIS_DIAG_LMHEAD=1
       - GENESIS_ENABLE_PN131_SK18=1
       # PN131 por el registro nativo de backends en vez de por cirugia de texto.
       # Antes: 5 anclas dentro de triton_attn.py, un archivo que upstream movio 81 lineas
@@ -406,6 +407,34 @@ services:
       - PYTHONHASHSEED=0
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    # ── Chequeo de salud que GENERA, no que hace ping ────────────────────────────
+    # Aproximadamente 1 de cada 12 arranques de v0.29.0 deja el modelo roto: responde
+    # /health con 200, sirve, y devuelve 2 tokens con el contenido vacio a cualquier cosa.
+    # Medido: ~4 rotos en ~47 arranques. Dentro de un arranque es 100% consistente, asi que
+    # UNA sonda alcanza para detectarlo — y por eso preguntar /health no sirve de nada.
+    # Esto pide una generacion de verdad y exige mas de 5 tokens; con menos el contenedor
+    # queda marcado "unhealthy" en `docker ps`, que es lo que convierte la falla de silenciosa
+    # en visible. OJO: Docker NO reinicia por unhealthy — `restart:` solo actua cuando el
+    # contenedor SALE. Para que se recupere solo hace falta un watchdog externo (o mirar el
+    # estado antes de mandarle trafico). Reiniciar a mano alcanza: sin tocar nada, el arranque
+    # siguiente sale sano.
+    # start_period generoso: la carga de pesos mas la compilacion tardan varios minutos, y
+    # durante esa ventana los fallos del chequeo no cuentan.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          n=$$(curl -sf -m 120 http://localhost:8320/v1/completions
+          -H 'Content-Type: application/json'
+          -H "Authorization: Bearer $${VLLM_API_KEY}"
+          -d '{"model":"qwen3.8","prompt":"La capital de Francia es","max_tokens":16,"temperature":0}'
+          | python3 -c "import sys,json;print(json.load(sys.stdin)['usage']['completion_tokens'])"
+          2>/dev/null) && [ "$${n:-0}" -gt 5 ]
+      interval: 60s
+      timeout: 130s
+      retries: 2
+      start_period: 900s
+    restart: unless-stopped
     shm_size: "16gb"
     ipc: host
     # Permite adjuntar profilers (py-spy, gdb) a los workers desde el host
