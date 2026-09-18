@@ -223,25 +223,35 @@ def finish_request(ctx: RequestTrackerContext, response_obj_or_dict: Any = None,
         # Fallbacks for streaming responses without explicit usage object
         if output_tokens is None and ctx.stream_output_tokens > 0:
             output_tokens = ctx.stream_output_tokens
+        # Cuantos de los numeros de arriba son MEDIDOS. Lo que se estime a partir de
+        # aca no puede usarse como denominador de una tasa: una division entre dos
+        # estimaciones sale con pinta de medicion y no lo es.
+        prompt_medido = prompt_tokens is not None
+        ttft_medido = ttft_ms is not None
+
         if prompt_tokens is None:
-            if ctx.prompt_chars > 0:
-                prompt_tokens = max(1, int(ctx.prompt_chars / 3.5))
-            elif ttft_ms is not None and ttft_ms > 0:
-                prompt_tokens = max(1, int(ttft_ms * 1.5))
-            else:
-                prompt_tokens = 16
-        if ttft_ms is None and e2e_ms is not None:
-            ttft_ms = min(e2e_ms, 50.0)
+            # ~3,5 caracteres por token: sirve para ordenar la tabla, no para dividir.
+            prompt_tokens = max(1, int(ctx.prompt_chars / 3.5)) if ctx.prompt_chars > 0 else 16
 
         # Calculate PP TPS (Prompt Processing)
+        #
+        # Solo con TTFT y prompt_tokens REALES. Antes, si faltaba el TTFT se le ponia
+        # `min(e2e_ms, 50.0)` —un 50 inventado— y ademas se deducian los tokens del
+        # propio TTFT (`ttft_ms * 1.5`); dividir uno por el otro daba cosas como
+        # 54.467 tokens / 50 ms = 1.089.340 tok/s, noventa veces el techo real de la
+        # maquina, y la UI lo mostraba como un dato medido. Con 155 pedidos reales,
+        # 90 salian con ese numero imposible.
         pp_tps = None
-        if ttft_ms is not None and ttft_ms > 0 and prompt_tokens:
+        if ttft_medido and prompt_medido and ttft_ms > 0 and prompt_tokens:
             pp_tps = round(prompt_tokens / (ttft_ms / 1000.0), 1)
 
         # Calculate TG TPS (Text Generation / decode)
+        #
+        # Sin TTFT real no se sabe donde termina el prefill, asi que el tiempo de
+        # decode no es separable del total: mejor no publicar la tasa.
         tg_tps = None
-        if output_tokens is not None and output_tokens > 0 and e2e_ms is not None:
-            decode_ms = max(1.0, e2e_ms - (ttft_ms or 0.0))
+        if output_tokens and e2e_ms is not None and ttft_medido:
+            decode_ms = max(1.0, e2e_ms - ttft_ms)
             tg_tps = round(output_tokens / (decode_ms / 1000.0), 1)
 
         # Calculate KV Cache Hit Rate %
