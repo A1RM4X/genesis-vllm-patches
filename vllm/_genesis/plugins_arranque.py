@@ -53,6 +53,14 @@ def cargar() -> None:
         return
     _cargado = True
 
+    # Lo PRIMERO: si algo revienta despues, que quede por escrito con los locales del frame.
+    try:
+        from vllm._genesis import volcado
+
+        volcado.instalar()
+    except Exception:                                        # noqa: BLE001
+        pass
+
     _avisar_si_falta_disco()
 
     if _prendido("GENESIS_DIAG_LMHEAD"):

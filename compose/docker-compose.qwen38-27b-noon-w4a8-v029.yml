@@ -362,7 +362,22 @@ services:
       # PN131 (SK-18g): el decode de la atencion en un kernel entero propio (PTX)
       # que lee la KV en int8. Sin esto, --kv-cache-dtype int8_per_token_head no
       # tiene quien lo atienda.
-      - GENESIS_DIAG_LMHEAD=1
+      # ── Diagnostico: volcado con los locales del frame que falla ─────────────
+      # vLLM tira el traceback y se muere, pero el traceback dice DONDE fallo, no con QUE.
+      # Esto deja un archivo por incidente con la excepcion y, por cada frame, sus variables
+      # resumidas (tensores como forma/dtype, listas como largo + extremos). Para el
+      # IndexError de block_pool eso es directamente `i` contra `len(new_block_hashes)`.
+      # Engancha el excepthook Y un handler del logger raiz, porque el EngineCore de vLLM
+      # atrapa el error, lo loguea y sale ordenado — por ahi un excepthook no se entera.
+      # Cuesta cero mientras no explote nada. Apagar: GENESIS_VOLCADO=0.
+      - GENESIS_VOLCADO=1
+      - GENESIS_VOLCADO_DIR=/root/.cache/vllm/genesis_volcados
+      # Logs a archivo ademas de consola, por la palanca NATIVA de vLLM. Con TP=2 son tres
+      # procesos escribiendo al mismo stdout; el formato lleva el pid y los loggers de Genesis
+      # van en DEBUG mientras vLLM se queda en INFO, para que el detalle propio no se pierda.
+      - VLLM_LOGGING_CONFIG_PATH=/root/.cache/vllm/genesis_logs/logging.json
+      # Solo para cazar el arranque roto; prender a mano cuando haga falta (ver diag_lm_head.py)
+      - GENESIS_DIAG_LMHEAD=0
       - GENESIS_ENABLE_PN131_SK18=1
       # PN131 por el registro nativo de backends en vez de por cirugia de texto.
       # Antes: 5 anclas dentro de triton_attn.py, un archivo que upstream movio 81 lineas
@@ -454,6 +469,12 @@ services:
       - -c
       - |
         pip install pandas scipy xxhash -q
+        # Escribe el dictConfig de logging ANTES de que arranque vLLM: este proceso muere en
+        # el exec, pero el archivo queda y lo leen los tres procesos que vienen despues.
+        # La variable se VACIA para esta linea a proposito: importar vllm dispara su
+        # _configure_vllm_root_logger, que revienta si el archivo todavia no existe. Huevo y
+        # gallina — con la variable vacia vLLM se saltea esa carga y podemos escribirlo.
+        VLLM_LOGGING_CONFIG_PATH= python3 -m vllm._genesis.volcado
         python3 -m vllm._genesis.patches.apply_all
         exec vllm serve "$@"
       - --
