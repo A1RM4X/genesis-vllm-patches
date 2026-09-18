@@ -53,6 +53,17 @@ def cargar() -> None:
         return
     _cargado = True
 
+    _avisar_si_falta_disco()
+
+    if _prendido("GENESIS_DIAG_LMHEAD"):
+        try:
+            from vllm._genesis.diag_lm_head import enganchar
+
+            enganchar()
+        except Exception as e:                                   # noqa: BLE001
+            log.error("[DIAG] no se pudo enganchar la firma de lm_head (%s: %s)",
+                      type(e).__name__, e)
+
     if _prendido("GENESIS_ENABLE_PN131_SK18") and _prendido("GENESIS_PN131_NATIVO"):
         try:
             from vllm._genesis.sk18_backend import registrar
@@ -61,3 +72,29 @@ def cargar() -> None:
         except Exception as e:                                   # noqa: BLE001
             log.error("[PN131] no se pudo registrar el backend SK-18 (%s: %s). La atencion "
                       "va a correr por el kernel generico.", type(e).__name__, e)
+
+
+def _avisar_si_falta_disco(minimo_gib: float = 10.0) -> None:
+    """Grita si el disco de las caches JIT esta casi lleno.
+
+    No es paranoia de manual: los unicos arranques que dejaron el modelo roto en v0.29.0
+    ocurrieron con el disco raiz al 96-100% y 8,18 GiB de RAM disponible para leer un
+    checkpoint de 18,12 GiB. Despues de liberar 31 GB, 22 arranques seguidos salieron sanos.
+    No esta probado que sea la causa — ver la nota del proyecto — pero un disco sin lugar
+    mientras se escriben las caches de torch.compile, Inductor y Triton es una fuente de
+    artefactos truncados que despues se cargan en silencio, y eso explicaria que la falla
+    fuera por arranque y desapareciera sola al haber espacio.
+
+    Avisar cuesta nada. Perseguir un fantasma otra vez, bastante.
+    """
+    try:
+        import shutil
+
+        libre = shutil.disk_usage("/root/.cache").free / 2 ** 30
+        if libre < minimo_gib:
+            log.warning("[Genesis] quedan %.1f GiB en el disco de las caches JIT (menos de "
+                        "%.0f). Las caches de torch.compile/Inductor/Triton se escriben ahi "
+                        "durante el arranque; sin lugar pueden quedar truncadas y cargarse "
+                        "despues sin avisar.", libre, minimo_gib)
+    except Exception:
+        pass    # un chequeo de cortesia nunca puede molestar al arranque
