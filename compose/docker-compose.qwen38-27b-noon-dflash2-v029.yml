@@ -52,6 +52,13 @@ services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
     container_name: genesis-27b-dflash2
+    # El kernel saco a swap 1,8 GB del PROPIO proceso servidor (workers 524+520 MB,
+    # EngineCore 198, API 561) porque el sistema tiene swappiness=60, 30,5 GB de RAM y ~15 GB
+    # de cache de paginas: con esa configuracion prefiere paginar anonimo antes que soltar
+    # cache. Un proceso que sirve no puede estar en swap — el bench de club-3090 directamente
+    # invalida toda la corrida cuando lo detecta ("every number in this run is suspect").
+    # mem_swappiness: 0 se lo prohibe SOLO a este contenedor, sin tocar el sistema.
+    mem_swappiness: 0
     cpuset: "0-7,16-23"
     ports:
       - "8360:8320"
