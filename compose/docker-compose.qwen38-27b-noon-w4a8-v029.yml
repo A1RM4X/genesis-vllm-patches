@@ -75,6 +75,14 @@ services:
       lanbridge:
         ipv4_address: 172.20.0.228
         ipv6_address: fd00:172:20::13
+        # Alias EXPLICITO a proposito. Docker Compose ya registra el nombre de servicio
+        # (vllm-server) como alias de red, asi que esto es redundante hoy — pero ese es un
+        # contrato implicito: si alguien renombra el servicio, el alias se cae en silencio
+        # y jspace-proxy, que resuelve por este nombre, deja de encontrar el motor.
+        # Declarado, el contrato es intencional. Los dos composes de motor lo comparten:
+        # son mutuamente excluyentes, asi que vllm-server apunta siempre al que este arriba.
+        aliases:
+          - vllm-server
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
