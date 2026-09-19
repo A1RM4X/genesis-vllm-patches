@@ -743,11 +743,16 @@ services:
       # verifica aunque se rechace, y a contexto largo esa verificacion cuesta mas que lo que
       # rinde la cola de la aceptacion. La carga real de opencode vive en 60-100k, asi que el
       # optimo es K=8. Si alguna vez el uso se corre a prompts cortos, K=9 es mejor ahi.
+      # El borrador HEREDA el kv-cache-dtype del target (int8_per_token_head). No poner
+      # "kv_cache_dtype":"auto" aca: con PN145 eso cuesta 483.076 -> 248.993 tokens de KV.
+      # OJO, porque la medicion previa decia lo contrario: antes de PN145 el dtype del
+      # borrador daba EXACTAMENTE lo mismo (178.823 de las dos formas), porque el block_size
+      # de 16 tapaba todo lo demas. Arreglado eso, el dtype pasa a valer un 94%.
       - --speculative-config
       # DFlash2: borrador EXTERNO (syvai/Qwen3.8-27B-DFlash2-W4A16, 5 capas, 1,2 GB) en vez
       # del cabezal MTP interno. K=7 es el default de club-3090 para este borrador.
       # La arquitectura DFlash2DraftModel es nativa desde v0.28.0; lo que falta lo pone PN142.
-      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":8,"kv_cache_dtype":"auto"}'
+      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":8}'
       - --host
       - "0.0.0.0"
       - --port
