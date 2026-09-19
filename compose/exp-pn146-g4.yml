@@ -51,7 +51,7 @@ version: '3.8'
 services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
-    container_name: genesis-27b-dflash2
+    container_name: genesis-27b-pn146
     # SIN SWAP, nunca. El kernel se habia llevado a swap 1,8 GB del propio proceso servidor
     # (3,85 GB contando el cgroup entero) con el sistema en swappiness=60 y ~15 GB de cache de
     # paginas: con eso prefiere paginar anonimo antes que soltar cache. Un proceso que sirve no
@@ -70,10 +70,10 @@ services:
     memswap_limit: 26g
     cpuset: "0-7,16-23"
     ports:
-      - "8360:8320"
+      - "8378:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.251
+        ipv4_address: 172.20.0.234
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
@@ -273,6 +273,10 @@ services:
       # --speculative-config al metodo dflash. Con MTP, la mitad de fa5017a5 no cambia nada:
       # "mtp" esta en el conjunto que SI preserva la KV del target.
       - GENESIS_ENABLE_PN142_DFLASH2=1
+      - GENESIS_DIAG_KV=1
+      - GENESIS_ENABLE_PN145_SW_BLOCK_SIZE=1
+      - GENESIS_ENABLE_PN146_GROUP_SIZE=1
+      - GENESIS_PN146_GROUP_SIZE=4
       # PN144: divide por 32 el residual del borrador (o_proj/down_proj de las 5 capas, la
       # semilla del embedding, y el epsilon de las 11 normas que lo ven, por c^2). Sin esto
       # el borrador desborda fp16 despues de UNA capa —su residual corre ~100x mas caliente
@@ -281,24 +285,6 @@ services:
       # costaba -13% de decode y +40% de TTFT a 50k. Esto es exacto (la norma es invariante
       # a escala) y no cuesta nada: 10 tensores de escalas divididos una vez al cargar.
       - GENESIS_PN144_ESCALA_RESIDUAL=32
-      # PN145 + PN146: la KV con DFlash2 pasa de 178.823 a 483.076 tokens (+170%) y la
-      # concurrencia de 1,09x a 2,95x. Medido, no estimado.
-      #
-      # PN145 — el grupo de ventana deslizante del borrador se llevaba 1153 de los 2001
-      # bloques por request (mas que las 64 capas del modelo grande juntas) porque elegia
-      # block_size=16 para una pagina padeada a 0,87 MB. Dos bugs encadenados: el call site
-      # pasa skip_page_size_padded, que fuera de TurboQuant es None, y sin presupuesto cae al
-      # bloque mas chico; y el backend declara MultipleOf(16) pero la funcion toma solo
-      # s.base, asi que no puede elegir un multiplo ni con presupuesto. Paso a 22 bloques.
-      #
-      # PN146 — group_size = min(capas por bucket) y el minimo son las 5 capas del borrador,
-      # que le imponen el tamano de grupo a las 64 del target. Como bytes_per_block lo fija el
-      # grupo MAS GRANDE (un max, no una suma), bajarlo a 4 da mas bloques totales: 2689 en
-      # vez de 2151. Con 4 quedan 18 grupos y no se paga nada en el scheduler — a 50k dio
-      # 201,7 tok/s, el mejor de toda la serie.
-      - GENESIS_ENABLE_PN145_SW_BLOCK_SIZE=1
-      - GENESIS_ENABLE_PN146_GROUP_SIZE=1
-      - GENESIS_PN146_GROUP_SIZE=4
       - GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER=1
       # PN129: buffer de decode de FlashInfer sin pin (Xid 31 VIRT_READ con >=4 requests MTP; visto 2026-09-13).
       - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=0
@@ -747,7 +733,7 @@ services:
       # DFlash2: borrador EXTERNO (syvai/Qwen3.8-27B-DFlash2-W4A16, 5 capas, 1,2 GB) en vez
       # del cabezal MTP interno. K=7 es el default de club-3090 para este borrador.
       # La arquitectura DFlash2DraftModel es nativa desde v0.28.0; lo que falta lo pone PN142.
-      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":8,"kv_cache_dtype":"auto"}'
+      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":8}'
       - --host
       - "0.0.0.0"
       - --port
