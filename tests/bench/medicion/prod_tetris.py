@@ -17,7 +17,7 @@ import urllib.request
 import os
 
 HOST = os.environ.get("VLLM_HOST", "http://127.0.0.1:8320")
-CLAVE = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+CLAVE = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
 CAB = {"Content-Type": "application/json", "Authorization": f"Bearer {CLAVE}"}
 URL = HOST + "/v1/chat/completions"
 PEDIDO = """Escribi un Tetris completo en Python, en un solo archivo, sin dependencias externas

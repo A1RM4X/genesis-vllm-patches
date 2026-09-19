@@ -8,6 +8,7 @@ import argparse, json, os, re, string, time
 from collections import Counter
 import urllib.request
 import urllib.error
+import os
 
 # Task configuration: HF dataset subset name, prompt template, metric
 TASKS = {
@@ -29,7 +30,7 @@ TASKS = {
     "repobench-p":       {"metric": "code",  "prompt": "Complete the code. Reply only with the next line.\n\n{context}"},
 }
 
-API_KEY = "<REDACTADO>"
+API_KEY = os.environ.get("GENESIS_BENCH_API_KEY", "")
 
 def normalize_answer(s):
     def remove_articles(t):

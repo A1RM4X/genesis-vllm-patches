@@ -13,12 +13,13 @@ import sys
 import threading
 import time
 import urllib.request
+import os
 
 IP = sys.argv[1]
 N = int(sys.argv[2])
 NTOK = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
 SALIDA = int(sys.argv[4]) if len(sys.argv) > 4 else 200
-H = {"Content-Type": "application/json", "Authorization": "Bearer <REDACTADO: clave rotada 2026-09-19>"}
+H = {"Content-Type": "application/json", "Authorization": "Bearer " + os.environ.get("VLLM_API_KEY", "")}
 
 res = [None] * N
 pico = {"kv": 0.0, "corriendo": 0, "esperando": 0, "preempt": 0.0}

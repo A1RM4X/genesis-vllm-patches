@@ -1,8 +1,9 @@
 """Estres de concurrencia MTP: N requests en paralelo, mezcla de prompts largos y
 generaciones largas, durante DURACION segundos. Reporta OK/ERR y tok/s."""
 import json, random, sys, threading, time, urllib.request
+import os
 BASE = "http://127.0.0.1:8320/v1/chat/completions"
-H = {"Content-Type": "application/json", "Authorization": "Bearer <REDACTADO: clave rotada 2026-09-19>"}
+H = {"Content-Type": "application/json", "Authorization": "Bearer " + os.environ.get("VLLM_API_KEY", "")}
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 DUR = int(sys.argv[2]) if len(sys.argv) > 2 else 300
 FILL = open("/home/usuario/Proyectos/genesis-vllm-patches/docs/LOGROS.md").read()

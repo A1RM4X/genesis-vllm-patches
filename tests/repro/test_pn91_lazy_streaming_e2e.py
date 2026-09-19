@@ -18,7 +18,7 @@ import urllib.request
 from typing import Any
 
 API_BASE = os.environ.get("VLLM_API_BASE", "http://172.20.0.228:8320")
-API_KEY = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+API_KEY = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
 DISK_OFFLOAD_DIR = "/home/usuario/Proyectos/kv-offload"
 
 

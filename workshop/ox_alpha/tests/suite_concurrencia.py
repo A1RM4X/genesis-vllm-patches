@@ -46,7 +46,7 @@ DEFAULT_MAX_TOKENS = 512
 DEFAULT_TIMEOUT_S = 30
 DEFAULT_MODEL = "qwen3.8"
 DEFAULT_BASE_URL = "http://127.0.0.1:8320"
-DEFAULT_API_KEY = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+DEFAULT_API_KEY = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
 
 
 def percentile(sorted_vals: list[float], p: float) -> float:

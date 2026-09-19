@@ -4,7 +4,7 @@
 # el contador satura en 1 y las corridas siguientes no miden nada. Ese fue el error que
 # invalido la primera biseccion.
 cd /home/usuario/Proyectos/genesis-vllm-patches/compose
-YML=$1; NOMBRE=$2; IP=$3; N=${4:-3}; K=<REDACTADO: clave rotada 2026-09-19>
+YML=$1; NOMBRE=$2; IP=$3; N=${4:-3}; K=${VLLM_API_KEY:?falta VLLM_API_KEY}
 crash=0; limpio=0
 for n in $(seq 1 $N); do
   docker compose -f $YML down >/dev/null 2>&1

@@ -13,8 +13,9 @@ import threading
 import time
 import urllib.request
 import uuid
+import os
 
-H = {"Content-Type": "application/json", "Authorization": "Bearer <REDACTADO: clave rotada 2026-09-19>"}
+H = {"Content-Type": "application/json", "Authorization": "Bearer " + os.environ.get("VLLM_API_KEY", "")}
 BASE = "http://127.0.0.1:8320"
 SUBAGENTES = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 

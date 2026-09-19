@@ -12,9 +12,10 @@ import re
 import sys
 import time
 import urllib.request
+import os
 
 BASE = "http://127.0.0.1:8320"
-H = {"Content-Type": "application/json", "Authorization": "Bearer <REDACTADO: clave rotada 2026-09-19>"}
+H = {"Content-Type": "application/json", "Authorization": "Bearer " + os.environ.get("VLLM_API_KEY", "")}
 TAG = sys.argv[1] if len(sys.argv) > 1 else "acc"
 MAXTOK = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 

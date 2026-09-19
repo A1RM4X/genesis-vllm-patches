@@ -14,9 +14,10 @@ import json
 import time
 import urllib.request
 import aiohttp
+import os
 
 BASE_URL = "http://127.0.0.1:8320"
-API_KEY = "<REDACTADO: clave rotada 2026-09-19>"
+API_KEY = os.environ.get("VLLM_API_KEY", "")
 
 def generate_prompt(req_idx: int, shared_tokens: int = 15000, unique_tokens: int = 35000) -> str:
     # Shared system context (~15,000 tokens)

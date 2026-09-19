@@ -3,7 +3,8 @@
 se piden todos al final; (2) velocidad de decode con ese contexto (streaming,
 sin contar el TTFT)."""
 import json, sys, time, glob, random, urllib.request
-BASE="http://127.0.0.1:8320/v1/chat/completions"; KEY="<REDACTADO: clave rotada 2026-09-19>"
+import os
+BASE="http://127.0.0.1:8320/v1/chat/completions"; KEY=os.environ.get("VLLM_API_KEY", "")
 random.seed(7)
 fs=sorted(glob.glob("/home/usuario/Proyectos/genesis-vllm-patches/vllm/_genesis/**/*.py", recursive=True))
 txt="".join(open(f,errors="ignore").read() for f in fs)[:200_000]

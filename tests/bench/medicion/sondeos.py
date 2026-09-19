@@ -11,7 +11,8 @@ Uso: sondeos.py <nombre> [n_sondeos]      -> /tmp/g115/sond_<nombre>.json
      sondeos.py --comparar ref otro [otro2]
 """
 import glob, json, math, sys, time, urllib.request
-BASE = "http://127.0.0.1:8320"; KEY = "<REDACTADO: clave rotada 2026-09-19>"
+import os
+BASE = "http://127.0.0.1:8320"; KEY = os.environ.get("VLLM_API_KEY", "")
 H = {"Content-Type": "application/json", "Authorization": "Bearer " + KEY}
 PISO = -20.0
 

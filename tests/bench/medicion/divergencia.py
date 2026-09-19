@@ -7,9 +7,10 @@ Uso:
   divergencia.py comparar <ref> <otro>             compara dos etiquetas ya grabadas
 """
 import json, sys, urllib.request
+import os
 
 BASE = "http://127.0.0.1:8320/v1/chat/completions"
-KEY = "<REDACTADO: clave rotada 2026-09-19>"
+KEY = os.environ.get("VLLM_API_KEY", "")
 
 PROMPTS = [
     "Escribí una función en Python que reciba una lista de diccionarios con las claves 'nombre' y "

@@ -36,7 +36,7 @@ MODEL = os.environ.get("GENESIS_PROD_MODEL", "qwen3.8")
 LOG_PATH = Path("/tmp/opencode/suite_calidad.log")
 BASELINE_PATH = Path("/tmp/opencode/suite_calidad_baseline.json")
 CONTAINER = os.environ.get("GENESIS_CONTAINER", "genesis-27b-qwen38-fp8")
-API_KEY = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+API_KEY = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
 
 # mismos prompts que suite_parches (tetris y rpg) workshop/ox_alpha/tests/suite_parches.py:32
 PROMPTS: dict[str, str] = {

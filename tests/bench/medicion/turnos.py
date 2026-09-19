@@ -1,8 +1,9 @@
 """Conversacion de agente: prefijo largo + N turnos que agregan contenido nuevo.
 Mide por turno el TTFT (streaming) y los tokens de prefix cache reutilizados."""
 import glob, json, sys, time, urllib.request
+import os
 BASE = "http://127.0.0.1:8320/v1/chat/completions"
-H = {"Content-Type": "application/json", "Authorization": "Bearer <REDACTADO: clave rotada 2026-09-19>"}
+H = {"Content-Type": "application/json", "Authorization": "Bearer " + os.environ.get("VLLM_API_KEY", "")}
 TAG = sys.argv[1]; TURNOS = int(sys.argv[2]) if len(sys.argv) > 2 else 12
 fs = sorted(glob.glob("/home/usuario/Proyectos/genesis-vllm-patches/vllm/_genesis/wiring/**/*.py", recursive=True))
 corpus = "".join(f"# ==== {f.split('wiring/')[-1]} ====\n" + open(f, errors="ignore").read() for f in fs)

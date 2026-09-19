@@ -1,5 +1,6 @@
 import time, urllib.request
-B="http://127.0.0.1:8320/metrics"; K="<REDACTADO: clave rotada 2026-09-19>"
+import os
+B="http://127.0.0.1:8320/metrics"; K=os.environ.get("VLLM_API_KEY", "")
 KS=["prefix_cache_queries_total","prefix_cache_hits_total","external_prefix_cache_queries_total","external_prefix_cache_hits_total","num_preemptions_total","prompt_tokens_total","generation_tokens_total"]
 def leer():
     d={}

@@ -26,6 +26,7 @@ import time
 import sys
 import statistics
 from datetime import datetime
+import os
 
 try:
     import requests
@@ -35,7 +36,7 @@ except ImportError:
     import requests
 
 # ── Config ──────────────────────────────────────────────────────────
-API_KEY = "<REDACTADO>"
+API_KEY = os.environ.get("GENESIS_BENCH_API_KEY", "")
 HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 SEP = "─" * 58
 

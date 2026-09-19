@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tareas con UNA respuesta correcta, temperature=0. Cuenta aciertos."""
 import json, sys, urllib.request
-BASE="http://127.0.0.1:8320/v1/chat/completions"; KEY="<REDACTADO: clave rotada 2026-09-19>"
+import os
+BASE="http://127.0.0.1:8320/v1/chat/completions"; KEY=os.environ.get("VLLM_API_KEY", "")
 TAREAS=[
  ("¿Cuánto es 847 por 23? Respondé solo el número.", "19481"),
  ("¿Cuánto es 1234 más 5678? Respondé solo el número.", "6912"),

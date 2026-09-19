@@ -1,5 +1,6 @@
 import json,urllib.request,re,time
-H={"Content-Type":"application/json","Authorization":"Bearer <REDACTADO: clave rotada 2026-09-19>"}
+import os
+H={"Content-Type":"application/json","Authorization":"Bearer " + os.environ.get("VLLM_API_KEY", "")}
 def chat(msgs,mt):
     b=json.dumps({"model":"qwen3.8","messages":msgs,"max_tokens":mt,"temperature":0,"chat_template_kwargs":{"enable_thinking":False}}).encode()
     t=time.time(); d=json.load(urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8320/v1/chat/completions",b,H),timeout=900))

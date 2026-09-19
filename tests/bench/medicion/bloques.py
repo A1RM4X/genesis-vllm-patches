@@ -1,5 +1,6 @@
 import json,urllib.request,time,threading,collections
-H={"Content-Type":"application/json","Authorization":"Bearer <REDACTADO: clave rotada 2026-09-19>"}
+import os
+H={"Content-Type":"application/json","Authorization":"Bearer " + os.environ.get("VLLM_API_KEY", "")}
 def req(n,seed,mt):
     txt=(f"[{seed}] Documento tecnico sobre planificacion de memoria en GPUs. "*n)+"\nEscribi un ensayo largo sobre el tema."
     b=json.dumps({"model":"qwen3.8","messages":[{"role":"user","content":txt}],"max_tokens":mt,"temperature":0.7,"chat_template_kwargs":{"enable_thinking":False}}).encode()

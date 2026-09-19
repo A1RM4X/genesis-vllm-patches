@@ -6,7 +6,7 @@
 set -u
 C=genesis-27b-pn122-eager
 IP=172.20.0.151:8320
-K=<REDACTADO: clave rotada 2026-09-19>
+K=${VLLM_API_KEY:?falta VLLM_API_KEY}
 
 echo "== esperando a que levante =="
 until [ "$(docker inspect $C --format '{{.State.Health.Status}}' 2>/dev/null)" = "healthy" ] \

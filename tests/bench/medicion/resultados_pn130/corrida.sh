@@ -2,7 +2,7 @@
 R=/home/usuario/Proyectos/genesis-vllm-patches/tests/bench/medicion/resultados_pn130
 CD=/home/usuario/Proyectos/genesis-vllm-patches/compose
 CN=genesis-27b-qwen38-ar4ikov-awq
-A="Authorization: Bearer <REDACTADO: clave rotada 2026-09-19>"
+A="Authorization: Bearer ${VLLM_API_KEY:?falta VLLM_API_KEY}"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a $R/estado.log; }
 docker compose -f $CD/docker-compose.qwen38-27b-noon-w4a8.yml down >/dev/null 2>&1
 docker run --rm -v /home/usuario/.cache/vllm:/c alpine rm -rf /c/qwen38-27b-noon-w4a8/torch_compile_cache

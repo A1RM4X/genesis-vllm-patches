@@ -107,7 +107,7 @@ class TestHarness:
 def main():
     parser = argparse.ArgumentParser(description="Test de carga Tiered Demotion")
     parser.add_argument("--url", default="http://172.20.0.228:8320", help="URL de vLLM")
-    parser.add_argument("--key", default="<REDACTADO: clave rotada 2026-09-19>", help="API key")
+    parser.add_argument("--key", default=os.environ.get("VLLM_API_KEY", ""), help="API key")
     parser.add_argument("--kv-dir", default="/home/usuario/Proyectos/kv-offload", help="Directorio /kv-offload")
     args = parser.parse_args()
 

@@ -5,7 +5,8 @@ Uso: fidelidad.py <nombre>            -> guarda /tmp/g115/fid_<nombre>.json
      fidelidad.py --comparar ref otro -> top-1 y |dlogp| contra la referencia, por tramo
 """
 import json, sys, glob, urllib.request, math
-BASE="http://127.0.0.1:8320"; KEY="<REDACTADO: clave rotada 2026-09-19>"
+import os
+BASE="http://127.0.0.1:8320"; KEY=os.environ.get("VLLM_API_KEY", "")
 def texto(objetivo_chars=110_000):
     fs=sorted(glob.glob("/home/usuario/Proyectos/genesis-vllm-patches/vllm/_genesis/**/*.py", recursive=True))
     out=[]; n=0

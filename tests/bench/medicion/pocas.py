@@ -1,5 +1,6 @@
 import json,urllib.request,sys
-H={"Content-Type":"application/json","Authorization":"Bearer <REDACTADO: clave rotada 2026-09-19>"}
+import os
+H={"Content-Type":"application/json","Authorization":"Bearer " + os.environ.get("VLLM_API_KEY", "")}
 T=[("¿Cuánto es 847 por 23? Respondé solo el número.","19481"),("¿Cuánto es 1234 más 5678? Respondé solo el número.","6912"),
    ("¿Cuánto es 15 al cuadrado? Respondé solo el número.","225"),("¿En qué año llegó el hombre a la Luna? Respondé solo el número.","1969"),
    ("¿Cuánto es 7 factorial? Respondé solo el número.","5040"),("¿Cuántos días tiene un año bisiesto? Respondé solo el número.","366")]

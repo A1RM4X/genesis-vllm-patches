@@ -13,7 +13,7 @@
 set -u
 RAIZ=/home/usuario/Proyectos/genesis-vllm-patches
 TMP=/home/usuario/.claude/jobs/fc6ace03/tmp
-K=<REDACTADO: clave rotada 2026-09-19>
+K=${VLLM_API_KEY:?falta VLLM_API_KEY}
 SALIDA=400
 CAL=3        # calentamientos
 MED=5        # corridas medidas
@@ -21,7 +21,7 @@ MED=5        # corridas medidas
 cat > $TMP/_una.py <<'PY'
 import json, sys, time, urllib.request
 ip, salida = sys.argv[1], int(sys.argv[2])
-H = {'Content-Type': 'application/json', 'Authorization': 'Bearer <REDACTADO: clave rotada 2026-09-19>'}
+H = {'Content-Type': 'application/json', 'Authorization': 'Bearer ${VLLM_API_KEY:?falta VLLM_API_KEY}'}
 P = ("Explica en detalle como funciona un cache de varios niveles en una CPU moderna: "
      "politicas de reemplazo, coherencia entre nucleos, prefetch, y el impacto de la "
      "localidad espacial y temporal en el rendimiento de un programa real.")

@@ -7,7 +7,7 @@ Implements the Part 11.1 pre-deploy validation checklist from the master plan.
 ```bash
 # Point at the integration container (VM 100)
 export GENESIS_BENCH_ENDPOINT="http://192.168.1.10:8000/v1"
-export GENESIS_BENCH_API_KEY="<REDACTADO>"
+export GENESIS_BENCH_API_KEY="<tu-clave>"   # nunca commitear una real
 export GENESIS_BENCH_MODEL="qwen3.6-35b-a3b-integration"
 
 # Run everything sequentially (P0 + P1 gates)

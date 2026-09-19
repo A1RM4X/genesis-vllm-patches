@@ -13,7 +13,7 @@ import time
 import urllib.request
 
 BASE_URL = "http://127.0.0.1:8320"
-API_KEY = "<REDACTADO: clave rotada 2026-09-19>"
+API_KEY = os.environ.get("VLLM_API_KEY", "")
 MODEL = "qwen3.8"
 
 

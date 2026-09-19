@@ -27,7 +27,7 @@ ENDPOINT = os.environ.get("GENESIS_PROD_ENDPOINT", "http://127.0.0.1:8320/v1/cha
 MODEL = os.environ.get("GENESIS_PROD_MODEL", "qwen3.8")
 LOG_PATH = Path("/tmp/opencode/suite_parches.log")
 CONTAINER = os.environ.get("GENESIS_CONTAINER", "genesis-27b-qwen38-fp8")
-API_KEY = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+API_KEY = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
 
 PROMPTS: dict[str, str] = {
     "tetris": "Escribe un juego de Tetris completo en Python para terminal (curses), con rotacion, lineas, score, y controles WASD. Codigo funcional y comentado.",

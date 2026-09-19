@@ -10,7 +10,7 @@ import time
 import urllib.request
 
 API_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8320/v1/chat/completions")
-API_KEY = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+API_KEY = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
 MODEL = os.environ.get("VLLM_MODEL", "qwen3.8")
 
 def query_model(messages, max_tokens=2048, temperature=0.0):

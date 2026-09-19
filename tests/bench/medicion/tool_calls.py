@@ -8,9 +8,10 @@ El sintoma que estamos cazando es un cierre de etiqueta mal emitido en el format
 Uso: tool_calls.py [etiqueta] [N] [temperatura] [tokens_de_contexto]
 """
 import json, sys, time, urllib.request, glob, random
+import os
 
 BASE = "http://127.0.0.1:8320/v1/chat/completions"
-KEY = "<REDACTADO: clave rotada 2026-09-19>"
+KEY = os.environ.get("VLLM_API_KEY", "")
 TAG = sys.argv[1] if len(sys.argv) > 1 else "prueba"
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 TEMP = float(sys.argv[3]) if len(sys.argv) > 3 else 0.7

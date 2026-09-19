@@ -89,7 +89,7 @@ def try_live_probe(timeout_s: float = 2.0) -> bool:
     """Prueba health de PROD con timeout corto. No usa sleeps largos."""
     import urllib.request, urllib.error
     base = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8320")
-    api_key = os.environ.get("VLLM_API_KEY", "<REDACTADO: clave rotada 2026-09-19>")
+    api_key = os.environ.get("VLLM_API_KEY", os.environ.get("VLLM_API_KEY", ""))
     url = base.rstrip("/") + "/health"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
     try:

@@ -51,7 +51,7 @@ except ImportError:
 
 CONTAINER = "vllm-server-mtp-test"
 PORT = 8000
-API_KEY = "<REDACTADO>"
+API_KEY = os.environ.get("GENESIS_BENCH_API_KEY", "")
 HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
 # Grid

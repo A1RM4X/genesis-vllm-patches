@@ -1,7 +1,7 @@
 #!/bin/bash
 # Arranca N veces guardando el log de cada arranque, etiquetado OK o ROTO.
 cd /home/usuario/Proyectos/genesis-vllm-patches/compose
-YML=docker-compose.qwen38-27b-noon-w4a8-v029.yml; K=<REDACTADO: clave rotada 2026-09-19>
+YML=docker-compose.qwen38-27b-noon-w4a8-v029.yml; K=${VLLM_API_KEY:?falta VLLM_API_KEY}
 D=/home/usuario/.claude/jobs/fc6ace03/tmp/logs; mkdir -p $D   # NO borrar: los logs viejos son la referencia
 for n in $(seq 1 ${1:-6}); do
   docker compose -f $YML down >/dev/null 2>&1

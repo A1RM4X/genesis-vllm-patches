@@ -12,7 +12,7 @@ cd /home/usuario/Proyectos/genesis-vllm-patches/compose
 YML=docker-compose.qwen38-27b-noon-w4a8-v029.yml
 NOMBRE=genesis-27b-v029
 IP=172.20.0.228:8320
-K=<REDACTADO: clave rotada 2026-09-19>
+K=${VLLM_API_KEY:?falta VLLM_API_KEY}
 N=${1:-10}
 
 pedir() {  # $1 = cuerpo json, $2 = ruta

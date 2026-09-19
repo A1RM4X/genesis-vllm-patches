@@ -5,7 +5,7 @@ CD=/home/usuario/Proyectos/genesis-vllm-patches/compose
 NOON=$CD/docker-compose.qwen38-27b-noon-w4a8.yml
 PROD=$CD/docker-compose.qwen38-27b-ar4ikov-awq.yml
 CN=genesis-27b-qwen38-ar4ikov-awq
-A="Authorization: Bearer <REDACTADO: clave rotada 2026-09-19>"
+A="Authorization: Bearer ${VLLM_API_KEY:?falta VLLM_API_KEY}"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a $R/estado.log; }
 
 arrancar(){ # $1 compose  $2 cache

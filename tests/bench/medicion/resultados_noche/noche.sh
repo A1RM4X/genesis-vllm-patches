@@ -4,7 +4,7 @@ RT=/home/usuario/Proyectos/genesis-vllm-patches/tests/bench/medicion/resultados_
 CD=/home/usuario/Proyectos/genesis-vllm-patches/compose
 G=/home/usuario/Proyectos/genesis-vllm-patches/vllm/_genesis
 CN=genesis-27b-qwen38-ar4ikov-awq
-A="Authorization: Bearer <REDACTADO: clave rotada 2026-09-19>"
+A="Authorization: Bearer ${VLLM_API_KEY:?falta VLLM_API_KEY}"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a $R/estado.log; }
 until grep -q "^\[.*\] fin" $RT/estado.log 2>/dev/null; do sleep 60; done
 bajar(){ for f in $CD/docker-compose.*.yml; do grep -q "container_name: $CN" $f && docker compose -f $f down >/dev/null 2>&1; done; docker rm -f $CN >/dev/null 2>&1; }

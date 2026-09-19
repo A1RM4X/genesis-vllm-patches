@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """TAR agregado sobre varios prompts (deltas de contadores) + textos para comparar."""
 import json, sys, time, urllib.request
-BASE="http://127.0.0.1:8320"; KEY="<REDACTADO: clave rotada 2026-09-19>"
+import os
+BASE="http://127.0.0.1:8320"; KEY=os.environ.get("VLLM_API_KEY", "")
 def met():
     r=urllib.request.Request(BASE+"/metrics",headers={"Authorization":"Bearer "+KEY}); d={}
     for l in urllib.request.urlopen(r,timeout=30).read().decode().split("\n"):

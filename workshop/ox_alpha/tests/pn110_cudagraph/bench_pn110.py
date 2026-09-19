@@ -35,6 +35,7 @@ import sys
 import time
 
 import requests
+import os
 
 HEALTH_URL_TPL = "http://{host}:{port}/health"
 CHAT_URL_TPL = "http://{host}:{port}/v1/chat/completions"
@@ -208,7 +209,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8390)
     ap.add_argument("--label", default="?", help="etiqueta del config (p.ej. SK=1)")
     ap.add_argument("--model", default="qwen3.8")
-    ap.add_argument("--api-key", default="<REDACTADO: clave rotada 2026-09-19>")
+    ap.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", ""))
     ap.add_argument("--timeout", type=int, default=480, help="segundos para /health")
     ap.add_argument("--prompt-decode-len", type=int, default=24)
     ap.add_argument("--gen-decode", type=int, default=200)
