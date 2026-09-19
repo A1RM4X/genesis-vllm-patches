@@ -462,6 +462,12 @@ KNOWN_GOOD_VLLM_PINS: tuple[str, ...] = (
     # update/v0.27.1 migration target (validated 2026-08-25, assets/vllm @ tag
     # v0.27.1 / commit 6e448d0, wiring re-anclado por categorías + composes a imagen v0.27.1)
     "0.27.1",
+    # v0.29.0 (validado 2026-09-19 en este fork): migracion completa del wiring,
+    # DFlash2 andando con PN142/PN144/PN145/PN146, calidad verificada con el
+    # quality-test.sh --quick de club-3090 (27/30, sin fallos flaky con pass@k=3)
+    # y velocidad con su bench.sh. Queda abierto el arranque roto ~8,5% que
+    # detecta el healthcheck por generacion — ver README, seccion "Status".
+    "0.29.0",
 )
 
 
