@@ -73,7 +73,17 @@ services:
       - "8360:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.251
+        # 172.20.0.228 es la direccion CANONICA de servicio de esta maquina, no una
+        # cualquiera: la tienen cableada open-webui (OPENAI_API_BASE_URLS), jspace-proxy
+        # (VLLM_BASE_HOST, que es lo que atiende llm.saitama.com.ar) y todos los
+        # conf/engines/*.conf de ../ai. Los composes de motor son mutuamente excluyentes
+        # —corre uno a la vez— asi que TODOS comparten esta IP a proposito.
+        #
+        # Este compose habia nacido con .251, que no ruteaba a ningun lado. Mientras el
+        # motor de produccion fue otro no se noto; al pasar DFlash2 a produccion se llevo
+        # el trafico a una direccion que nadie consulta y llm.saitama.com.ar empezo a dar
+        # 502. El ultimo 200 del proxy fue el 2026-09-18 17:31.
+        ipv4_address: 172.20.0.228
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
