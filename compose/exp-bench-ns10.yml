@@ -51,7 +51,7 @@ version: '3.8'
 services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
-    container_name: genesis-27b-dflash2
+    container_name: genesis-27b-bn10
     # SIN SWAP, nunca. El kernel se habia llevado a swap 1,8 GB del propio proceso servidor
     # (3,85 GB contando el cgroup entero) con el sistema en swappiness=60 y ~15 GB de cache de
     # paginas: con eso prefiere paginar anonimo antes que soltar cache. Un proceso que sirve no
@@ -69,11 +69,9 @@ services:
     mem_limit: 26g
     memswap_limit: 26g
     cpuset: "0-7,16-23"
-    ports:
-      - "8360:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.251
+        ipv4_address: 172.20.0.160
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
@@ -344,18 +342,6 @@ services:
       # early-return de allocate_new_blocks) resulto medida con una sola corrida y se
       # retracto. Ese arreglo sigue puesto y es correcto por su cuenta, pero no alcanza.
       # Costo de apagarlo: se pierde el ahorro de -9 bloques GDN por request.
-      # PN122 PRENDIDO (2026-09-19). Estaba apagado desde que se lo acuso de corromper con
-      # MTP en v0.29.0. Con DFlash2 se verifico que NO corrompe: quality-test.sh --quick da
-      # 27/30 en los dos brazos (y TC-05 + IF-04 fallan en ambos, o sea que son del modelo).
-      #
-      # Que compra: KV 526.221 -> 566.314 tokens (+7,6%), y la huella de una request CORTA
-      # baja 2,5x — el estado GDN pasa de 10 a 2 bloques por grupo Mamba, porque la formula
-      # es (2 + num_speculative_blocks) y la cinta lo pone en 0. Medido con 10 requests de
-      # 8k: el pico de KV cae de 59,1% a 23,8%.
-      #
-      # Que cuesta: -2,6% de decode, medido con A/B INTERCALADO (A/B/A/B, 3 calentamientos +
-      # 5 medidas por arranque, CV 0,05%). La deriva entre arranques del mismo brazo es 0,7%,
-      # asi que el delta se le puede creer. OJO: una sonda sin calentar habia dado -7,6%.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo
@@ -518,7 +504,7 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
       - CUDA_DEVICE_SCHEDULE=1
       - OMP_NUM_THREADS=1
-      - VLLM_API_KEY=${VLLM_API_KEY:-}
+      - VLLM_API_KEY=
       - TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
       - TRITON_CACHE_DIR=/root/.cache/triton
       - VLLM_USE_FLASHINFER_SAMPLER=1
@@ -621,17 +607,10 @@ services:
       # otro valor el parche no engancha y el KV cae al generico de vLLM.
       - --kv-cache-dtype
       - "int8_per_token_head"
-      # Se queda en 10. Medido con bench.sh (3 calentamientos + 5 medidas) el 2026-09-19:
-      # subir a 24 NO da nada en single-stream —narrativa 129,1 vs 128,0 y codigo 251,9 vs
-      # 256,0, todo dentro del CV— y cuesta 70.000 tokens de KV (566.314 -> 496.409, -12%),
-      # porque PN131 reserva acumuladores por slot. O sea que se come casi todo lo que
-      # PN122 acaba de liberar.
-      # OJO, esto contradice la nota vieja de "+35-49% con 24" y a una prueba propia de carga
-      # dominada por decode que daba 408 vs 304 tok/s agregados: esa comparacion estaba
-      # viciada porque el brazo de 10 se midio recien arrancado, sin calentar. Si alguna vez
-      # la carga real pasa a ser muchos streams cortos a la vez, hay que volver a medirlo
-      # CON calentamiento antes de subirlo.
-      # GENESIS_PN131_BMAX de arriba tiene que seguir a este numero.
+      # Vuelve a 10 para la prueba de saturacion de KV (2026-09-17). Con 24 el
+      # throughput agregado era 35-49% mayor, pero PN131 reserva acumuladores por
+      # slot y con 10 queda mas KV libre. GENESIS_PN131_BMAX de arriba tiene que
+      # seguir a este numero.
       - --max-num-seqs
       - "10"
       - --tensor-parallel-size
@@ -789,8 +768,6 @@ services:
       - "0.0.0.0"
       - --port
       - "8320"
-      - --api-key
-      - "${VLLM_API_KEY:-}"
 
 networks:
   lanbridge:
