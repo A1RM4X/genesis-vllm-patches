@@ -82,6 +82,15 @@ def cargar() -> None:
         log.error("[PN144] no se pudo escalar el residual del borrador DFlash2 (%s: %s). "
                   "En fp16 el borrador va a dar NaN y aceptar 0.", type(e).__name__, e)
 
+    if _prendido("GENESIS_DIAG_KV"):
+        try:
+            from vllm._genesis.diag_kv import enganchar as _eng_kv
+
+            _eng_kv()
+        except Exception as e:                                   # noqa: BLE001
+            log.error("[DIAG KV] no se pudo enganchar el volcado de KVCacheConfig (%s: %s)",
+                      type(e).__name__, e)
+
     if _prendido("GENESIS_DIAG_DFLASH"):
         try:
             from vllm._genesis.diag_dflash import enganchar as _eng_dflash
