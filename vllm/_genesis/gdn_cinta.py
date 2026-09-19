@@ -406,7 +406,25 @@ _sombra_nuevos: set = set()
 def _sombra_antes(layer, ssm_state, sidx, nacc, slots, N):
     """Estado upstream: K+1 columnas por slot. La columna 0 de la sombra se toma
     del estado real SOLO en el primer paso spec del request (estado de prefill);
-    despues la sombra evoluciona sola con el kernel de upstream y se compara."""
+    despues la sombra evoluciona sola con el kernel de upstream y se compara.
+
+    OJO CON LEER ``estado(antes)``: me hizo sacar una conclusion falsa (2026-09-19).
+    Compara ``h[1 + slot*K1 + acc - 1]`` — el estado de UPSTREAM despues de acc-1 tokens —
+    contra ``ssm_state[s]`` — el de PN122 despues del token 0. Esos dos solo coinciden cuando
+    ``acc == 1``: para acc>1 TIENEN que diferir, porque PN122 recupera la diferencia
+    reproduciendo la cinta, que es exactamente lo que el parche hace. Las muestras con acc>1
+    no se pueden leer como error.
+
+    Y aun con acc==1 el numero mezcla el error del paso con la DERIVA ACUMULADA: la sombra
+    evoluciona sola desde que se siembra, asi que cualquier paso que el hook no vea (prefill,
+    decode sin spec) la deja atras sin que la cinta tenga la culpa.
+
+    Para decidir si PN122 esta bien NO alcanza ni esto ni comparar texto greedy: un error de
+    1e-4 alcanza para dar vuelta un argmax y hacer divergir el texto sin que haya nada roto.
+    Lo que si discrimina es la TASA DE ACEPTACION del spec decode, que se derrumbaria si el
+    estado estuviera corrupto. Medido 2026-09-19 con DFlash2 K=8: 5,37 a 1k y 5,17 a 50k con
+    PN122, contra 5,15-5,69 y 4,64-5,46 sin el. Dentro del rango: no hay corrupcion.
+    """
     K1 = layer.num_spec + 1
     key = layer.prefix
     if key not in _sombra:

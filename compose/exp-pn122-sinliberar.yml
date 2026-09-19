@@ -51,7 +51,7 @@ version: '3.8'
 services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
-    container_name: genesis-27b-pn122
+    container_name: genesis-27b-pn122-sl
     # SIN SWAP, nunca. El kernel se habia llevado a swap 1,8 GB del propio proceso servidor
     # (3,85 GB contando el cgroup entero) con el sistema en swappiness=60 y ~15 GB de cache de
     # paginas: con eso prefiere paginar anonimo antes que soltar cache. Un proceso que sirve no
@@ -70,10 +70,10 @@ services:
     memswap_limit: 26g
     cpuset: "0-7,16-23"
     ports:
-      - "8384:8320"
+      - "8386:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.150
+        ipv4_address: 172.20.0.152
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
@@ -346,6 +346,7 @@ services:
       # retracto. Ese arreglo sigue puesto y es correcto por su cuenta, pero no alcanza.
       # Costo de apagarlo: se pierde el ahorro de -9 bloques GDN por request.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
+      - GENESIS_PN122_SIN_LIBERAR=1
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo
       # habia medido mal): el cruce esta entre 4992 (0,93x) y 5824 (1,04x).
