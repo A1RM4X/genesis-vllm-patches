@@ -715,11 +715,21 @@ services:
       - --async-scheduling
       - --scheduling-policy
       - priority
+      # K=8 (num_speculative_tokens): cuantos tokens propone el borrador por paso, que el
+      # target verifica en UNA pasada. Medido en este rig, decode tok/s:
+      #        1k                      50k
+      #   K=7  242,7  accept 5,69      196,2  accept 5,26
+      #   K=8  250,6  accept 5,72      200,7  accept 5,21
+      #   K=9  285,2  accept 6,42      185,6  accept 5,08
+      # K=9 gana 17% en contexto corto y PIERDE 8% a 50k: cada token propuesto de mas se
+      # verifica aunque se rechace, y a contexto largo esa verificacion cuesta mas que lo que
+      # rinde la cola de la aceptacion. La carga real de opencode vive en 60-100k, asi que el
+      # optimo es K=8. Si alguna vez el uso se corre a prompts cortos, K=9 es mejor ahi.
       - --speculative-config
       # DFlash2: borrador EXTERNO (syvai/Qwen3.8-27B-DFlash2-W4A16, 5 capas, 1,2 GB) en vez
       # del cabezal MTP interno. K=7 es el default de club-3090 para este borrador.
       # La arquitectura DFlash2DraftModel es nativa desde v0.28.0; lo que falta lo pone PN142.
-      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":7,"kv_cache_dtype":"auto"}'
+      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":8,"kv_cache_dtype":"auto"}'
       - --host
       - "0.0.0.0"
       - --port
