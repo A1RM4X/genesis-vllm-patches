@@ -51,7 +51,7 @@ version: '3.8'
 services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
-    container_name: genesis-27b-dflash2
+    container_name: genesis-27b-g16
     # SIN SWAP, nunca. El kernel se habia llevado a swap 1,8 GB del propio proceso servidor
     # (3,85 GB contando el cgroup entero) con el sistema en swappiness=60 y ~15 GB de cache de
     # paginas: con eso prefiere paginar anonimo antes que soltar cache. Un proceso que sirve no
@@ -70,10 +70,10 @@ services:
     memswap_limit: 26g
     cpuset: "0-7,16-23"
     ports:
-      - "8360:8320"
+      - "8381:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.251
+        ipv4_address: 172.20.0.231
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
@@ -296,16 +296,10 @@ services:
       # grupo MAS GRANDE (un max, no una suma), bajarlo a 4 da mas bloques totales: 2689 en
       # vez de 2151. Con 4 quedan 18 grupos y no se paga nada en el scheduler — a 50k dio
       # 201,7 tok/s, el mejor de toda la serie.
+      - GENESIS_DIAG_KV=1
       - GENESIS_ENABLE_PN145_SW_BLOCK_SIZE=1
       - GENESIS_ENABLE_PN146_GROUP_SIZE=1
-      # Medido con 10 requests de 8k en paralelo, que es la forma de la carga real:
-      #   g=4  18 grupos  KV 526.414  43,4 tok/s agregado
-      #   g=8   9 grupos  KV 526.221  49,6 tok/s   <- misma KV, +14%
-      #   g=16  5 grupos  KV 509.308  51,3 tok/s   <- 3% mas rapido, 17k tokens menos de KV
-      # g=8 es el punto dulce. La KV total casi no se mueve entre 4 y 8 porque el costo en
-      # BYTES es el mismo (menos grupos, pero cada bloque mas grande); lo que mejora es el
-      # trabajo por request, que baja de 912 bloques a 678.
-      - GENESIS_PN146_GROUP_SIZE=8
+      - GENESIS_PN146_GROUP_SIZE=16
       - GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER=1
       # PN129: buffer de decode de FlashInfer sin pin (Xid 31 VIRT_READ con >=4 requests MTP; visto 2026-09-13).
       - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=0
