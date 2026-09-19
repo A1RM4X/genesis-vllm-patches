@@ -117,27 +117,27 @@ services:
       - GENESIS_ENABLE_PN90_KV_DISK_WRITE_GATING=1
       - GENESIS_PN90_MAX_PENDING_MB=256
       - GENESIS_ENABLE_PN91_KV_LAZY_STREAMING=1
-      # 2026-09-19: ERA EL BUG QUE HACIA QUE EL OFFLOAD ESCRIBIERA Y NUNCA LEYERA.
-      # 0,2 s / 4 pasos es MAS CORTO que una promocion L3->L2. Medido en el rescate de un
-      # prompt de 20k desalojado de la GPU: los dos grupos de atencion aciertan 39/39
-      # chunks y el grupo de ventana deslizante del borrador DFlash2 queda en HIT_PENDING
-      # —esta en cache, la lectura de disco sigue en vuelo—. Al 5o paso PN91 arma el modo
-      # estricto, un bloque en vuelo pasa a contar como MISS, se corta la racha de la
-      # ventana y el lookup ENTERO devuelve 0: un grupo veta el acierto de los otros ocho.
-      # O sea que se abortaba un rescate de 6,7 s por no esperarle dos decimas al disco.
-      # Con 3 s / 60 pasos: TTFT 6,76 -> 0,97 s (-85,6%), 612 MiB de vuelta por CPU_to_GPU
-      # y el primer external_prefix_cache_hits distinto de cero del proyecto.
       # 2026-09-19: PN97 prohibe que una promocion L3->L2 desaloje ("solo slots realmente
       # libres"). Se escribio cuando L2 tenia 222 slots y un prompt costaba ~36: entraban
       # seis y la regla era sana. PN145/PN146 subieron el bloque de GPU a 880 tokens, el
       # slot de offload quedo en 29,8 MB y L2 en 72 slots, con ~28 por request: ahora L2
       # vive clavada al 100% (bytes_used == capacity_bytes) y "solo slots libres" significa
-      # NUNCA. Medido: 7.347 consultas al tier primario contra 32 al de disco — el lookup
-      # muere en L2 y a L3 no se lo consulta, por eso escribia 50 GB y no leia un byte.
-      # Mientras L2 no entre al menos un par de requests, PN97 es un interbloqueo.
+      # NUNCA. Medido: 7.347 consultas al tier primario contra 32 al de disco (1 acierto);
+      # apagandolo, 73 consultas y 42 aciertos. Mientras L2 no entre al menos un par de
+      # requests, PN97 es un interbloqueo.
       - GENESIS_DISABLE_PN97=1
-      - GENESIS_PN91_MAX_DEFER_SECONDS=3.0
-      - GENESIS_PN91_MAX_DEFER_STEPS=60
+      # 2026-09-19: ERA EL BUG QUE HACIA QUE EL OFFLOAD ESCRIBIERA Y NUNCA LEYERA, y el
+      # presupuesto hay que darlo con holgura. PN91 pasa a modo estricto al agotarse, y en
+      # estricto un bloque EN VUELO cuenta como MISS: corta la racha de la ventana
+      # deslizante y el lookup ENTERO devuelve 0. Las promociones L3->L2 son asincronas y
+      # resuelven de a poco, asi que con 0,2 s / 4 pasos no resolvia ninguna y con 3 s / 60
+      # resolvia solo una parte (medido: el prefijo de atencion acertaba 0, 8, 12 o 16 de 20
+      # chunks segun la corrida, y cualquier truncado lo vetaba algun grupo de ventana).
+      # Con 15 s / 400 aciertan los NUEVE grupos, 20/20 y 19/19, de forma reproducible.
+      # No cuesta latencia en el caso malo: sin nada en cache el backend devuelve MISS al
+      # toque, no HIT_PENDING. Medido, TTFT en frio 6,76-6,81 s, igual que antes.
+      - GENESIS_PN91_MAX_DEFER_SECONDS=15.0
+      - GENESIS_PN91_MAX_DEFER_STEPS=400
       - GENESIS_ENABLE_PN92_KV_FP4_COMPRESSION=1
       - GENESIS_PN92_COMPRESS_ON_WRITE=0
       - GENESIS_PN92_KV_DTYPE=fp8_e4m3

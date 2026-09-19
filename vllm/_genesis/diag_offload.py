@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Diagnostico del offload de KV: por que se escribia a L2/L3 y nunca se leia.
 
-RESUELTO EN PARTE el 2026-09-19. Esto documenta lo que la instrumentacion encontro, porque
+RESUELTO el 2026-09-19. Esto documenta lo que la instrumentacion encontro, porque
 hasta ese dia el archivo apostaba a la hipotesis equivocada (que cortaba el pre-chequeo del
 lookup). No era eso: el lookup pedia bien y el backend no tenia nada, por tres causas
 INDEPENDIENTES que habia que sacar en orden. Las tres eran parches nuestros.
@@ -15,13 +15,20 @@ INDEPENDIENTES que habia que sacar en orden. Las tres eran parches nuestros.
    lo consulta. Medido: 7.347 consultas al tier primario contra 32 al de disco, 1 acierto.
    Con GENESIS_DISABLE_PN97=1: 73 consultas y 42 aciertos en L3.
 
-2. PN91 — el presupuesto mas corto que el disco
-   GENESIS_PN91_MAX_DEFER_SECONDS=0,2 con _STEPS=4. Una promocion L3->L2 tarda mas que eso.
-   Al 5o paso PN91 arma el modo estricto, un bloque EN VUELO pasa a contar como MISS, se
-   corta la racha de la ventana deslizante y el lookup ENTERO devuelve 0. O sea: se abortaba
-   un rescate que ahorra 6,7 s por no esperarle dos decimas al disco. A 3,0 s / 60 pasos el
-   rescate completo anda: TTFT 6,76 -> 0,97 s (-85,6%), 612 MiB por CPU_to_GPU y el primer
-   external_prefix_cache_hits distinto de cero del proyecto.
+2. PN91 — el presupuesto mas corto que el disco  (ERA LA CAUSA PRINCIPAL)
+   GENESIS_PN91_MAX_DEFER_SECONDS=0,2 con _STEPS=4. Al agotarse, PN91 pasa a modo estricto,
+   y en estricto un bloque EN VUELO (HIT_PENDING) cuenta como MISS: corta la racha de
+   `_sliding_window_lookup` y el lookup ENTERO devuelve 0. Las promociones L3->L2 son
+   asincronas y resuelven DE A POCO, una tanda por pasada del scheduler, asi que el
+   presupuesto hay que darlo con mucha holgura:
+
+       0,2 s /   4 pasos  ->  no resolvia ninguna; el offload nunca leyo un byte
+       3   s /  60 pasos  ->  resolvia una parte, y variaba por corrida: el prefijo de
+                              atencion acertaba 0, 8, 12 o 16 de 20 chunks
+      15   s / 400 pasos  ->  aciertan los NUEVE grupos, 20/20 y 19/19, reproducible
+
+   No cuesta latencia en el caso malo: sin nada en cache el backend devuelve MISS al toque,
+   no HIT_PENDING. TTFT en frio 6,76-6,88 s, igual que antes del cambio.
 
 3. PN81 — L3 mas chico que L1, y podando al reves
    La cuota eran 30 GB. La KV de GPU son 566.314 tokens y el offload escribe 62,9 KB por
@@ -30,24 +37,25 @@ INDEPENDIENTES que habia que sacar en orden. Las tres eran parches nuestros.
    que la primera victima es justo el prefijo del hilo largo. A 64 GB desaparecen los
    desalojos de disco.
 
-LO QUE QUEDA ABIERTO: el veto del grupo del borrador
-   `_lookup_complete_chunks` exige que acierten TODOS los grupos. Con L2 de 2 GiB el prefijo
-   de atencion acierta parcial (g6 8 de 20 chunks; con 6 GiB, 16 de 20) y el hit se trunca a
-   ese limite. Pero del grupo de ventana deslizante del borrador DFlash2 upstream guarda
-   SOLO la cola alcanzable —ver `is_store_reachable_swa_chunk`: `sliding_window + 1` chunks
-   al final de cada segmento—, que corresponde al final REAL de la request, no al chunk 8.
-   Entonces `('ventana4', N, 0)` da MISS y veta los 15 chunks que los otros ocho grupos SI
-   acertaron. Solo un acierto de prefijo del 100% sobrevive, y por eso el test chico
-   (L1 de 101k tokens, 8 prompts de desalojo) anda y el de produccion no.
+RESULTADO: rescate de un prompt de 20k desalojado de la GPU, TTFT 6,88 -> 1,21 s (-82,5%),
+612 MiB por CPU_to_GPU, salida identica a la del acierto de L1. Tres corridas seguidas con
+disco limpio y reinicio: 1,21 / 1,24 / 1,28 s.
 
-   Las dos salidas, ninguna probada todavia:
-     a) que L2 entre un par de requests enteras, para que el prefijo acierte 100%. Cuesta
-        RAM de la placa madre, que es justo lo que el proyecto no quiere gastar. Medido que
-        va en la direccion correcta (8/20 -> 16/20 al triplicar L2) pero no cruzo el umbral.
-     b) sacarle el veto al grupo del borrador: es especulativo, un estado equivocado solo
-        hace que el target rechace las propuestas —la salida sigue siendo correcta— a cambio
-        de menos aceptacion. Mucho mas barato que recomputar 20k tokens. Riesgo: leer
-        bloques sin inicializar, que en este proyecto ya dio NaN silenciosos antes (PN144).
+DOS CALLEJONES SIN SALIDA, anotados para no repetirlos
+------------------------------------------------------
+* "El grupo del borrador veta el acierto de los demas, hay que sacarle el veto." FALSO.
+  Con el presupuesto de PN91 en 3 s el lookup daba `('ventana4', N, 0)` y yo lo lei como
+  "el borrador no tiene nada guardado, y no puede tenerlo porque sus chunks viejos tienen
+  block_id 0 y `_build_store_jobs` los saltea". Llegue a escribir el parche (PN147, tres
+  anclajes) y a medir un rescate exitoso con el. Pero era n=1 y NO REPRODUJO. Con el
+  presupuesto en 15 s y PN147 APAGADO el mismo grupo contesta `('ventana4', 19, 19)`: los
+  datos estaban siempre, el 0 era el modo estricto de PN91 contando lo que estaba en vuelo.
+  PN147 se borro del arbol: su text-patch tocaba tres anclajes de upstream de forma
+  incondicional a cambio de nada.
+* "El anillo de staging de PN100 se lleva 32 de los 72 slots de L2, liberarlo da +44%."
+  PEOR. Con GENESIS_DISABLE_PN100=1 el prefijo de atencion paso de 12/20 a 0/20: el anillo
+  acota el trafico efimero y por eso PROTEGE el prefijo del hilo largo, que es literalmente
+  lo que dice su docstring. Queda en 32.
 
 Esto vuelca, por cada lookup, el resultado de cada grupo (tipo de spec, ventana, chunks
 pedidos, chunks que contesto el backend) y cual fue la salida. Se prende con
