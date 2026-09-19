@@ -51,13 +51,13 @@ version: '3.8'
 services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
-    container_name: genesis-27b-dflash2
+    container_name: genesis-27b-dflash2-nan
     cpuset: "0-7,16-23"
     ports:
-      - "8360:8320"
+      - "8368:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.251
+        ipv4_address: 172.20.0.245
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
@@ -257,14 +257,9 @@ services:
       # --speculative-config al metodo dflash. Con MTP, la mitad de fa5017a5 no cambia nada:
       # "mtp" esta en el conjunto que SI preserva la KV del target.
       - GENESIS_ENABLE_PN142_DFLASH2=1
-      # PN144: divide por 32 el residual del borrador (o_proj/down_proj de las 5 capas, la
-      # semilla del embedding, y el epsilon de las 11 normas que lo ven, por c^2). Sin esto
-      # el borrador desborda fp16 despues de UNA capa —su residual corre ~100x mas caliente
-      # que un modelo normal, pico 50.080 contra un techo de 65.504— da NaN y acepta 0. La
-      # alternativa era --dtype bfloat16, que es global y nos sacaba de PN130/W4A8/KV int8:
-      # costaba -13% de decode y +40% de TTFT a 50k. Esto es exacto (la norma es invariante
-      # a escala) y no cuesta nada: 10 tensores de escalas divididos una vez al cargar.
-      - GENESIS_PN144_ESCALA_RESIDUAL=32
+      - GENESIS_PN142_DIAG=1
+      - GENESIS_DIAG_DFLASH=1
+      - GENESIS_DIAG_DFLASH_NAN=1
       - GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER=1
       # PN129: buffer de decode de FlashInfer sin pin (Xid 31 VIRT_READ con >=4 requests MTP; visto 2026-09-13).
       - GENESIS_ENABLE_PN129_FLASHINFER_DECODE_UNPIN=0
@@ -385,7 +380,6 @@ services:
       # Manda las activaciones a Marlin en int8 en vez de fp16. Es lo que habilita
       # el mma entero (m16n8k32.s8), que consume el doble de K por instruccion que
       # el HMMA de fp16. Sin esto el peso se desempaqueta a fp16 y se pierde todo.
-      - VLLM_MARLIN_INPUT_DTYPE=int8
       #
       # PN125: red de contencion para las escalas NEGATIVAS de AutoRound. El Marlin
       # oficial asume escalas positivas y con estas devuelve BASURA SILENCIOSA (sin
@@ -428,7 +422,7 @@ services:
       - VLLM_LOGGING_CONFIG_PATH=/root/.cache/vllm/genesis_logs/logging.json
       # Solo para cazar el arranque roto; prender a mano cuando haga falta (ver diag_lm_head.py)
       - GENESIS_DIAG_LMHEAD=0
-      - GENESIS_ENABLE_PN131_SK18=1
+      - GENESIS_ENABLE_PN131_SK18=0
       # PN131 por el registro nativo de backends en vez de por cirugia de texto.
       # Antes: 5 anclas dentro de triton_attn.py, un archivo que upstream movio 81 lineas
       # entre v0.27.1 y v0.29.0. Ahora: UNA ancla en el cuerpo de load_general_plugins()
@@ -553,6 +547,7 @@ services:
       - compressed-tensors
       - --chat-template
       - /etc/qwen-froggeric-chat-template.jinja
+      - --enforce-eager
       - --dtype
       - float16
       - --mamba-ssm-cache-dtype
@@ -567,7 +562,7 @@ services:
       # Es el nombre exacto que mira PN131 para elegir su camino: con cualquier
       # otro valor el parche no engancha y el KV cae al generico de vLLM.
       - --kv-cache-dtype
-      - "int8_per_token_head"
+      - "auto"
       # Vuelve a 10 para la prueba de saturacion de KV (2026-09-17). Con 24 el
       # throughput agregado era 35-49% mayor, pero PN131 reserva acumuladores por
       # slot y con 10 queda mas KV libre. GENESIS_PN131_BMAX de arriba tiene que
@@ -703,7 +698,7 @@ services:
       # DFlash2: borrador EXTERNO (syvai/Qwen3.8-27B-DFlash2-W4A16, 5 capas, 1,2 GB) en vez
       # del cabezal MTP interno. K=7 es el default de club-3090 para este borrador.
       # La arquitectura DFlash2DraftModel es nativa desde v0.28.0; lo que falta lo pone PN142.
-      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":7,"kv_cache_dtype":"auto"}'
+      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16","num_speculative_tokens":7}'
       - --host
       - "0.0.0.0"
       - --port

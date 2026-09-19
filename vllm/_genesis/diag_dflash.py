@@ -73,6 +73,58 @@ def _pesos_compartidos(self) -> str:
     return " | ".join(partes) if partes else "no encontre ninguno"
 
 
+def cazar_nan(modelo, etiqueta: str = "borrador") -> None:
+    """Engancha TODOS los submodulos y denuncia el PRIMERO que saca NaN con entrada finita.
+
+    Por que hace falta en vez de razonar: el borrador termina escupiendo NaN en fp16 y anda
+    en bf16, y es facil armar una historia convincente sobre donde desborda. La primera que
+    arme (la suma de cuadrados de `hidden_norm`, con picos de 12.000 al cuadrado pasandose de
+    65.504) era falsa: `ops.rms_norm` acumula la varianza en fp32. Sin saber el modulo exacto,
+    "arreglarlo" es adivinar.
+
+    OJO: esto SINCRONIZA en cada modulo. Solo sirve con los grafos CUDA apagados
+    (--enforce-eager) y para una corrida de diagnostico.
+    """
+    import torch
+
+    # Traza de la PRIMERA pasada, en orden de ejecucion y con los modulos limpios tambien.
+    # Mirar solo los que ensucian no alcanza: la primera corrida mostro layer 1 recibiendo un
+    # (1) NaN sin que ningun modulo de layer 0 lo hubiera producido, porque lo que ensucia
+    # puede ser una op que NO es un modulo (una suma residual, una conv funcional) o un
+    # buffer precargado. Con la cuenta de NaN entrando y saliendo de cada modulo en orden, el
+    # salto de 0 a 1 queda entre dos lineas concretas.
+    corridas = {"n": 0}
+    TOPE = int(os.environ.get("GENESIS_DIAG_DFLASH_TRAZA", "260"))
+
+    def _cuenta(x) -> int:
+        if isinstance(x, torch.Tensor) and x.is_floating_point():
+            return int(torch.isnan(x).sum() + torch.isinf(x).sum())
+        if isinstance(x, (list, tuple)):
+            return sum(_cuenta(y) for y in x)
+        if isinstance(x, dict):
+            return sum(_cuenta(y) for y in x.values())
+        return 0
+
+    def _hook(nombre):
+        def f(_mod, entrada, kw, salida):
+            if corridas["n"] >= TOPE:
+                return
+            corridas["n"] += 1
+            ent = _cuenta(entrada) + _cuenta(kw)
+            sal = _cuenta(salida)
+            log.warning("[traza %s] %3d %-52s NaN entra=%d sale=%d | %s",
+                        etiqueta, corridas["n"], nombre, ent, sal,
+                        _stats(salida[0] if isinstance(salida, tuple) and salida else salida))
+        return f
+
+    n = 0
+    for nombre, mod in modelo.named_modules():
+        if nombre:
+            mod.register_forward_hook(_hook(nombre), with_kwargs=True)
+            n += 1
+    log.warning("[NaN %s] cazador puesto sobre %d submodulos", etiqueta, n)
+
+
 def enganchar() -> None:
     """Envuelve ``propose`` de los especuladores DFlash. No puede tumbar el arranque."""
     import inspect
@@ -100,6 +152,10 @@ def enganchar() -> None:
             if not estado["pesos"]:
                 estado["pesos"] = True
                 log.warning("[DIAG dflash] pesos compartidos -> %s", _pesos_compartidos(self))
+                if os.environ.get("GENESIS_DIAG_DFLASH_NAN") == "1":
+                    # Recien aca: antes de la primera pasada real el modelo todavia no
+                    # existe. Los hooks entran en vigor desde la llamada siguiente.
+                    cazar_nan(self.model, "borrador")
 
             fila = (salida[0].tolist()
                     if isinstance(salida, torch.Tensor) and salida.numel() else [])

@@ -51,13 +51,13 @@ version: '3.8'
 services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
-    container_name: genesis-27b-dflash2
+    container_name: genesis-27b-dflash2-a16b
     cpuset: "0-7,16-23"
     ports:
-      - "8360:8320"
+      - "8371:8320"
     networks:
       lanbridge:
-        ipv4_address: 172.20.0.251
+        ipv4_address: 172.20.0.242
     volumes:
       # Caché de modelos HuggingFace host
       - /home/usuario/Proyectos/models-cache:/root/.cache/huggingface
@@ -257,13 +257,6 @@ services:
       # --speculative-config al metodo dflash. Con MTP, la mitad de fa5017a5 no cambia nada:
       # "mtp" esta en el conjunto que SI preserva la KV del target.
       - GENESIS_ENABLE_PN142_DFLASH2=1
-      # PN144: divide por 32 el residual del borrador (o_proj/down_proj de las 5 capas, la
-      # semilla del embedding, y el epsilon de las 11 normas que lo ven, por c^2). Sin esto
-      # el borrador desborda fp16 despues de UNA capa —su residual corre ~100x mas caliente
-      # que un modelo normal, pico 50.080 contra un techo de 65.504— da NaN y acepta 0. La
-      # alternativa era --dtype bfloat16, que es global y nos sacaba de PN130/W4A8/KV int8:
-      # costaba -13% de decode y +40% de TTFT a 50k. Esto es exacto (la norma es invariante
-      # a escala) y no cuesta nada: 10 tensores de escalas divididos una vez al cargar.
       - GENESIS_PN144_ESCALA_RESIDUAL=32
       - GENESIS_ENABLE_PN128_GDN_MTP_ASYNC_ORDER=1
       # PN129: buffer de decode de FlashInfer sin pin (Xid 31 VIRT_READ con >=4 requests MTP; visto 2026-09-13).
@@ -385,7 +378,6 @@ services:
       # Manda las activaciones a Marlin en int8 en vez de fp16. Es lo que habilita
       # el mma entero (m16n8k32.s8), que consume el doble de K por instruccion que
       # el HMMA de fp16. Sin esto el peso se desempaqueta a fp16 y se pierde todo.
-      - VLLM_MARLIN_INPUT_DTYPE=int8
       #
       # PN125: red de contencion para las escalas NEGATIVAS de AutoRound. El Marlin
       # oficial asume escalas positivas y con estas devuelve BASURA SILENCIOSA (sin

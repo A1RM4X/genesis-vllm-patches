@@ -72,6 +72,16 @@ def cargar() -> None:
             log.error("[DIAG] no se pudo enganchar la firma de lm_head (%s: %s)",
                       type(e).__name__, e)
 
+    # PN144 va ANTES del diagnostico: engancha load_weights, que corre despues igual, pero
+    # asi el orden en el log cuenta la historia en el orden en que pasan las cosas.
+    try:
+        from vllm._genesis import dflash2_escala
+
+        dflash2_escala.enganchar()
+    except Exception as e:                                       # noqa: BLE001
+        log.error("[PN144] no se pudo escalar el residual del borrador DFlash2 (%s: %s). "
+                  "En fp16 el borrador va a dar NaN y aceptar 0.", type(e).__name__, e)
+
     if _prendido("GENESIS_DIAG_DFLASH"):
         try:
             from vllm._genesis.diag_dflash import enganchar as _eng_dflash
