@@ -82,6 +82,14 @@ def cargar() -> None:
         log.error("[PN144] no se pudo escalar el residual del borrador DFlash2 (%s: %s). "
                   "En fp16 el borrador va a dar NaN y aceptar 0.", type(e).__name__, e)
 
+    if _prendido("GENESIS_DIAG_OFFLOAD"):
+        try:
+            from vllm._genesis.diag_offload import enganchar as _eng_off
+
+            _eng_off()
+        except Exception as e:                                   # noqa: BLE001
+            log.error("[DIAG offload] no se pudo enganchar (%s: %s)", type(e).__name__, e)
+
     if _prendido("GENESIS_DIAG_KV"):
         try:
             from vllm._genesis.diag_kv import enganchar as _eng_kv
