@@ -172,10 +172,19 @@ Kept deliberately honest — these are the things a reader would otherwise disco
   pin-gate warning; that is expected, not a fault.
 - **About 8.5% of boots on 0.29.0 came up broken** — the model emits two tokens and stops.
   The generation-based healthcheck catches it. Root cause still open.
-- **The KV offload tiers write but never read.** L2 (RAM) and L3 (NVMe) receive evicted
-  blocks — 50 GB measured in a single run — and the lookup has never returned a hit. It
-  requires all nine KV-cache groups to match, and six of them are recurrent groups with a
-  one-chunk window. Diagnosis in `vllm/_genesis/diag_offload.py`.
+- **KV offload reads now work, but only on a 100% prefix hit.** Until 2026-09-19 the tiers
+  wrote 50 GB per run and the lookup had never returned a single hit. Three of this
+  project's own patches were responsible, and all three are fixed: `PN97` refused every
+  L3→L2 promotion once L2 was permanently full (disk tier queried 32 times vs 7 347 for
+  RAM); `PN91`'s 0.2 s deferral budget was shorter than a disk promotion, so an in-flight
+  block was scored as a miss and vetoed the whole lookup; and `PN81`'s 30 GB quota made L3
+  **smaller than L1** while pruning by write age. Rescue of an evicted 20K prompt now costs
+  **0.97 s instead of 6.76 s (−85.6%)**, returning 612 MiB over `CPU_to_GPU`.
+  What is still open: `_lookup_complete_chunks` requires *all nine* groups to hit, and
+  upstream stores only the reachable tail of a sliding-window group. So when the attention
+  prefix hits partially (16 of 20 chunks at production sizing), the DFlash2 drafter's group
+  misses at that truncated boundary and vetoes the other eight groups' hits. Full analysis
+  and the two candidate fixes are in `vllm/_genesis/diag_offload.py`.
 - **PCIe links negotiate gen4 ×8, not ×16** on this machine. Every number above was measured
   under that constraint.
 

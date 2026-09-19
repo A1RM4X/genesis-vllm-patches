@@ -92,7 +92,15 @@ services:
     environment:
       # ── PARCHES GENESIS (ESTABILIDAD Y NAVEGACIÓN AGÉNTICA) ──────────────────────
       - GENESIS_ENABLE_PN81_KV_DISK_QUOTA=1
-      - GENESIS_KV_DISK_MAX_GB=30
+      # 2026-09-19: 30 GB dejaba a L3 MAS CHICO QUE L1 y lo volvia inutil. Medido: la KV
+      # de GPU son 566.314 tokens y el offload escribe 62,9 KB por token, asi que espejar
+      # L1 entero pide 35,6 GB. Con 30 de cuota, todo lo que sale de la GPU desborda el
+      # disco enseguida —541 desalojos en una sola corrida de 30 prompts de 20k— y como
+      # PN81 poda por mtime (lo mas viejo primero) la victima es justo el prefijo del hilo
+      # largo, que es lo unico que valia la pena guardar. 64 GB = 1,8x L1, y el disco tiene
+      # 229 GB libres. OJO: podar por mtime es antiguedad de ESCRITURA, no de uso; con la
+      # cuota holgada pesa menos, pero sigue siendo la politica equivocada para un cache.
+      - GENESIS_KV_DISK_MAX_GB=64
       - GENESIS_KV_DISK_CHECK_SECS=60
       - GENESIS_KV_DISK_ORPHAN_DAYS=3
       - GENESIS_KV_DISK_ORPHAN_CHECK_SECS=3600
@@ -109,8 +117,27 @@ services:
       - GENESIS_ENABLE_PN90_KV_DISK_WRITE_GATING=1
       - GENESIS_PN90_MAX_PENDING_MB=256
       - GENESIS_ENABLE_PN91_KV_LAZY_STREAMING=1
-      - GENESIS_PN91_MAX_DEFER_SECONDS=0.2
-      - GENESIS_PN91_MAX_DEFER_STEPS=4
+      # 2026-09-19: ERA EL BUG QUE HACIA QUE EL OFFLOAD ESCRIBIERA Y NUNCA LEYERA.
+      # 0,2 s / 4 pasos es MAS CORTO que una promocion L3->L2. Medido en el rescate de un
+      # prompt de 20k desalojado de la GPU: los dos grupos de atencion aciertan 39/39
+      # chunks y el grupo de ventana deslizante del borrador DFlash2 queda en HIT_PENDING
+      # —esta en cache, la lectura de disco sigue en vuelo—. Al 5o paso PN91 arma el modo
+      # estricto, un bloque en vuelo pasa a contar como MISS, se corta la racha de la
+      # ventana y el lookup ENTERO devuelve 0: un grupo veta el acierto de los otros ocho.
+      # O sea que se abortaba un rescate de 6,7 s por no esperarle dos decimas al disco.
+      # Con 3 s / 60 pasos: TTFT 6,76 -> 0,97 s (-85,6%), 612 MiB de vuelta por CPU_to_GPU
+      # y el primer external_prefix_cache_hits distinto de cero del proyecto.
+      # 2026-09-19: PN97 prohibe que una promocion L3->L2 desaloje ("solo slots realmente
+      # libres"). Se escribio cuando L2 tenia 222 slots y un prompt costaba ~36: entraban
+      # seis y la regla era sana. PN145/PN146 subieron el bloque de GPU a 880 tokens, el
+      # slot de offload quedo en 29,8 MB y L2 en 72 slots, con ~28 por request: ahora L2
+      # vive clavada al 100% (bytes_used == capacity_bytes) y "solo slots libres" significa
+      # NUNCA. Medido: 7.347 consultas al tier primario contra 32 al de disco — el lookup
+      # muere en L2 y a L3 no se lo consulta, por eso escribia 50 GB y no leia un byte.
+      # Mientras L2 no entre al menos un par de requests, PN97 es un interbloqueo.
+      - GENESIS_DISABLE_PN97=1
+      - GENESIS_PN91_MAX_DEFER_SECONDS=3.0
+      - GENESIS_PN91_MAX_DEFER_STEPS=60
       - GENESIS_ENABLE_PN92_KV_FP4_COMPRESSION=1
       - GENESIS_PN92_COMPRESS_ON_WRITE=0
       - GENESIS_PN92_KV_DTYPE=fp8_e4m3
