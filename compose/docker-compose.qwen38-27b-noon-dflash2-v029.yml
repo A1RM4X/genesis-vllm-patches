@@ -52,13 +52,22 @@ services:
   vllm-server:
     image: vllm/vllm-openai:v0.29.0
     container_name: genesis-27b-dflash2
-    # El kernel saco a swap 1,8 GB del PROPIO proceso servidor (workers 524+520 MB,
-    # EngineCore 198, API 561) porque el sistema tiene swappiness=60, 30,5 GB de RAM y ~15 GB
-    # de cache de paginas: con esa configuracion prefiere paginar anonimo antes que soltar
-    # cache. Un proceso que sirve no puede estar en swap — el bench de club-3090 directamente
-    # invalida toda la corrida cuando lo detecta ("every number in this run is suspect").
-    # mem_swappiness: 0 se lo prohibe SOLO a este contenedor, sin tocar el sistema.
-    mem_swappiness: 0
+    # SIN SWAP, nunca. El kernel se habia llevado a swap 1,8 GB del propio proceso servidor
+    # (3,85 GB contando el cgroup entero) con el sistema en swappiness=60 y ~15 GB de cache de
+    # paginas: con eso prefiere paginar anonimo antes que soltar cache. Un proceso que sirve no
+    # puede estar en swap — el bench de club-3090 invalida la corrida entera cuando lo detecta
+    # ("every number in this run is suspect").
+    #
+    # OJO CON LA PERILLA: `mem_swappiness: 0` NO sirve. Es cgroup v1, y este host corre cgroup
+    # v2 (`stat -fc %T /sys/fs/cgroup` -> cgroup2fs), donde docker lo ignora EN SILENCIO. En v2
+    # la unica forma de decir "sin swap" es memswap_limit == mem_limit, que docker traduce a
+    # memory.swap.max=0. Verificado con un contenedor descartable antes de escribir esto.
+    #
+    # El limite NO es un presupuesto: vLLM usa ~15 GB y 26g no llega a atarlo nunca. Esta solo
+    # porque en v2 no se puede pedir memory.swap.max=0 sin un mem_limit. Si alguna vez lo toca,
+    # el contenedor muere por OOM en vez de degradarse — que a 26 GB de 30,5 es lo correcto.
+    mem_limit: 26g
+    memswap_limit: 26g
     cpuset: "0-7,16-23"
     ports:
       - "8360:8320"
