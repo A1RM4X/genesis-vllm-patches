@@ -2406,6 +2406,42 @@ def apply_patch_N127() -> PatchResult:
     return _failed(name, reason)
 
 
+@register_patch("PN146 tamano de grupo de KV")
+def apply_patch_PN146() -> PatchResult:
+    """PN146: group_size elegible por env; inerte sin ella."""
+    name = "PN146 tamano de grupo de KV"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kv_cache import patch_PN146_group_size
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN146_group_size.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
+@register_patch("PN145 bloque de la ventana deslizante")
+def apply_patch_PN145() -> PatchResult:
+    """PN145: el grupo de ventana deslizante deja de pagar una pagina cada 16 tokens."""
+    name = "PN145 bloque de la ventana deslizante"
+    if not _APPLY_MODE:
+        return _applied(name, "dry-run: text-patch ready")
+    try:
+        from vllm._genesis.wiring.kv_cache import patch_PN145_sw_block_size
+    except Exception as e:
+        return _failed(name, f"wiring import failed: {e}")
+    status, reason = patch_PN145_sw_block_size.apply()
+    if status == "applied":
+        return _applied(name, reason)
+    if status == "skipped":
+        return _skipped(name, reason)
+    return _failed(name, reason)
+
+
 @register_patch("PN143 enganche de proceso")
 def apply_patch_PN143() -> PatchResult:
     """PN143: cargar() de Genesis corre dentro de CADA proceso de vLLM."""

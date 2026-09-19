@@ -171,5 +171,44 @@ def enganchar() -> None:
                 log.warning("[DIAG KV] no se pudo volcar (%s: %s)", type(e).__name__, e)
 
     cls.__init__ = __init__
-    log.warning("[DIAG KV] enganchado sobre KVCacheConfig.__init__ y "
-                "create_kv_cache_group_specs")
+
+    # --- lo que DE VERDAD fija la capacidad: los bloques por request, grupo por grupo ---
+    # max_concurrency = num_blocks / sum_grupos(cdiv(max_memory_usage, page_size)), y
+    # "GPU KV cache size: N tokens" no es mas que max_concurrency * max_model_len. O sea que
+    # CADA grupo cuesta un juego entero de bloques por request: fragmentar los grupos divide
+    # la capacidad. Esto imprime el reparto para saber cual grupo se la lleva.
+    orig_conc = kv_cache_utils.get_max_concurrency_for_kv_cache_config
+    visto = {"n": 0}
+
+    def get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config):
+        r = orig_conc(vllm_config, kv_cache_config)
+        if visto["n"] < 1:
+            visto["n"] += 1
+            try:
+                from vllm.utils.math_utils import cdiv
+            except Exception:                                    # noqa: BLE001
+                from vllm.utils import cdiv
+            try:
+                total = 0
+                log.warning("[DIAG KV] --- bloques por request, por grupo ---")
+                for g, grupo in enumerate(kv_cache_config.kv_cache_groups):
+                    spec = grupo.kv_cache_spec
+                    mem = spec.max_memory_usage_bytes(vllm_config)
+                    page = spec.page_size_bytes
+                    n = cdiv(mem, page)
+                    total += n
+                    log.warning("[DIAG KV]  grp %-3d %-26s capas=%-3d mem/req=%-10s "
+                                "page=%-10s -> %d bloques",
+                                g, type(spec).__name__, len(grupo.layer_names or []),
+                                _mb(mem), _mb(page), n)
+                log.warning("[DIAG KV] TOTAL %d bloques/request | num_blocks=%d | "
+                            "concurrencia=%.3f", total, kv_cache_config.num_blocks, r)
+            except Exception as e:                               # noqa: BLE001
+                log.warning("[DIAG KV] concurrencia: %s: %s", type(e).__name__, e)
+        return r
+
+    kv_cache_utils.get_max_concurrency_for_kv_cache_config = (
+        get_max_concurrency_for_kv_cache_config)
+
+    log.warning("[DIAG KV] enganchado sobre KVCacheConfig.__init__, "
+                "create_kv_cache_group_specs y get_max_concurrency_for_kv_cache_config")

@@ -1278,6 +1278,28 @@ PATCH_REGISTRY: dict[str, dict[str, Any]] = {
         "upstream_pr": None,
         "applies_to": {},
     },
+    "PN146": {
+        "title": "Tamano de grupo de KV elegible (la heuristica de upstream no lo acierta)",
+        "env_flag": "GENESIS_ENABLE_PN146_GROUP_SIZE",
+        "default_on": False,
+        "category": "kv_cache",
+        "credit": (
+            "Genesis-original 2026-09-19. group_size = min(capas por bucket) y con DFlash2 el minimo son las 5 capas del borrador, que le imponen el tamano de grupo a las 64 del modelo grande: 15 grupos, con las 16 capas de atencion partidas en cuatro. Como bytes_per_block lo fija el grupo MAS GRANDE (un max, no una suma), un group_size mas chico da mas bloques totales: la prediccion da 2,94 de concurrencia con 4 contra 2,47 con 5. Inerte sin GENESIS_PN146_GROUP_SIZE: el valor se elige midiendo, no razonando."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
+    "PN145": {
+        "title": "Bloque de la ventana deslizante alineado con la atencion primaria",
+        "env_flag": "GENESIS_ENABLE_PN145_SW_BLOCK_SIZE",
+        "default_on": False,
+        "category": "kv_cache",
+        "credit": (
+            "Genesis-original 2026-09-19. Con DFlash2 el grupo SlidingWindow del borrador (5 capas) se llevaba 1153 de los 2001 bloques por request — mas que las 64 capas del modelo grande juntas — porque elegia block_size=16 para una pagina padeada a 0,87 MB (dimensionada para 880 tokens). Dos bugs encadenados en _largest_kernel_block_within: el call site pasa skip_page_size_padded (None fuera de TurboQuant) y sin presupuesto cae al bloque mas chico; y el backend declara MultipleOf(16) pero la funcion toma solo s.base, asi que no puede elegir un multiplo ni aunque hubiera presupuesto. Medido: 178.823 tokens de KV y concurrencia 1,09x."
+        ),
+        "upstream_pr": None,
+        "applies_to": {},
+    },
     "PN143": {
         "title": "Enganche de Genesis en cada proceso de vLLM (load_general_plugins)",
         "env_flag": "GENESIS_ENABLE_PN143_ENGANCHE_PLUGINS",
