@@ -64,6 +64,49 @@ them means a tensor never has to leave the integer domain between the RMSNorm
 that produces it and the attention that consumes it — which is also why the
 KV cache can be int8 without a dequant step in front of the attention kernel.
 
+### Why int8 beats fp8 in the KV cache, at the same width
+
+This is the least intuitive claim here, so the numbers first. Attention **output**
+error against float, measured on real dumps (PN123, layers 3 and 35, 22 464
+tokens of code, 192 queries in the 16K–22K span):
+
+| KV format | bits/value | output error, layer 3 / 35 | top-8 agreement |
+|---|---|---|---|
+| `fp8_e4m3`, static scale | 8.0 | 2.1% / 2.6% | 95–96% |
+| **`int8` per token-head** | 8.1 | **0.5% / 0.6%** | **99%** |
+
+**~4× less error for 0.1 extra bits.** The reason is where the bits go. `e4m3`
+spends 4 of its 8 bits on an exponent, buying a dynamic range this tensor does
+not use: post-RoPE vectors with qk-norm are nearly isotropic and each
+(token, head) slice occupies a narrow, well-behaved range. int8 with a scale
+fitted *per token-head* spends all 8 bits on mantissa inside exactly that range.
+The 0.1 bit is that scale, amortized over the head.
+
+And on Ampere it is also **faster**, which was not the goal — the switch was made
+looking for quality:
+
+| | fp8 | int8 |
+|---|---|---|
+| decode @1K | 114.7 | **157.8** tok/s |
+| decode @50K | 91.8 | **119.7** tok/s (+30%) |
+| prefill @50K | 2251 | 2206 tok/s |
+| 12 concurrent | 751.9 | 764.4 tok/s |
+
+Two reasons it ends up faster: Triton **does not accept fp8 on SM86** at all, so
+the fp8 path pays conversions the hardware cannot do natively; and the integer
+kernel consumes the int8 KV directly, with no dequant step in front of it.
+
+The honest cost: KV capacity drops ~7% (636 635 → 589 824 tokens at the time of
+that measurement) because the integer kernel reserves its own accumulators.
+
+⚠️ **Hadamard rotation is not part of this.** It is easy to assume the int8 win
+comes from rotating first; it does not. Measured on the same dumps, rotation
+changes int8 by nothing at all — **0.38% → 0.39%** and **0.55% → 0.54%**, which
+is noise. `PN126` exists and is **off** in production for exactly that reason.
+Rotation only starts to matter at int4, where it is the difference between
+usable and not (6.0% / 8.6% output error *with* it). Do not carry the
+assumption backwards from int4 to int8.
+
 ### Next: int4 in the KV cache
 
 int8 is the standard the pipeline runs on today. **int4 in the KV cache is the
