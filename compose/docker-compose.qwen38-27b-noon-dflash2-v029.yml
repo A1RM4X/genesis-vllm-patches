@@ -247,6 +247,14 @@ services:
       # Con 6 subagentes de 50k: el primero usable a los 33 s en vez de 200 s,
       # mismo tiempo total. 0 lo desactiva.
       - GENESIS_PN115_MAX_CONCURRENT_PREFILLS=1
+      # Prioridad AUTOMATICA (2026-09-20): un prompt de hasta 2000 tokens no espera detras del
+      # prefill en curso. La FORZADA (`priority` < 0 o `genesis_agent`) sigue igual y es la unica
+      # que saltea el headroom de KV o desaloja. Medido, pedido de 300 tok bajo un prefill de
+      # 59k, SIN marcar prioridad: 26 s -> 1,6-3,3 s. Los largos siguen de a uno: 3 de 30k a la
+      # vez dan TTFT 16 / 28 / 40 s, con los cortos del medio en 0,5-3 s.
+      # Necesita --long-prefill-token-threshold < max-num-batched-tokens (ver abajo): con 8192
+      # el largo se lleva el paso entero y el corto admitido igual espera 7,5-13 s.
+      - GENESIS_PN115_PROMPT_CORTO_TOKENS=2000
       # PN116: super kernel de MLP (SK-05) AISLADO al prefill grande.
       # El MLP es el 70,2% de los FLOPs de GEMM del modelo, asi que es el unico
       # bloque que justifica un super kernel.
@@ -586,6 +594,9 @@ services:
       - CUDA_DEVICE_SCHEDULE=1
       - OMP_NUM_THREADS=1
       - VLLM_API_KEY=${VLLM_API_KEY:-}
+      # Opcional. Si esta definida, las rutas de Genesis que MUTAN el servidor (reset de caches,
+      # config de PN115) exigen ESTA clave en vez de la de inferencia. Ver vllm/_genesis/api_auth.py
+      - GENESIS_ADMIN_API_KEY=${GENESIS_ADMIN_API_KEY:-}
       - TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
       - TRITON_CACHE_DIR=/root/.cache/triton
       - VLLM_USE_FLASHINFER_SAMPLER=1
@@ -813,8 +824,17 @@ services:
       # all-reduce (down_proj) dura 2,4 ms contra 6,3 de comunicacion.
       - --max-num-batched-tokens
       - "8192"
+      # 1760 = 2 bloques de 880. Dos efectos, medidos 2026-09-20 (A/B 8192 / 3520 / 1760):
+      #  * el estado GDN se guarda al final de cada chunk, asi que el chunk ES el grano del
+      #    prefix-cache: prompt repetido de 7,4k 2,49 -> 0,91 s (0 -> 5.280 tok cacheados), de
+      #    22k 2,61 -> 1,28 s. Con 8192 todo prompt < 7.920 tokens no cacheaba NADA.
+      #  * deja lugar en el paso para los pedidos cortos (ver PN115_PROMPT_CORTO_TOKENS).
+      # NO cuesta prefill medible: 5 corridas de 90k por brazo dan 1.867 tok/s (8192) contra
+      # 1.861 (1760). La primera medicion decia -5,5% con UNA corrida por brazo y era deriva
+      # del reloj por el cap de potencia (ver README, "What the power cap costs"). KV sin
+      # cambio. Tiene que ser >= 880 y < 8192.
       - --long-prefill-token-threshold
-      - "8192"
+      - "1760"
       - --performance-mode
       - "throughput"
       # Tallas de CUDA Graph para MTP K=3 (cada secuencia aporta K+1=4 tokens por paso)

@@ -20,7 +20,10 @@ This is **not a product**. It is a working notebook with code attached:
 
 - **It targets one machine.** 2× RTX 3090 (sm_86), TP=2, PCIe gen4 ×8, no
   NVLink, 30 GB of host RAM, one specific quantized checkpoint. Numbers,
-  thresholds and several patches are tuned to exactly that. On different
+  thresholds and several patches are tuned to exactly that.
+- **Every number here is measured with the cards power-capped** — 229 W and 243 W, against
+  350 / 370 W stock. Uncapped, this same stack does about **+20% prefill and +7% decode**
+  ([measured](#what-the-power-cap-costs)). Read the tables as a floor, not a ceiling. On different
   hardware, expect some patches to be useless and others to be wrong.
 - **It is in active development.** Patches land, get measured, and sometimes get
   deleted when the measurement says the idea was wrong. The git history contains
@@ -220,7 +223,7 @@ so whichever is up owns the endpoint.
 
 ### Measured performance
 
-Measured 2026-09-20 with the `bench.sh` harness from
+**All of it under the power cap (229 W / 243 W).** Measured 2026-09-20 with the `bench.sh` harness from
 [club-3090](https://github.com/noonghunna/club-3090), run **directly against the
 container** (no reverse proxy in the path). Decode: 3 warm-ups + 5 measured
 runs. Prefill: 1 warm-up + 3 measured runs, cache-busted with a fresh haystack
@@ -250,6 +253,53 @@ temporary `sitecustomize`, scoped to the server under test — the `.curlrc` alo
 and engine-timing captures came back empty (the engine does not log acceptance
 at this verbosity), so the acceptance rate behind that gap is inferred from
 throughput, not measured here.
+
+### What the power cap costs
+
+The cap is deliberate — heat, noise and the power bill on a machine that runs all day — and it
+is *asymmetric* on purpose: the two cards are not the same silicon, TP=2 runs at the pace of
+the slower one, and 229 W / 243 W is the split where their clocks meet (+13.4% prefill over an
+even split at similar total power; the sweep is documented inside
+`/etc/systemd/system/nvidia-powerlimit.service`).
+
+Same container, same minute, cap lifted to the stock limits and then restored through that
+service (2026-09-20; three 90K prefills, and the greedy bench for decode):
+
+| | capped 229 / 243 W | uncapped 350 / 370 W | |
+|---|---|---|---|
+| prefill @ 90K | 1 861 tok/s | **2 224** tok/s | **+19.5%** |
+| decode, reasoning prose | 124.4 tok/s | **132.7** tok/s | **+6.7%** |
+| decode, code | 256–274 tok/s | 285 ±12 tok/s | ≈ +5%, inside that bench's noise |
+| SM clock under load | 1 370 / 1 464 MHz | 1 792 / 1 820 MHz | |
+| power drawn | 224 / 238 W | 326 / 330 W | **+42%** |
+| temperature (max) | 69 / 56 °C | 76 / 63 °C | |
+
+The club-3090 `bench.sh` harness, run the same way with the cap lifted
+([raw output](tests/bench/resultados/bench-dflash2-sin-cap-350-370w-20260920.txt), `INTEGRITY: OK`),
+against the capped run in [Measured performance](#measured-performance):
+
+| `bench.sh` | capped 229 / 243 W | uncapped 350 / 370 W | |
+|---|---|---|---|
+| prefill @ 10K | 2 808 tok/s (CV 1.3%) | **3 368** (CV 1.6%) | **+20%** |
+| prefill @ 90K | 1 838 tok/s (CV 0.7%) | **2 221** (CV 0.3%) | **+21%** |
+| decode, narrative | 134 tok/s (CV 5.3%) | **140** (CV 2.4%) | +4.3% |
+| decode, code | 257 tok/s (CV 8.7%) | **285** (CV 6.1%) | +11%, one run per arm at 6–9% CV: "somewhat up", not a number |
+
+The two harnesses agree where they overlap: 2 221 vs 2 224 tok/s at 90K, and a single-digit
+gain on decode. The code-vs-narrative gap stays at ~2× with or without the cap — it comes from
+the drafter's acceptance rate, not from power.
+
+Prefill is compute-bound and follows the clock. Decode is bound by memory traffic and barely
+moves — which is the same thing the [decode profile](#where-a-decode-step-actually-goes) says
+from the other side. So the cap trades a fifth of the prefill for 42% less power, and costs
+decode almost nothing.
+
+**The cap also makes measurements drift.** The driver holds the power limit by moving the
+clock, so the clock wanders with temperature: within a single run of five identical 90K
+prefills GPU0 went from 1 220 to 1 162 MHz, and throughput from 1 896 to 1 819 tok/s. A
+single run per arm can therefore "find" a ±5% effect that is not there — it happened in this
+README, see the threshold table under
+[Admission and time to first token](#admission-and-time-to-first-token).
 
 ### A/B on a greedy bench, 2026-09-20
 
@@ -406,6 +456,62 @@ PN143 exists because `apply_all` runs as a separate process and then `exec`s
 bit us silently once — the server booted, logged "applied", and ran the generic
 kernel anyway. Only a one-time notice inside the kernel's `forward` revealed it.
 
+### Admission and time to first token
+
+| | | |
+|---|---|---|
+| ✅ | **PN115** | Admission control in the scheduler: KV-headroom gate, **one prefill at a time**, and two ways past that queue — *forced* priority (the client says so) and *automatic* priority (the prompt is short) |
+| ✅ | **PN89** | Request tracker and the HTTP endpoints described under [Client-facing controls](#client-facing-controls) |
+
+With an idle server TTFT is simply prefill: 82 ms at 100 tokens, 0.54 s at 1.5K, 2.5 s at 7.4K,
+8.1 s at 22K, 18.8 s at 44K. The two problems worth writing down were both about *scheduling*,
+and both were invisible in a throughput benchmark.
+
+**A short request waited for the whole long prefill.** PN115 serialises prefills on purpose:
+the prefill already runs at 80–85% of the compute roofline, so N concurrent prefills each get
+1/N of it and *none* finishes until all do. Six 50K sub-agents are all usable at 200 s that
+way, versus the first one at 33 s when serialised. That reasoning holds between comparable
+prompts and is pure loss for a 300-token request stuck behind a 59K one — measured at
+**26 s**, against 108 ms on an idle engine. The fix is the automatic priority:
+`GENESIS_PN115_PROMPT_CORTO_TOKENS=2000` lets a prompt of up to 2 000 tokens skip the
+serialisation — and *only* that; it still respects the KV-headroom gate and never preempts
+anyone.
+
+**The prefix cache only hit in 7 920-token steps.** On this hybrid model the GDN recurrent
+state is saved at the end of each prefill chunk, so the chunk *is* the cache granularity.
+With `--long-prefill-token-threshold` equal to `--max-num-batched-tokens` (8192 → aligned
+chunks of 9 × 880 tokens) a repeated 7.4K prompt cached **nothing**.
+
+One flag moves both, because a smaller chunk also leaves room in each step for the short
+request that was just let through. Measured, one clean boot per arm
+([`tests/bench/medicion/ttft_ab.py`](tests/bench/medicion/ttft_ab.py)):
+
+| `--long-prefill-token-threshold` | repeated 7.4K prompt | repeated 22K prompt | 90K prefill, idle server | short request under a 59K prefill |
+|---|---|---|---|---|
+| 8192 (before) | 2.49 s · 0 cached | 2.61 s · 15 840 cached | 1 867 tok/s | **26 s** |
+| 3520 | 1.67 s · 3 520 | 1.95 s · 17 600 | not re-measured ² | 3.6–6.6 s ¹ |
+| **1760** ← in production | **0.91 s** · 5 280 | **1.28 s** · 19 360 | 1 861 (−0.3%, noise) ² | **1.6–3.3 s** |
+
+¹ measured with forced priority, before the automatic one existed; the 1760 row is with plain,
+unmarked requests. KV capacity is identical in all three arms.
+
+² **Retraction.** This table first said the smaller chunk cost −5.5% of long-prefill
+throughput (1 920 → 1 814 tok/s), from one 90K run per arm. Repeated properly — fresh boot, one
+90K warm-up, five 90K runs per arm — it is 1 867 (range 1 819–1 896) against 1 861 (1 852–1 879):
+no measurable cost. The kernel profile agrees: at 18K the 1760 arm is actually *faster*
+(6.47 s vs 6.86 s, Marlin is more efficient at the smaller batch), and what grows with more
+steps — idle gaps, the offload's device-to-host copies, PN131's per-step KV dequantisation —
+adds up to tens of milliseconds. The original gap was clock drift under the power cap.
+
+The threshold alone does **not** fix the 26 s — with PN115 serialising, the short request is
+never admitted, whatever the chunk size. And the priority alone is not enough either: at 8192
+an admitted short request still waits 7.5–13 s, because the long prefill takes the whole step.
+It takes both. Long prompts still run one at a time: three 30K prompts launched together get
+their first token at 16 / 28 / 40 s, with short requests in between answered in 0.5–3 s.
+
+Known limit: "short" is judged on the **total** prompt length, because a waiting request's
+cached prefix is not known yet. A 60K-token turn with 59K already cached counts as long.
+
 ### Tiered KV cache (RAM + NVMe)
 
 When VRAM fills, vLLM **discards** old prefix blocks and recomputes them later.
@@ -493,6 +599,127 @@ being computed — working exactly as intended. Before concluding anything about
 hit rate, check `num_preemptions_total` first: if it is zero, the tier was never
 asked to do its job.
 
+## Client-facing controls
+
+Everything a client can send, or call, that changes how this server behaves. None of it is
+stock vLLM except the `priority` field itself.
+
+### Request fields
+
+They travel in the body of `/v1/chat/completions` (or `/v1/completions`). `kv_transfer_params`
+is an existing vLLM field that reaches the scheduler and the offloading tiers untouched, which
+is why it is used as the carrier: no plumbing patch is needed.
+
+```jsonc
+{
+  "model": "qwen3.8",
+  "messages": [...],
+  "priority": -8,                       // optional; forced priority
+  "kv_transfer_params": {
+    "genesis_agent": "primary",         // who is asking
+    "persist_disk": true,               // may this request's KV reach the NVMe tier?
+    "name": "refactor-auth"             // display name in the request history
+  }
+}
+```
+
+| field | read by | effect |
+|---|---|---|
+| `priority` (int) | PN115, scheduler | Below `high_prio_threshold` (default `0`) it is **forced priority**: never waits behind a prefill, skips the KV-headroom gate, and if every slot is taken it may **preempt** a lower-priority request. It also orders the waiting queue (`--scheduling-policy priority`). Lower = more urgent. |
+| `kv_transfer_params.priority` | PN115 | Same, used only when the top-level `priority` is `0` or absent. |
+| `kv_transfer_params.genesis_agent` (alias `agent`) | PN115, PN90, PN100, PN88, PN101 | One tag, three jobs — see the table below. |
+| `kv_transfer_params.persist_disk` (bool) | PN90, PN100 | Overrides the agent allowlist: `true` lets this request's blocks be demoted to the NVMe tier, `false` forbids it. |
+| `kv_transfer_params.name` | PN89 | Cosmetic: the name shown in `/v1/kv-offload/requests`. |
+| request id (`X-Request-Id` header) | PN115 | Last-resort fallback: an id starting with `coach-`, `primary_`… takes that agent's priority. Auto-generated ids never match. |
+| *(nothing — prompt length)* | PN115 | **Automatic priority**: a prompt of up to `GENESIS_PN115_PROMPT_CORTO_TOKENS` tokens skips the prefill queue. It gets nothing else. |
+
+Priority is resolved in that order: explicit `priority`, then `kv_transfer_params.priority`,
+then the agent tag, then the request id.
+
+**What `genesis_agent` decides:**
+
+| agent | priority (PN115) | may write to NVMe (PN90) |
+|---|---|---|
+| `coach` | −10 | yes |
+| `primary`, `primary_high` | −8 | yes |
+| `planner` | −5 | yes |
+| `coder`, `verifier` | −5 | no |
+| `primary_low`, `primary_nothink`, `planner_nothink` | 0 | yes |
+| `build`, `plan` | 0 | yes |
+| `utility` | 5 | no |
+| `explorer`, `vision`, `art` | 10 | no |
+| *(no tag)* | 0 | **no** |
+
+The third job is labelling: the tag becomes the `agent` label on the `kv_tier_*` Prometheus
+series. Names outside `GENESIS_KV_AGENTS` collapse into `other`, so a typo in a client config
+cannot create unbounded series. The disk allowlist is `GENESIS_KV_DISK_WRITERS`.
+
+The reason behind the disk column: sub-agents produce single-use context. Letting it reach the
+NVMe tier only evicts the long thread's prefix, which is the one thing worth keeping.
+
+In opencode this goes in each agent's `extraBody`:
+
+```jsonc
+"extraBody": { "kv_transfer_params": { "genesis_agent": "coach", "persist_disk": true } }
+```
+
+### HTTP endpoints
+
+| endpoint | key | what it does |
+|---|---|---|
+| `GET /v1/kv-offload/requests` | API | Recent requests: id, name, agent, priority, prompt / cached / output tokens, TTFT, prefill and decode tok/s, KV hit rate. No prompt text. |
+| `GET /v1/genesis/pid` (alias `/v1/kv-offload/pid`) | API | PN115 state: settings, free KV blocks, and the counters `gated_by_prefill_total`, `short_prompt_bypass_total`, `priority_bypass_total`, `emergency_preemptions_total`. |
+| `POST /v1/genesis/pid` (alias `/v1/kv-offload/pid`) | **admin** | Retunes PN115 live, no restart. JSON body, validated — see below. |
+| `POST /v1/kv-offload/reset` | **admin** | Empties L1 (GPU), L2 (RAM) and L3 (NVMe), **terminates in-flight requests**, zeroes the metrics. Query flags, all default `true`: `force`, `notify_clients`, `clear_l1`, `clear_l2`, `clear_l3`, `clear_metrics`, `clear_history`. |
+
+Keys accepted by `POST /v1/genesis/pid`. Anything else, or a wrong type or range, is rejected
+whole with `400` and never reaches the control file:
+
+| key | type | range | meaning |
+|---|---|---|---|
+| `enabled`, `kv_gating`, `latency_pid` | bool | | master switch · KV-headroom gate · latency PID (forced off under async scheduling) |
+| `max_concurrent_prefills` | int | 0–64 | `0` = no serialisation, `1` = one prefill at a time |
+| `short_prompt_tokens` | int | 0–1 000 000 | automatic-priority limit; `0` = off |
+| `high_prio_threshold` | int | −1000–1000 | priorities *below* this are "forced" |
+| `headroom_ratio` | float | 0–0.9 | share of GPU blocks never committed |
+| `min_concurrency`, `max_concurrency` | int | 1–1024 · 0–1024 | never gate below · cap |
+| `target_step_ms`, `kp`, `kd` | float | ≥ 0 | latency PID tuning |
+
+```bash
+curl -s -H "Authorization: Bearer $VLLM_API_KEY" http://HOST:8320/v1/genesis/pid
+curl -s -X POST -H "Authorization: Bearer $GENESIS_ADMIN_API_KEY" \
+     -H 'Content-Type: application/json' -d '{"short_prompt_tokens": 1000}' \
+     http://HOST:8320/v1/genesis/pid
+```
+
+### Security model
+
+**Every Genesis route is authenticated, by construction.** vLLM's own middleware only guards
+paths that start with `/v1`; everything else is open by design (`/health`, `/metrics`). Genesis
+used to mount aliases outside that prefix — `/kv-offload/requests`, `/kv-offload/reset`,
+`/reset_prefix_cache` — and they were open without anyone having decided so: on 2026-09-20,
+`GET /kv-offload/requests` with no key returned `200`, and the same route family could wipe
+all three cache tiers and cut every request in flight. The fix is structural, not a path
+rename: authentication is a dependency of the **router** (`vllm/_genesis/api_auth.py`), so a
+route added tomorrow is born protected whatever its prefix — and a test walks every route of
+the router and asserts `401` without a key. The unprefixed aliases were removed; nothing used
+them, and `/reset_prefix_cache` shadowed one of vLLM's own development endpoints.
+
+**Two keys, two levels.** `VLLM_API_KEY` reads. Routes that *change* the server take the admin
+level: with `GENESIS_ADMIN_API_KEY` set they demand that key, so an inference client cannot
+retune admission or flush the caches; unset, the normal key is accepted. The admin key also
+reads. With no API key configured at all the server is open — same behaviour as vLLM.
+
+**What is *not* protected, and cannot be with one shared key: the request fields.** They are
+self-declared. Anyone holding the inference key can tag itself `coach` and get top priority
+with the right to preempt, or send `persist_disk: true`. The damage is bounded — preemption
+only happens when every slot is taken, and the NVMe tier is capped by PN81's quota
+(`GENESIS_KV_DISK_MAX_GB`) — but it is a trust decision, not an access control. It fits a
+single-user rig. If the key is ever shared, put a proxy in front that strips or rewrites
+`priority` and `kv_transfer_params` per caller.
+
+---
+
 ## Getting started
 
 ### 1. Credentials
@@ -504,6 +731,10 @@ versioned** — `.env` is gitignored, only `.env.example` is tracked.
 cp compose/.env.example compose/.env
 openssl rand -hex 32          # generate a real key, paste it into compose/.env
 ```
+
+`GENESIS_ADMIN_API_KEY` is optional: set it and the routes that change the server
+(cache reset, admission config) stop accepting the inference key — see
+[Security model](#security-model).
 
 Benchmark and diagnostic scripts read the same `VLLM_API_KEY` **with no
 default**: a script run without it fails loudly instead of sending a stale key.
@@ -584,9 +815,12 @@ hard way:
   Boot logs a pin-gate warning; that is expected, not a fault.
 - **PCIe links negotiate gen4 ×8, not ×16** on this machine. Every number above
   was measured under that constraint.
-- **The 3090s are power-capped at 220 W**, which drops the sustained SM clock to
-  810 MHz and the real bandwidth roof to 640 GB/s, not 730. Any burst
-  measurement on this rig overestimates by ~11%.
+- **The 3090s are power-capped — 229 W and 243 W, set by `nvidia-powerlimit.service`** (the
+  kernel-level bandwidth notes elsewhere in this repo were taken at the earlier, even 220 W
+  cap: sustained SM clock of 810 MHz, real roof 640 GB/s instead of 730). Two consequences:
+  every number here is ~20% short of what the silicon does uncapped on prefill
+  ([measured](#what-the-power-cap-costs)), and the clock drifts with temperature, so a burst
+  overestimates and a single run per arm is not evidence.
 
 ### Dead ends
 

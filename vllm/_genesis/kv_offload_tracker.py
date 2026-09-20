@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("vllm._genesis.kv_offload_tracker")
@@ -65,7 +65,12 @@ except Exception as _prom_err:
     PROM_REQS_BY_PRIORITY = None
     PROM_REQS_BY_AGENT = None
 
-router = APIRouter()
+from vllm._genesis.api_auth import require_admin_key, require_api_key
+
+# Todo el router va autenticado, tenga la ruta el prefijo que tenga: el middleware de vLLM solo
+# cubre /v1/*. Las rutas que MUTAN suman require_admin_key. Ver vllm/_genesis/api_auth.py.
+router = APIRouter(dependencies=[Depends(require_api_key)])
+_ADMIN = [Depends(require_admin_key)]
 
 
 class RequestTrackerContext:
@@ -341,14 +346,11 @@ def get_records() -> list[dict[str, Any]]:
 
 
 @router.get("/v1/kv-offload/requests")
-@router.get("/kv-offload/requests")
 async def get_kv_offload_requests():
     return JSONResponse(content=get_records())
 
 
-@router.post("/v1/kv-offload/reset")
-@router.post("/kv-offload/reset")
-@router.post("/reset_prefix_cache")
+@router.post("/v1/kv-offload/reset", dependencies=_ADMIN)
 async def reset_kv_cache_and_metrics(
     raw_request: Request,
     force: bool = Query(default=True, description="Force preemption and graceful notification of active requests"),
@@ -490,6 +492,54 @@ async def reset_kv_cache_and_metrics(
     )
 
 
+# Claves que acepta POST /v1/genesis/pid, con su tipo y rango. Es la misma lista que lee
+# dynamic_pid_gating.check_control_updates(): si se agrega una alla, va tambien aca.
+_PID_CAMPOS: dict[str, tuple[type, float | None, float | None]] = {
+    "enabled": (bool, None, None),
+    "kv_gating": (bool, None, None),
+    "latency_pid": (bool, None, None),
+    "max_concurrent_prefills": (int, 0, 64),
+    "short_prompt_tokens": (int, 0, 1_000_000),
+    "high_prio_threshold": (int, -1000, 1000),
+    "min_concurrency": (int, 1, 1024),
+    "max_concurrency": (int, 0, 1024),
+    "max_kv_tokens": (int, 0, None),
+    "headroom_ratio": (float, 0.0, 0.9),
+    "target_step_ms": (float, 0.0, None),
+    "kp": (float, 0.0, 100.0),
+    "kd": (float, 0.0, 100.0),
+}
+
+
+def _validar_pid(datos: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    limpio: dict[str, Any] = {}
+    errores: list[str] = []
+    for k, v in datos.items():
+        campo = _PID_CAMPOS.get(k)
+        if campo is None:
+            errores.append(f"{k}: clave desconocida")
+            continue
+        tipo, lo, hi = campo
+        if tipo is bool:
+            if not isinstance(v, bool):
+                errores.append(f"{k}: se esperaba true/false")
+                continue
+        else:
+            # bool es subclase de int: True no es un numero valido aca.
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                errores.append(f"{k}: se esperaba un numero")
+                continue
+            if tipo is int and float(v) != int(v):
+                errores.append(f"{k}: se esperaba un entero")
+                continue
+            v = tipo(v)
+            if (lo is not None and v < lo) or (hi is not None and v > hi):
+                errores.append(f"{k}: fuera de rango [{lo}, {hi}]")
+                continue
+        limpio[k] = v
+    return limpio, errores
+
+
 @router.get("/v1/genesis/pid")
 @router.get("/v1/kv-offload/pid")
 async def get_pid_status_endpoint():
@@ -501,8 +551,8 @@ async def get_pid_status_endpoint():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@router.post("/v1/genesis/pid")
-@router.post("/v1/kv-offload/pid")
+@router.post("/v1/genesis/pid", dependencies=_ADMIN)
+@router.post("/v1/kv-offload/pid", dependencies=_ADMIN)
 async def update_pid_config_endpoint(
     raw_request: Request,
     enabled: Optional[bool] = Query(None),
@@ -526,10 +576,18 @@ async def update_pid_config_endpoint(
 
     try:
         body = await raw_request.json()
-        if isinstance(body, dict):
-            updates.update(body)
     except Exception:
-        pass
+        body = None
+    if isinstance(body, dict):
+        updates.update(body)
+
+    # El body NO se mezcla a ciegas: claves fuera de la lista o con el tipo equivocado se
+    # rechazan enteras, en vez de quedar escritas en el archivo de control.
+    limpio, errores = _validar_pid(updates)
+    if errores:
+        return JSONResponse(status_code=400, content={"error": "config invalida",
+                                                      "detalle": errores})
+    updates = limpio
 
     try:
         from vllm._genesis import dynamic_pid_gating as _g115

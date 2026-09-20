@@ -108,9 +108,14 @@ try:
         "vllm:pid_gated_by_prefill_total",
         "Genesis PN115 requests deferred because another prefill is in flight",
     )
+    PROM_PID_SHORT_BYPASS = Counter(
+        "vllm:pid_short_prompt_bypass_total",
+        "Genesis PN115 short prompts admitted past the prefill serialization",
+    )
 except Exception as _prom_err:  # pragma: no cover
     log.debug("Prometheus client not initialized for PN115: %s", _prom_err)
     PROM_PID_EMA_STEP_MS = None
+    PROM_PID_SHORT_BYPASS = None
     PROM_PID_TARGET_STEP_MS = None
     PROM_PID_ACTIVE_KV_TOKENS = None
     PROM_PID_MAX_KV_TOKENS = None
@@ -231,6 +236,18 @@ class PIDAdmissionController:
         self.max_concurrent_prefills = int(
             os.environ.get("GENESIS_PN115_MAX_CONCURRENT_PREFILLS", "0")
         )
+        # Prioridad AUTOMATICA: un prompt de hasta N tokens no espera detras de un prefill en
+        # curso. La serializacion tiene sentido entre prefills comparables (6 subagentes de
+        # 50k); contra un pedido de 300 tokens es pura espera — medido 2026-09-20: 26 s detras
+        # de un prefill de 59k, contra 108 ms con el motor libre. Exime SOLO de la
+        # serializacion: no saltea el headroom de KV ni desaloja a nadie, que eso sigue siendo
+        # de la prioridad forzada (`priority` / `genesis_agent`).
+        # Rinde junto con --long-prefill-token-threshold < max-num-batched-tokens: si el largo
+        # se lleva el paso entero, el corto admitido igual espera un chunk completo.
+        # 0 = desactivado (comportamiento anterior).
+        self.short_prompt_tokens = int(
+            os.environ.get("GENESIS_PN115_PROMPT_CORTO_TOKENS", "0")
+        )
 
         # Headroom de seguridad: fracción de bloques GPU que nunca se compromete.
         self.safety_headroom_ratio = float(os.environ.get("GENESIS_PID_HEADROOM_RATIO", "0.10"))
@@ -257,6 +274,7 @@ class PIDAdmissionController:
 
         self.gated_count: int = 0
         self.gated_by_prefill: int = 0
+        self.short_bypass: int = 0
         self.bypass_count: int = 0
         self.preempt_count: int = 0
 
@@ -374,6 +392,9 @@ class PIDAdmissionController:
                 self.max_concurrent_prefills = int(data["max_concurrent_prefills"])
                 log.info("[PN115] max_concurrent_prefills -> %d",
                          self.max_concurrent_prefills)
+            if "short_prompt_tokens" in data:
+                self.short_prompt_tokens = int(data["short_prompt_tokens"])
+                log.info("[PN115] short_prompt_tokens -> %d", self.short_prompt_tokens)
             if "headroom_ratio" in data:
                 self.safety_headroom_ratio = float(data["headroom_ratio"])
                 self.max_safe_usage_ratio = 1.0 - self.safety_headroom_ratio
@@ -424,6 +445,8 @@ class PIDAdmissionController:
             "max_concurrent_prefills": self.max_concurrent_prefills,
             "gated_requests_total": self.gated_count,
             "gated_by_prefill_total": self.gated_by_prefill,
+            "short_prompt_tokens": self.short_prompt_tokens,
+            "short_prompt_bypass_total": self.short_bypass,
             "priority_bypass_total": self.bypass_count,
             "emergency_preemptions_total": self.preempt_count,
             "bloques_por_request": getattr(self, "bloques_por_request", None),
@@ -659,10 +682,19 @@ class PIDAdmissionController:
         if self.max_concurrent_prefills > 0:
             prefilling = sum(1 for r in running if _is_prefilling(r))
             if prefilling >= self.max_concurrent_prefills:
-                self.gated_by_prefill += 1
-                if PROM_PID_GATED_PREFILL:
-                    PROM_PID_GATED_PREFILL.inc()
-                return self._gate()
+                npt = getattr(request, "num_prompt_tokens", None)
+                corto = (self.short_prompt_tokens > 0 and npt is not None
+                         and npt <= self.short_prompt_tokens)
+                if not corto:
+                    self.gated_by_prefill += 1
+                    if PROM_PID_GATED_PREFILL:
+                        PROM_PID_GATED_PREFILL.inc()
+                    return self._gate()
+                # Prioridad automatica: solo exime de la serializacion; el gate de
+                # headroom de KV de abajo le sigue aplicando.
+                self.short_bypass += 1
+                if PROM_PID_SHORT_BYPASS:
+                    PROM_PID_SHORT_BYPASS.inc()
 
         # INVARIANTE ANTI-DEADLOCK del gate de KV. Por debajo de
         # min_concurrency no se difiere por headroom, pase lo que pase. Sin

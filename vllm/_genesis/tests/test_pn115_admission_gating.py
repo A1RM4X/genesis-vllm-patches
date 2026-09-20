@@ -458,6 +458,56 @@ def test_apagado_por_default_no_serializa(gating):
     assert gating.should_gate_waiting(nuevo, sched) is False
 
 
+
+# ══════════════ 5b. prioridad automatica: prompts cortos ══════════════
+
+
+@pytest.fixture()
+def serial_corto(monkeypatch):
+    """Un prefill por vez, con los prompts de hasta 2000 tokens eximidos."""
+    monkeypatch.setenv("GENESIS_ENABLE_PN115_PID_GATING", "1")
+    monkeypatch.setenv("GENESIS_PN115_KV_GATING", "1")
+    monkeypatch.setenv("GENESIS_PN115_LATENCY_PID", "0")
+    monkeypatch.setenv("GENESIS_PN115_MAX_CONCURRENT_PREFILLS", "1")
+    monkeypatch.setenv("GENESIS_PN115_PROMPT_CORTO_TOKENS", "2000")
+    mod = importlib.reload(importlib.import_module("vllm._genesis.dynamic_pid_gating"))
+    _aislar_archivos(mod)
+    yield mod
+    importlib.reload(mod)
+
+
+def _nuevo(rid, n):
+    return FakeRequest(rid, num_tokens=n, num_computed=0, num_prompt_tokens=n)
+
+
+def test_prompt_corto_no_espera_detras_de_un_prefill(serial_corto):
+    sched = FakeScheduler([_prefilling("grande"), _decoding("d1")])
+    assert serial_corto.should_gate_waiting(_nuevo("corto", 300), sched) is False
+    assert serial_corto.get_pid_status()["short_prompt_bypass_total"] == 1
+
+
+def test_el_umbral_es_inclusivo_y_el_largo_sigue_esperando(serial_corto):
+    sched = FakeScheduler([_prefilling("grande")])
+    assert serial_corto.should_gate_waiting(_nuevo("justo", 2000), sched) is False
+    assert serial_corto.should_gate_waiting(_nuevo("pasado", 2001), sched) is True
+    assert serial_corto.should_gate_waiting(_nuevo("largo", 40_000), sched) is True
+    assert serial_corto.get_pid_status()["gated_by_prefill_total"] == 2
+
+
+def test_prompt_corto_no_saltea_el_headroom_de_kv(serial_corto):
+    """La automatica exime SOLO de la serializacion: sin bloques libres, espera igual."""
+    sched = FakeScheduler([_prefilling("grande"), _decoding("d1")],
+                          free_blocks=1, total_blocks=1000)
+    assert serial_corto.should_gate_waiting(_nuevo("corto", 300), sched) is True
+
+
+def test_sin_el_umbral_el_corto_espera_como_antes(serial):
+    """GENESIS_PN115_PROMPT_CORTO_TOKENS sin setear = comportamiento anterior."""
+    assert serial._CONTROLLER.short_prompt_tokens == 0
+    sched = FakeScheduler([_prefilling("grande")])
+    assert serial.should_gate_waiting(_nuevo("corto", 300), sched) is True
+
+
 # ══════════════ prioridad desde kv_transfer_params ══════════════
 
 
