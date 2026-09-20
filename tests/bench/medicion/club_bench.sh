@@ -44,6 +44,32 @@ trap 'rm -rf "$CURLDIR"' EXIT
 if [ -n "$CLAVE" ]; then
   printf 'header = "Authorization: Bearer %s"\n' "$CLAVE" > "$CURLDIR/.curlrc"
   chmod 600 "$CURLDIR/.curlrc"
+  # 2026-09-20: el .curlrc NO alcanza. bench.sh solo usa curl para /v1/models; las requests
+  # que se miden salen por urllib con headers fijos (solo Content-Type) y daban 401 las 16.
+  # Mismo criterio que arriba (no tocar sus scripts, no abrir el server, la clave fuera de
+  # la linea de comando): un sitecustomize en el mismo directorio temporal le agrega la
+  # Authorization a urllib, SOLO para requests que van al servidor bajo prueba.
+  umask 077
+  printf '%s' "$CLAVE" > "$CURLDIR/clave"
+  cat > "$CURLDIR/sitecustomize.py" <<'PYEOF'
+import os, urllib.request
+_d = os.path.dirname(os.path.abspath(__file__))
+_pref = os.environ.get("GENESIS_BENCH_URL", "")
+try:
+    _k = open(os.path.join(_d, "clave")).read().strip()
+except OSError:
+    _k = ""
+if _k and _pref:
+    _orig = urllib.request.OpenerDirector.open
+    def _open(self, fullurl, *a, **kw):
+        req = fullurl if isinstance(fullurl, urllib.request.Request) else urllib.request.Request(fullurl)
+        if req.full_url.startswith(_pref) and not req.has_header("Authorization"):
+            req.add_header("Authorization", "Bearer " + _k)
+        return _orig(self, req, *a, **kw)
+    urllib.request.OpenerDirector.open = _open
+PYEOF
+  export PYTHONPATH="$CURLDIR${PYTHONPATH:+:$PYTHONPATH}"
+  export GENESIS_BENCH_URL="http://$IP:8320"
 fi
 export CURL_HOME="$CURLDIR"
 

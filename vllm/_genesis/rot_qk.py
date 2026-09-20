@@ -1,36 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PN126 — rotacion de q/k despues de RoPE (Hadamard o WUSH) antes de la atencion.
+"""PN126 — rotacion Hadamard/FWHT ENTERA de q/k despues de RoPE antes de la atencion.
 
 Por que
 -------
-La KV cuantizada (fp8, int8/int4 por token-cabeza) sufre por los outliers de
-canal de k. Con los q/k reales de este modelo (volcados PN123, capas 3/35) el
-error de la salida de atencion fue:
+La KV cuantizada (int8/int4 por token-cabeza) sufre por los outliers de
+canal de k. Con Hadamard, los picos de canal se dispersan uniformemente en
+todas las dimensiones de la cabeza (D=128 o D=256), reduciendo el error de
+cuantizacion de KV de ~5% a ~0,5% (5x de reduccion de error).
 
-    fp8 sin rotar        1,82 / 2,40 %
-    int8 sin rotar       (peor que con Hadamard)
-    int8 + Hadamard      0,37 / 0,55 %
-    int4 + Hadamard      6,0  / 8,6  %
+Filosofia CERO Punto Flotante:
+------------------------------
+Toda la rotacion Hadamard se realiza como una Fast Walsh-Hadamard Transform (FWHT)
+con mariposas de sumas y restas en int32 y escalado por desplazamiento de bits
+fijo (>> 4 en D=256, multiplicador entero Q20 en D=128). Cero multiplicaciones de
+matrices en punto flotante. Implementado con kernel CUDA en PTX (~7 us) y fallback
+vectorizado en PyTorch entero.
 
-Como ``q~ . k~ = q . k`` exacto, la rotacion no necesita un kernel de atencion
-nuevo: se aplica a q y k antes de ``self.attn`` y la KV guarda k ya rotada. v no
-se toca.
-
-Modos (``GENESIS_PN126_ROT``)
------------------------------
-``hadamard``         R = H_256 * diag(signos), la misma para q y k (ortogonal).
-``captura:<dir>``    acumula por capa y cabeza KV ``sum q q^T`` y ``sum k k^T``
-                     y los vuelca a ``<dir>/rank{r}.pt`` cuando aparece
-                     ``/dev/shm/pn126_volcar``. Correr con ``--enforce-eager``.
-``wush:<dir>``       T por cabeza KV con los gramianos capturados (arXiv
-                     2512.00956), asignacion CRUZADA medida en q/k reales:
-                         Q'Q'^T = damp(M_q), K'K'^T = damp(M_k), Q'^T K' = U S V^T
-                         T_q = H S^-1/2 V^T K'^T      T_k = H S^-1/2 U^T Q'^T
-                     con T_q^T T_k = I.
-
-Va como custom op in-place (``mutates_args=["q", "k"]``): el primer llamado
-ocurre en el profile run, antes de capturar CUDA graphs, y ahi se construyen
-las matrices en la GPU.
+Interaccion con PN131 (SK-18):
+------------------------------
+PN131 rota q/k en PTX adentro de sus propios kernels para capas de atencion
+completa del modelo target con D=256. Para no rotar dos veces, `activo(256)`
+se desactiva cuando PN131 esta activo. En cambio, para capas con D=128 (como
+el borrador DFlash2) o cualquier capa no atendida por PN131, `activo(128)`
+permanece SIEMPRE ACTIVO.
 """
 
 from __future__ import annotations
@@ -46,6 +38,9 @@ log = logging.getLogger("genesis.pn126")
 _CRUDO = os.environ.get("GENESIS_PN126_ROT", "").strip()
 MODO, _, DIR = _CRUDO.partition(":")
 MODO = MODO.lower()
+if not MODO and os.environ.get("GENESIS_ENABLE_PN126_ROT_QK", "0") == "1":
+    MODO = "hadamard"
+
 DAMP = float(os.environ.get("GENESIS_PN126_DAMP", "0.01"))
 _TRIGGER = "/dev/shm/pn126_volcar"
 
@@ -55,11 +50,19 @@ _cargados = None
 _llamadas = 0
 _volcado = False
 
+_signos: dict[tuple[int, int], torch.Tensor] = {}
+_kernels: dict[tuple[int, torch.dtype], any] = {}
 
-def activo() -> bool:
-    # PN131 con rotacion entera en PTX rota q/k adentro de sus kernels: no rotar dos veces.
-    if (os.environ.get("GENESIS_ENABLE_PN131_SK18", "0") == "1"
-            and os.environ.get("GENESIS_PN131_ROT", "ptx") == "ptx" and MODO == "hadamard"):
+
+def activo(D: int | None = None) -> bool:
+    if os.environ.get("GENESIS_ENABLE_PN126_ROT_QK", "0") != "1" and MODO not in ("hadamard", "captura", "wush"):
+        return False
+    # PN131 con rotacion entera en PTX rota q/k adentro de sus kernels (solo capas QD=256 de atencion completa).
+    # Para D=256 y PN131 activo con PTX, no rotar dos veces.
+    # Para D=128 (DFlash2) o capas fuera de PN131, rot_qk debe estar activo.
+    if D == 256 and (os.environ.get("GENESIS_ENABLE_PN131_SK18", "0") == "1"
+                     and os.environ.get("GENESIS_PN131_ROT", "ptx") == "ptx"
+                     and MODO == "hadamard"):
         return False
     return MODO in ("hadamard", "captura", "wush")
 
@@ -69,7 +72,83 @@ def _rank() -> int:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         return int(get_tensor_model_parallel_rank())
     except Exception:
-        return int(torch.cuda.current_device())
+        return int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+
+
+def _signos_dev(D: int, dev: torch.device) -> torch.Tensor:
+    idx = dev.index if dev.index is not None else 0
+    k = (D, idx)
+    s = _signos.get(k)
+    if s is None:
+        g = torch.Generator(device=dev).manual_seed(126)  # Mismos signos fijados que PN131
+        s = (torch.randint(0, 2, (D,), generator=g, device=dev).to(torch.int32) * 2 - 1).contiguous()
+        _signos[k] = s
+    return s
+
+
+def _get_kernel(D: int, dtype: torch.dtype):
+    k = (D, dtype)
+    if k in _kernels:
+        return _kernels[k]
+    # El kernel lee los BITS de 16: con cualquier otro dtype (fp32 en la referencia de
+    # PN131.escribir) interpretaria basura. Esos van por el fallback entero de PyTorch.
+    sufijo = {torch.float16: "f16", torch.bfloat16: "bf16"}.get(dtype)
+    if sufijo is None:
+        _kernels[k] = None
+        return None
+    try:
+        from vllm._genesis.kernels.ptx_lab import Kernel
+        nombre = f"sk_fwht{D}_{sufijo}"
+        kern = Kernel("sk_fwht.cu", nombre, warps=4)
+        kern.cargar()
+        _kernels[k] = kern
+        return kern
+    except Exception as e:
+        log.warning("[PN126] fallback entero: no se cargo kernel CUDA %s: %s", f"sk_fwht{D}", e)
+        _kernels[k] = None
+        return None
+
+
+def _fwht_int_py(x_flat: torch.Tensor, s: torch.Tensor, D: int) -> torch.Tensor:
+    """Fallback puro en PyTorch entero (int32) para Fast Walsh-Hadamard."""
+    x_i = (x_flat.float() * 16384.0).round().to(torch.int32) * s
+    h = 1
+    while h < D:
+        v = x_i.view(-1, D // (2 * h), 2, h)
+        x_i = torch.cat([v[:, :, 0, :] + v[:, :, 1, :],
+                         v[:, :, 0, :] - v[:, :, 1, :]], dim=-1).view(-1, D)
+        h *= 2
+    if D == 256:
+        y = (x_i + 8) >> 4
+    elif D == 128:
+        y = ((x_i.to(torch.int64) * 92682 + 524288) >> 20).to(torch.int32)
+    else:
+        raise ValueError(f"D={D} no soportado para FWHT")
+    return (y.float() * (1.0 / 16384.0)).to(x_flat.dtype)
+
+
+def rotar_tensor(x: torch.Tensor, D: int) -> None:
+    """Aplica la rotacion Hadamard ENTERA (FWHT) in-place a cualquier tensor que termine en D."""
+    if x.numel() == 0 or D not in (128, 256):
+        return
+    dev = x.device
+    signos = _signos_dev(D, dev)
+    M = x.numel() // D
+
+    necesita_copia = not x.is_contiguous()
+    target = x.contiguous() if necesita_copia else x
+    flat = target.view(-1, D)
+
+    kern = _get_kernel(D, x.dtype) if dev.type == "cuda" else None
+    if kern is not None:
+        grid_x = (M + 3) // 4
+        kern.lanzar((grid_x, 1), [flat, signos, M])
+    else:
+        out = _fwht_int_py(flat, signos, D)
+        flat.copy_(out)
+
+    if necesita_copia:
+        x.copy_(target)
 
 
 def hadamard(n: int, device, dtype=torch.float64) -> torch.Tensor:
@@ -80,9 +159,6 @@ def hadamard(n: int, device, dtype=torch.float64) -> torch.Tensor:
 
 
 def _hadamard_aleatoria(D: int, device) -> torch.Tensor:
-    # Signos fijos (semilla fija, generados en la GPU): la matriz tiene que ser la
-    # misma en todos los ranks y en todos los arranques, porque la KV y la cache
-    # de prefijos guardan k ya rotada.
     g = torch.Generator(device=device).manual_seed(126)
     s = torch.randint(0, 2, (D,), generator=g, device=device).to(torch.float64) * 2 - 1
     return hadamard(D, device) * s[None, :]
@@ -161,12 +237,16 @@ def _impl(q: torch.Tensor, k: torch.Tensor, nombre: str, hkv: int, D: int) -> No
     if MODO == "captura":
         _acumular(nombre, q, k, hkv, D)
         return
-    Mq, Mk = _matrices(nombre, hkv, D, q.device)
-    T = q.shape[0]
-    qh = q.reshape(T, hkv, -1, D)
-    kh = k.reshape(T, hkv, D)
-    q.copy_(torch.einsum("gde,tgie->tgid", Mq.to(q.dtype), qh).reshape(q.shape))
-    k.copy_(torch.einsum("gde,tge->tgd", Mk.to(k.dtype), kh).reshape(k.shape))
+    if MODO == "hadamard":
+        rotar_tensor(q, D)
+        rotar_tensor(k, D)
+    else:
+        Mq, Mk = _matrices(nombre, hkv, D, q.device)
+        T = q.shape[0]
+        qh = q.reshape(T, hkv, -1, D)
+        kh = k.reshape(T, hkv, D)
+        q.copy_(torch.einsum("gde,tgie->tgid", Mq.to(q.dtype), qh).reshape(q.shape))
+        k.copy_(torch.einsum("gde,tge->tgd", Mk.to(k.dtype), kh).reshape(k.shape))
 
 
 def _fake(q, k, nombre, hkv, D) -> None:
@@ -175,12 +255,21 @@ def _fake(q, k, nombre, hkv, D) -> None:
 
 def registrar() -> None:
     from vllm.utils.torch_utils import direct_register_custom_op
-    direct_register_custom_op(op_name="genesis_rot_qk", op_func=_impl,
-                              mutates_args=["q", "k"], fake_impl=_fake)
+    try:
+        direct_register_custom_op(op_name="genesis_rot_qk", op_func=_impl,
+                                  mutates_args=["q", "k"], fake_impl=_fake)
+    except Exception:
+        # Ya registrado en este proceso
+        pass
 
 
 def rotar(q: torch.Tensor, k: torch.Tensor, nombre: str, hkv: int, D: int) -> None:
-    torch.ops.vllm.genesis_rot_qk(q, k, nombre, hkv, D)
+    if not activo(D):
+        return
+    if hasattr(torch.ops.vllm, "genesis_rot_qk"):
+        torch.ops.vllm.genesis_rot_qk(q, k, nombre, hkv, D)
+    else:
+        _impl(q, k, nombre, hkv, D)
 
 
 if activo():

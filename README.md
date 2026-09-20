@@ -57,7 +57,8 @@ as the **compute** format, stage by stage:
 | KV cache | fp16 / fp8 | **int8 per token-head** | `--kv-cache-dtype int8_per_token_head` | **+30%** decode @50K vs fp8, and **4× less error** |
 | Attention decode | fp16/fp8 kernel | **integer, hand-written PTX** | **PN131** — SK-18h reads the int8 KV directly, no dequant | parity with FlashInfer fp8 on quality, decode and PP |
 | TP all-reduce | fp16 | **int8** | **PN120** — half the bytes over a PCIe link already at 96% | **+6.5%** prefill |
-| Drafter KV | inherits fp16 | **int8** | compose | part of the **+217%** KV capacity |
+| Drafter KV | inherits fp16 | **int8** | compose | part of the **+226%** KV capacity |
+| `lm_head` (target + drafter) | bf16 → fp8 | **int4 g128** | **PN139** — half the bytes of fp8, a format Ampere has no silicon for | **+3%** steps/s, **+3%** KV |
 
 The point is the *composition*. Any one of these is a known trick; doing all of
 them means a tensor never has to leave the integer domain between the RMSNorm
@@ -208,7 +209,8 @@ known-good starting point.
 | Weights / activations | int4 weights · **int8 activations** (W4A8 Marlin) |
 | KV cache | **`int8_per_token_head`**, read directly by this project's integer PTX decode kernel |
 | Context | 262 144 tokens · `max-num-seqs 10` · `gpu-memory-utilization 0.92` |
-| **KV capacity** | **566 314 tokens** — 2.16× concurrency at full context |
+| `lm_head` | **int4 per group (g128)**, target and drafter — no fp8 tensor left anywhere in the chain |
+| **KV capacity** | **583 790 tokens** — 2.23× concurrency at full context |
 | Address on this host | `172.20.0.228:8320`, alias `vllm-server` |
 
 A second compose keeps the **MTP** drafter as a fallback path:
@@ -226,20 +228,52 @@ per run. Raw output in [`tests/bench/resultados/`](tests/bench/resultados/).
 
 | | mean | CV |
 |---|---|---|
-| prefill @ 10K | **2829** tok/s | 0.2% |
-| prefill @ 90K | **1850** tok/s | 0.6% |
-| decode, narrative | **131** tok/s | 4.8% |
-| decode, code | **235** tok/s | 9.4% |
+| prefill @ 10K | **2808** tok/s | 1.3% |
+| prefill @ 90K | **1838** tok/s | 0.7% |
+| decode, narrative | **134** tok/s | 5.3% |
+| decode, code | **257** tok/s | 8.7% |
+
+That is the stack as it stands at the end of 2026-09-20: PN139 on, PN122 with its
+model-runner-v2 hooks, PN92/PN108 off. The run from that morning, before those changes, gave
+2829 / 1850 / 131 / 235. Prefill is unchanged within its CV; the decode means moved +2% and
++9%, which is **inside** this harness's 5–9% decode spread — one run per stack does not
+resolve it. The A/B that does resolve it is [below](#ab-on-a-greedy-bench-2026-09-20).
 
 Prefill is very stable. Decode spread is real, not noise: throughput tracks
 DFlash2's acceptance rate, which depends heavily on the content being generated
 — code accepts far more draft tokens than prose, which is the whole 131 → 235
 gap.
 
-The harness reports `INTEGRITY: OK` and `swap check: PASS`. Its draft-acceptance
+The harness reports `INTEGRITY: OK` and `swap check: PASS`. (Its measured requests go through
+`urllib`, not `curl`, so `tests/bench/medicion/club_bench.sh` now injects the API key with a
+temporary `sitecustomize`, scoped to the server under test — the `.curlrc` alone got 401s.) Its draft-acceptance
 and engine-timing captures came back empty (the engine does not log acceptance
 at this verbosity), so the acceptance rate behind that gap is inferred from
 throughput, not measured here.
+
+### A/B on a greedy bench, 2026-09-20
+
+`bench.sh` samples at `temperature=0.6`, so its decode spread hides anything under ~5%. For
+A/B work there is [`tests/bench/medicion/ab_greedy.py`](tests/bench/medicion/ab_greedy.py):
+`temperature=0`, 1 500 tokens, 1 warm-up + 3 runs, acceptance from the `/metrics` deltas, and a
+foreign-traffic check. Two loads: reasoning prose, and code with thinking off. One fresh
+container per arm.
+
+| arm | prose tok/s (accept) | code tok/s (accept) | verdict |
+|---|---|---|---|
+| baseline, two boots | 118.5 / 117.9 (2.79) | 274.7 / 265.0 (6.58 / 6.38) | — |
+| **PN139** — `lm_head` int4 instead of fp8 | **124.4 / 123.9** (2.86) | 273.6 / 256.5 | **+5% prose**, reproduced; on |
+| drafter **without** Hadamard rotation | 123.3 (2.92) | **239.8** (5.79) | −7…13% code; rotation stays |
+| PN92 + PN108 off (no fp8 left) | 125.2 | 273.9 | neutral; off |
+
+Prose is tight (±0.3 tok/s, reproduces across boots). Code is **not**: the same config gave
+256–275 across four boots, because the generation-based healthcheck lands inside some runs and
+moves the acceptance. Under ~5% on code, one boot per arm proves nothing.
+
+Two things fall out besides the verdicts. Steps/s is ~42 with or without the drafter rotation,
+so the whole effect is acceptance — **fusing or optimising the FWHT kernel would buy nothing**.
+And the bench is short-context only; K and the attention kernel were tuned at 50K+, and a
+long-context arm is still missing.
 
 ### Behavioural quality
 
@@ -316,7 +350,7 @@ configuration is on the list.
 
 ## What this fork adds
 
-The dispatcher holds **103 patch entries**; **56 are active** in the production
+The dispatcher holds **192 entries**; **61 are applied** in the production
 container. Everything from PN120 up is this fork's work. ✅ marks what is
 actually running in production, taken from the dispatcher's boot log rather than
 from the code defaults.
@@ -333,7 +367,7 @@ from the code defaults.
 | ✅ | **PN126** | Hadamard rotation of q/k after RoPE — halves the int8 KV error at layer 35, costs ~1.4% prefill |
 | | PN134-137 | int8 activation quantization fused into the RMSNorm; group smoothing folded into the weights (exact SmoothQuant) |
 | | PN133 | Draft-model linears in W8A8 — the 7.6% above |
-| | PN139 | `lm_head` in per-group int4 — the 12.6% above |
+| ✅ | **PN139** | `lm_head` in per-group int4 (g128), target and drafter — replaces the fp8 of PN77, which stays on only as the hook |
 
 ### KV cache and capacity
 
@@ -341,12 +375,12 @@ from the code defaults.
 |---|---|---|
 | ✅ | **PN145** | Sliding-window block aligned with primary attention |
 | ✅ | **PN146** | Selectable KV group size — upstream's heuristic picks badly on hybrid models |
-| ✅ | **PN122** | MTP rollback on GDN without speculative blocks |
+| ✅ | **PN122** | Speculative rollback on GDN without speculative blocks. Needs its own hooks in the v2 model runner, which DFlash2 forces — see [open problems](#status-and-open-problems) |
 | ✅ | **PN127** | `MambaManager` honours `drop_eagle_block` (vllm#48375) |
 | ✅ | **PN121** | Preemption-cascade guard with deferred frees |
 
-PN145 + PN146, plus giving the drafter int8 KV, took capacity from 178 823 to
-**566 314 tokens (+217%)**. The mechanism is counter-intuitive and worth
+PN145 + PN146, giving the drafter int8 KV, and the int4 `lm_head` took capacity from 178 823 to
+**583 790 tokens (+226%)**. The mechanism is counter-intuitive and worth
 knowing: on a hybrid model `bytes_per_block` is the **max** across groups, not
 the sum, so *smaller* groups yield *more* total blocks.
 
@@ -418,7 +452,7 @@ Take the `GPU KV cache size` your engine prints at boot and read across:
 |---|---|---|---|
 | 100 000 tok | 1.7 GiB | 2.5 GiB | 3.3 GiB |
 | 250 000 tok | 4.2 GiB | 6.3 GiB | 8.3 GiB |
-| **566 314 tok** ← this rig | **9.5 GiB** | 14.2 GiB | 18.9 GiB |
+| **583 790 tok** ← this rig | **9.7 GiB** | 14.6 GiB | 19.5 GiB |
 | 1 000 000 tok | 16.7 GiB | 25.0 GiB | 33.4 GiB |
 | 2 000 000 tok | 33.4 GiB | 50.1 GiB | 66.8 GiB |
 
@@ -435,7 +469,7 @@ L2 = 6 GiB (0.64× L1)   →   16 of 20
 complete prefix         →   the 1.21 s rescue above
 ```
 
-On this machine L1 is 566 314 tokens, so L2 wants 9.4 GiB. The host has 30 GB
+On this machine L1 is 583 790 tokens, so L2 wants 9.7 GiB. The host has 30 GB
 total with the container already at 16.4 GB, so that is not reachable here —
 which is why this rig runs at 0.21× and why the tier is provisioned to exist
 rather than to pay. **On a machine with RAM to spare, size L2 at or above L1 and
@@ -526,9 +560,20 @@ hard way:
   the hardware path and a working compose all exist; what is missing is a
   quantization process built around per-group scales along the head dimension.
   See [Next: int4 in the KV cache](#next-int4-in-the-kv-cache).
-- **L2 is at 0.21× L1 and wants 9.4 GiB to do its job.** The tiered KV cache
+- **L2 is at 0.21× L1 and wants 9.7 GiB to do its job.** The tiered KV cache
   works and the rescue is reproducible; what limits it here is host RAM, not the
   mechanism. See [Size L2 relative to L1](#size-l2-relative-to-l1--this-is-the-whole-game).
+- **PN122 silently corrupted long generations with DFlash2 — fixed 2026-09-20, and worth
+  knowing how it hid.** DFlash2 forces vLLM's v2 model runner, which migrates GDN state across
+  block boundaries from `mamba_hybrid.py`; PN122's materialisation hooks lived only on the v1
+  path, while its "skip the biased copy" edit sat in a kernel both runners share. Every
+  880-token block boundary left the recurrent state stale: output degenerated (loops, zeros,
+  EOS mid-word) after ~1 000 tokens. `quality-test --quick` scored 27/30 throughout, because
+  none of its answers cross a boundary. **The oracle for this patch is a >2 000-token
+  generation, single and concurrent** — not a short-answer suite.
+- **A second bug the same day:** the new integer FWHT reads 16-bit words, and PN131's
+  reference-scale code handed it fp32. Signature: `ek=11` on *every* attention layer in the boot
+  log, where a healthy boot shows `ek=0`. Identical values across layers are the tell.
 - **The decode profile is a configuration behind.** Re-profile against int8 KV +
   DFlash2 K=8 before acting on the percentages above.
 - **The drafter still runs in fp16** — 7.6% of every decode step. PN133 is

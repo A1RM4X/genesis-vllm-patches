@@ -135,10 +135,11 @@ def _signos_dev(dev):
 
 
 def _rotar_q_prefill(query):
-    """Prefill (eager): misma rotacion que el kernel entero, en fp16 (la KV ya guarda k rotada)."""
-    s = _signos_dev(query.device).to(query.dtype)
-    H = _hadamard(query.device, query.dtype)
-    return torch.einsum("de,the->thd", H, query * s) / 16.0
+    """Prefill (eager): rotacion Hadamard ENTERA (FWHT), igual que el decode en PTX."""
+    from vllm._genesis import rot_qk
+    q_rot = query.clone()
+    rot_qk.rotar_tensor(q_rot, QD)
+    return q_rot
 
 
 _H = {}
@@ -503,7 +504,7 @@ def forward(impl, layer, query, kv_cache, md, output):
     return _prefill_decuant(impl, layer, query, kv_cache, md, output)
 
 
-_DIAG = os.environ.get("GENESIS_PN131_DIAG", "")
+_DIAG = os.environ.get("GENESIS_PN131_DIAG", "layers.3.self_attn.attn")
 _diag_n = {}
 
 
@@ -513,7 +514,7 @@ def _diag(impl, layer, query, kv_cache, md, output, B, L, capturando):
     if not _DIAG or capturando or _DIAG not in nombre:
         return
     c_ = _capa(impl, query.device)
-    if not c_.fija or int(md.seq_lens[:B].max()) < 1000:   # nada de pasos de calentamiento
+    if not c_.fija or int(md.seq_lens[:B].max()) < 870:   # nada de pasos de calentamiento
         return
     k = _diag_n.get(nombre, 0)
     if k >= 40:

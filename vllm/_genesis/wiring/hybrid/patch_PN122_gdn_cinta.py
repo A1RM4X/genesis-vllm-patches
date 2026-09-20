@@ -221,6 +221,40 @@ MU_POST_NEW = (
     + MU_POST_OLD
 )
 
+# ─────────────── model runner v2 (DFlash2): mamba_hybrid.py ───────────────
+# El v2 no pasa por preprocess_mamba/postprocess_mamba_all: migra el estado desde
+# MambaHybridModelState, llamando directo a los kernels fusionados. Sin estos ganchos el
+# salteo de bias>0 (pn122_mu_skip, que SI le llega) dejaba el estado GDN viejo en cada borde
+# de bloque: la salida degeneraba a los ~1000 tokens. En v0.27.1 el archivo no existe.
+MH_IMPORT_OLD = "from vllm.v1.worker.mamba_utils import (\n"
+MH_IMPORT_NEW = _IMP + MH_IMPORT_OLD
+MH_PRE_OLD = (
+    "        ctx.run_fused_precopy(\n"
+    "            num_reqs,\n"
+    "            self._mamba_state_idx_gpu,\n"
+)
+MH_PRE_NEW = (
+    "        if _g122.activo():  # " + MARKER + "\n"
+    "            _g122.v2_pre(\n"
+    "                ctx, kv_cache_config,\n"
+    "                self.vllm_config.compilation_config.static_forward_context,\n"
+    "                num_reqs, input_batch.idx_mapping, self._mamba_state_idx_gpu,\n"
+    "                self._mamba_src_col_gpu, self._mamba_src_off_gpu,\n"
+    "            )\n"
+    + MH_PRE_OLD
+)
+MH_POST_OLD = (
+    "            self._mamba_ctx.run_fused_postprocess_align(\n"
+)
+MH_POST_NEW = (
+    "            if _g122.activo():  # " + MARKER + "\n"
+    "                _g122.v2_post(\n"
+    "                    self._mamba_ctx, num_reqs, self.num_accepted_tokens_gpu,\n"
+    "                    self._mamba_state_idx_gpu, num_computed_tokens, idx_mapping,\n"
+    "                )\n"
+    + MH_POST_OLD
+)
+
 # ─────────────── v0.29.0: el early-return que marcaba el request antes de tiempo ───────────────
 # PN122 pone `num_speculative_blocks = 0`: ese es TODO su beneficio (libera K bloques de estado
 # GDN por request del pool). En v0.29.0 upstream agrego una linea adentro del early-return de
@@ -291,7 +325,15 @@ _PATCHES = [
         ("pn122_mu_pre", MU_PRE_OLD, MU_PRE_NEW),
         ("pn122_mu_post", MU_POST_OLD, MU_POST_NEW),
     ]),
+    ("v1/worker/gpu/model_states/mamba_hybrid.py", [
+        ("pn122_mh_import", MH_IMPORT_OLD, MH_IMPORT_NEW),
+        ("pn122_mh_pre", MH_PRE_OLD, MH_PRE_NEW),
+        ("pn122_mh_post", MH_POST_OLD, MH_POST_NEW),
+    ]),
 ]
+
+
+_SOLO_V2 = {"v1/worker/gpu/model_states/mamba_hybrid.py"}
 
 
 def _patchers() -> list[TextPatcher] | None:
@@ -299,6 +341,8 @@ def _patchers() -> list[TextPatcher] | None:
     for rel, subs in _PATCHES:
         target = resolve_vllm_file(rel)
         if target is None:
+            if rel in _SOLO_V2:   # v0.27.1 no tiene model runner v2
+                continue
             return None
         out.append(TextPatcher(
             patch_name=f"PN122 cinta GDN ({rel.rsplit('/', 1)[-1]})",

@@ -149,6 +149,7 @@ services:
       # 0,22%/0,39% (capas 3/35) — a la mitad en la 35. Antes lo teniamos apagado
       # por una lectura mal hecha de una medicion vieja.
       - GENESIS_ENABLE_PN126_ROT_QK=1
+      - GENESIS_PN126_ROT=hadamard
       # 2026-09-19: ERA EL BUG QUE HACIA QUE EL OFFLOAD ESCRIBIERA Y NUNCA LEYERA, y el
       # presupuesto hay que darlo con holgura. PN91 pasa a modo estricto al agotarse, y en
       # estricto un bloque EN VUELO cuenta como MISS: corta la racha de la ventana
@@ -161,10 +162,12 @@ services:
       # toque, no HIT_PENDING. Medido, TTFT en frio 6,76-6,81 s, igual que antes.
       - GENESIS_PN91_MAX_DEFER_SECONDS=15.0
       - GENESIS_PN91_MAX_DEFER_STEPS=400
-      - GENESIS_ENABLE_PN92_KV_FP4_COMPRESSION=1
-      - GENESIS_PN92_COMPRESS_ON_WRITE=0
-      - GENESIS_PN92_KV_DTYPE=fp8_e4m3
-      - GENESIS_PN92_CHUNK_ELEMS=1048576
+      # PN92 (codec de 4 bits del tier de disco): APAGADO 2026-09-20. Solo sabe leer la KV
+      # como fp8_e4m3 o fp16 (kv_fp4_codec.kv_dtype_code) y la KV es int8 por token-cabeza:
+      # estaba inerte (COMPRESS_ON_WRITE=0), pero prenderlo interpretaba mal los bytes.
+      # Para volver necesita un modo int8 (agrupar los int8 ya cuantizados, sin pasar por
+      # float). Sin el: mismos parches aplicados salvo este, misma KV, mismo rendimiento.
+      - GENESIS_ENABLE_PN92_KV_FP4_COMPRESSION=0
       - GENESIS_ENABLE_PN93_SPARSE_GDN=0
       - GENESIS_PN93_GDN_CHECKPOINT_STRIDE=16
       # PN99 comprime a 4 bits asumiendo que el KV es fp8; con el KV en int8 por
@@ -180,8 +183,12 @@ services:
       # El lm_head viene en BF16 y con un vocabulario de 150k+ es de los tensores
       # mas pesados del modelo, y se lee ENTERO en cada paso de decode.
       # PN77 lo baja a fp8 y PN108 hace lo mismo para el borrador del MTP.
+      # PN77 queda prendido SOLO como enganche de PN139 (el walker): con PN139 activo el swap
+      # a int4 tiene prioridad y ningun lm_head termina en fp8. Verificar en el arranque:
+      # dos lineas "PN139: lm_head ? a int4 g128" por worker (target y borrador).
       - GENESIS_ENABLE_PN77_FP8_LM_HEAD=1
-      - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=1
+      # PN108 (lm_head del borrador a fp8): apagado 2026-09-20, PN139 llega igual al borrador.
+      - GENESIS_ENABLE_PN108_DRAFT_FP8_LM_HEAD=0
       #
       # PN139: el mismo lm_head en int4 por grupo (g128) en vez de fp8 — la MITAD
       # de los bytes, y el decode esta limitado por trafico, no por aritmetica.
@@ -192,7 +199,11 @@ services:
       # arranque no determinista de v0.29.0 (ver el bloque de PN122 abajo). NO esta probado
       # que PN139 sea la causa — al contrario, hubo un arranque roto con PN139 ya apagado.
       # En v0.27.1 sigue prendido y andando (+8,9% de decode, 318 MB contra 646 por GPU).
-      - GENESIS_ENABLE_PN139_LM_HEAD_INT4=0
+      # 2026-09-20: PRENDIDO de nuevo en v0.29.0. A/B con banco greedy (3 corridas, +-0,3):
+      # pasos/s +3%, prosa 118,2 -> 124,4 tok/s, codigo 270 -> 273,6 (ruido), aceptacion
+      # igual, KV 566.314 -> 583.790. El arranque roto que motivo apagarlo era otra cosa
+      # (la referencia ek de PN131 y los ganchos v2 de PN122, los dos arreglados hoy).
+      - GENESIS_ENABLE_PN139_LM_HEAD_INT4=1
 
       # ── APAGADOS A PROPOSITO, con el motivo medido ─────────────────────────
       # Sin esto nadie sabe si ya se probo, y se reintenta cada seis meses.
@@ -406,6 +417,12 @@ services:
       # Que cuesta: -2,6% de decode, medido con A/B INTERCALADO (A/B/A/B, 3 calentamientos +
       # 5 medidas por arranque, CV 0,05%). La deriva entre arranques del mismo brazo es 0,7%,
       # asi que el delta se le puede creer. OJO: una sonda sin calentar habia dado -7,6%.
+      #
+      # 2026-09-20: con DFlash2 corre el model runner v2 (el v1 lo rechaza), que migra el
+      # estado GDN desde mamba_hybrid.py y no pasaba por los ganchos de la cinta: el estado
+      # quedaba viejo en cada borde de bloque (880 tok) y la salida degeneraba a los ~1000
+      # tokens. Arreglado con gdn_cinta.v2_pre/v2_post + pn122_mh_*. OJO: el quality-test
+      # --quick no lo ve (no cruza un borde); el oraculo es una generacion de >2000 tokens.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo

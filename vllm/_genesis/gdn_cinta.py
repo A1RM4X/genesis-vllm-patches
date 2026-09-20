@@ -230,7 +230,7 @@ def enlazar(layer, device) -> None:
     log.warning("[PN122] cinta de %s: %d slots x %d tokens x %d", getattr(layer, "prefix", "?"),
                 _n_slots, layer.num_spec, fila(layer))
     layer._g122_cinta = torch.zeros(
-        (_n_slots, layer.num_spec, fila(layer)), dtype=torch.float16, device=device)
+        (_n_slots, layer.num_spec, fila(layer)), dtype=torch.float32, device=device)
 
 
 # ─────────────────────────────── kernels ────────────────────────────────
@@ -342,14 +342,14 @@ def _k_escribir(A_log, a, b, dt_bias, beta_sp, threshold, k, v, cu, sidx, slots,
             kk = tl.load(k + (src * H + hh) * K + ok, mask=mk, other=0).to(tl.float32)
             if IS_L2:
                 kk = kk * tl.rsqrt(tl.sum(kk * kk) + 1e-6)
-            tl.store(row + hh * K + ok, kk.to(tl.float16), mask=mk)
+            tl.store(row + hh * K + ok, kk.to(tl.float32), mask=mk)
         tl.store(row + H * K + ohv,
-                 tl.load(v + src * HV * V + ohv, mask=mhv, other=0).to(tl.float16), mask=mhv)
+                 tl.load(v + src * HV * V + ohv, mask=mhv, other=0).to(tl.float32), mask=mhv)
         x = tl.load(a + src * HV + oh, mask=mh, other=0).to(tl.float32) + db
         sp = tl.where(beta_sp * x <= threshold, (1 / beta_sp) * tl.log(1 + tl.exp(beta_sp * x)), x)
-        tl.store(row + H * K + HV * V + oh, (-tl.exp(Al) * sp).to(tl.float16), mask=mh)
+        tl.store(row + H * K + HV * V + oh, (-tl.exp(Al) * sp).to(tl.float32), mask=mh)
         bb = tl.sigmoid(tl.load(b + src * HV + oh, mask=mh, other=0).to(tl.float32))
-        tl.store(row + H * K + HV * V + HV + oh, bb.to(tl.float16), mask=mh)
+        tl.store(row + H * K + HV * V + HV + oh, bb.to(tl.float32), mask=mh)
 
 
 def spec_update(layer, A_log, a, b, dt_bias, q, k, v, ssm_state, cu_seqlens,
@@ -482,46 +482,64 @@ def _sombra_despues(layer, A_log, a, b, dt_bias, q, k, v, cu, sidx, nacc, slots,
 @triton.jit(do_not_specialize=["num_reqs"])
 def _k_materializar(MODO_POST: tl.constexpr, nacc, state_idx, nsched, ncomp, ndraft,
                     src_col_p, bias_p, bt_ptrs, bt_stride: tl.int64, ssm_addrs, ssm_strides,
-                    grupos, cinta_addrs, slots, num_reqs, block_size: tl.constexpr,
-                    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                    grupos, cinta_addrs, slots, idx_map, num_reqs, block_size: tl.constexpr,
+                    IDX: tl.constexpr, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
                     BK: tl.constexpr, BV: tl.constexpr, TM: tl.constexpr, ROW: tl.constexpr):
     """Escribe en ``dst`` el estado que upstream leeria de ``columna src + bias``:
     ``estado[src]`` + ``bias`` filas de cinta. Solo casos con bias > 0; el resto
-    (conv, bias 0) lo sigue copiando el kernel de upstream."""
+    (conv, bias 0) lo sigue copiando el kernel de upstream.
+
+    ``IDX`` (model runner v2): los arreglos por request viven indexados por slot de
+    req-state (``idx_map[fila]``), la block table sigue por fila del batch, ``ncomp`` ya
+    trae el computado DESPUES del paso, y el slot de cinta es ``slot de req-state + 1``
+    (lo mismo que ``v2_pre`` deja en ``slots_gpu()`` para el builder de GDN)."""
     req = tl.program_id(0)
     lay = tl.program_id(1)
     if req >= num_reqs:
         return
+    if IDX:
+        ri = tl.load(idx_map + req)
+        if ri < 0:
+            return
+    else:
+        ri = req
     if MODO_POST:
-        acc = tl.load(nacc + req)
-        src_col = tl.load(state_idx + req)
-        running = tl.load(ncomp + req) + tl.load(nsched + req) - tl.load(ndraft + req)
-        nuevo = running + acc - 1
+        acc = tl.load(nacc + ri)
+        src_col = tl.load(state_idx + ri)
+        if IDX:
+            nuevo = tl.load(ncomp + ri)
+            running = nuevo - acc + 1
+        else:
+            running = tl.load(ncomp + ri) + tl.load(nsched + ri) - tl.load(ndraft + ri)
+            nuevo = running + acc - 1
         alineado = (nuevo // block_size) * block_size
         if alineado < running:
             return
         bias = alineado - running
         dst_col = alineado // block_size - 1
     else:
-        src_col = tl.load(src_col_p + req)
-        dst_col = tl.load(state_idx + req)
+        src_col = tl.load(src_col_p + ri)
+        dst_col = tl.load(state_idx + ri)
         if src_col < 0 or src_col == dst_col:
             return
-        bias = tl.load(bias_p + req)
+        bias = tl.load(bias_p + ri)
     if bias <= 0 or src_col < 0 or dst_col < 0:
         return
     g = tl.load(grupos + lay).to(tl.int64)
     bt = tl.load(bt_ptrs + g).to(tl.pointer_type(tl.int32)) + req * bt_stride
     sb = tl.load(bt + src_col).to(tl.int64)
     dbk = tl.load(bt + dst_col).to(tl.int64)
-    if sb <= 0 or dbk <= 0:
+    if sb <= 0 or dbk <= 0:   # 0 es el bloque nulo de vLLM: ni leerlo ni escribirlo
         return
     base = tl.load(ssm_addrs + lay)
     stride = tl.load(ssm_strides + lay)
     src = (base + sb * stride).to(tl.pointer_type(tl.float16))
     dst = (base + dbk * stride).to(tl.pointer_type(tl.float16))
-    slot = tl.load(slots + req).to(tl.int64)
-    tape = tl.load(cinta_addrs + lay).to(tl.pointer_type(tl.float16)) + slot * TM * ROW
+    if IDX:
+        slot = (ri + 1).to(tl.int64)
+    else:
+        slot = tl.load(slots + req).to(tl.int64)
+    tape = tl.load(cinta_addrs + lay).to(tl.pointer_type(tl.float32)) + slot * TM * ROW
     o_k = tl.arange(0, BK)
     mk = o_k < K
     for hv in range(0, HV):
@@ -585,13 +603,15 @@ def _init_meta(ctx, kv_cache_config, forward_context) -> bool:
     return True
 
 
-def _lanzar(modo_post, ctx, num_reqs, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias):
+def _lanzar(modo_post, ctx, num_reqs, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias,
+            idx_map=None):
     H, HV, K, V, TM, ROW = _meta.dims
     _k_materializar[(num_reqs, len(_meta.capas))](
         modo_post, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias,
         ctx.block_table_ptrs, ctx.block_table_stride_req, _meta.ssm_addrs,
-        _meta.ssm_strides, _meta.grupos, _meta.cinta_addrs, slots_gpu(), num_reqs,
-        block_size=ctx.block_size, H=H, HV=HV, K=K, V=V,
+        _meta.ssm_strides, _meta.grupos, _meta.cinta_addrs, slots_gpu(),
+        idx_map if idx_map is not None else slots_gpu(), num_reqs,
+        block_size=ctx.block_size, IDX=idx_map is not None, H=H, HV=HV, K=K, V=V,
         BK=triton.next_power_of_2(K), BV=min(triton.next_power_of_2(V), 32),
         TM=TM, ROW=ROW, num_warps=4, num_stages=3)
 
@@ -616,6 +636,8 @@ def materializar_post(ctx, kv_cache_config, forward_context, num_reqs, nacc, sta
     # bias = alineado - running > 0 exige un borde en (running, running + draft].
     if not ((((running + draft) // bs) * bs) > running).any():
         return
+    log.warning("[PN122] materializar_post DISPARADO: running=%s draft=%s bs=%d",
+                running[:num_reqs].tolist(), draft[:num_reqs].tolist(), bs)
     if not _init_meta(ctx, kv_cache_config, forward_context):
         return
     _lanzar(True, ctx, num_reqs, nacc, state_idx_buf.gpu, nsched_buf.gpu, ncomp_buf.gpu,
@@ -631,11 +653,46 @@ def materializar_pre(ctx, kv_cache_config, forward_context, num_reqs, state_idx_
     bias = bias_buf.np[:num_reqs]
     if not ((src >= 0) & (bias > 0)).any():
         return
+    log.warning("[PN122] materializar_pre DISPARADO: src=%s bias=%s",
+                src[:num_reqs].tolist(), bias[:num_reqs].tolist())
     if not _init_meta(ctx, kv_cache_config, forward_context):
         return
     g = state_idx_buf.gpu
     _lanzar(False, ctx, num_reqs, g, g, g, g, g, src_col_buf.gpu, bias_buf.gpu)
 
 
-__all__ = ["activo", "num_speculative_blocks", "actualizar_slots", "enlazar",
+# ───────────────────────── model runner v2 (mamba_hybrid.py) ─────────────────────────
+# DFlash2 obliga al runner v2, que no pasa por preprocess_mamba/postprocess_mamba_all: migra
+# el estado desde MambaHybridModelState.{pre,post}process_state, todo en GPU e indexado por
+# slot de req-state. Sin estos dos ganchos el salteo de bias>0 en _copy_mamba_state_block
+# dejaba el estado viejo en cada borde de bloque y la salida degeneraba (2026-09-20).
+# No hay decision en CPU: bajo async scheduling los espejos numpy son optimistas, asi que el
+# kernel se lanza siempre y sale solo por request (mismo criterio que upstream en v2).
+
+def v2_pre(ctx, kv_cache_config, forward_context, num_reqs, idx_mapping, state_idx, src_col,
+           src_off) -> None:
+    """Antes de ``ctx.run_fused_precopy``. Fija el slot de cinta de cada fila del batch
+    (= slot de req-state + 1; el 0 es relleno) y materializa las migraciones con bias>0."""
+    if not _ACTIVO or _slots_gpu is None or num_reqs == 0:
+        return
+    n = min(num_reqs, _slots_gpu.shape[0])
+    _slots_gpu[:n].copy_(idx_mapping[:n])
+    _slots_gpu[:n].add_(1)
+    if not _init_meta(ctx, kv_cache_config, forward_context):
+        return
+    _lanzar(False, ctx, num_reqs, state_idx, state_idx, state_idx, state_idx, state_idx,
+            src_col, src_off, idx_map=idx_mapping)
+
+
+def v2_post(ctx, num_reqs, nacc, state_idx, ncomp_nuevo, idx_mapping) -> None:
+    """Antes de ``ctx.run_fused_postprocess_align`` (que pisa ``nacc`` con 1)."""
+    if not _ACTIVO or num_reqs == 0 or _meta.ssm_addrs is None:
+        return
+    if sync_bits() & 4:
+        return
+    _lanzar(True, ctx, num_reqs, nacc, state_idx, ncomp_nuevo, ncomp_nuevo, ncomp_nuevo,
+            nacc, nacc, idx_map=idx_mapping)
+
+
+__all__ = ["v2_pre", "v2_post", "activo", "num_speculative_blocks", "actualizar_slots", "enlazar",
            "spec_update", "materializar_post", "materializar_pre", "slots_gpu"]
