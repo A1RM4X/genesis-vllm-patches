@@ -66,21 +66,29 @@ so whichever is up owns the endpoint.
 
 ### Measured performance
 
-Measured 2026-09-19 against the container above, after one long warm-up, with
-cache-busted prompts (a different seed per run). Instrument is this project's
-own script, one shot per run — **not** the warmed `bench.sh` harness, so these
-are a floor, not a best case.
+Measured 2026-09-20 with the `bench.sh` harness from
+[club-3090](https://github.com/noonghunna/club-3090), run **directly against the
+container** (no reverse proxy in the path). Decode: 3 warm-ups + 5 measured
+runs. Prefill: 1 warm-up + 3 measured runs, cache-busted with a fresh haystack
+per run. Raw output and the config that produced it are in
+[`tests/bench/resultados/`](tests/bench/resultados/).
 
-| | mean | range | n |
-|---|---|---|---|
-| prefill @ 10K | **2901** tok/s | 2896 – 2907 | 3 |
-| prefill @ 90K | **1873** tok/s | 1844 – 1913 | 3 |
-| decode, narrative | **121** tok/s | 109 – 128 | 4 |
-| decode, code | **197** tok/s | 132 – 257 | 4 |
+| | mean | CV |
+|---|---|---|
+| prefill @ 10K | **2829** tok/s | 0.2% |
+| prefill @ 90K | **1850** tok/s | 0.6% |
+| decode, narrative | **131** tok/s | 4.8% |
+| decode, code | **235** tok/s | 9.4% |
 
-Decode spread is real, not noise: throughput tracks DFlash2's acceptance rate,
-which depends heavily on the content being generated (code accepts far more
-draft tokens than prose). Prefill, by contrast, is tight — CV 0.2% at 10K.
+Prefill is very stable. Decode spread is real, not noise: throughput tracks
+DFlash2's acceptance rate, which depends heavily on the content being generated
+— code accepts far more draft tokens than prose, which is the whole 131 → 235
+gap.
+
+The harness reports `INTEGRITY: OK` and `swap check: PASS` for this run. Its
+draft-acceptance and engine-timing captures came back empty: the engine does not
+log acceptance at this verbosity, so the acceptance rate behind that gap is
+inferred from the throughput, not measured here.
 
 Behavioural quality is checked with `quality-test.sh --quick` from
 [club-3090](https://github.com/noonghunna/club-3090) (ToolCall-15 +
