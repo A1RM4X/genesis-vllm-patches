@@ -241,9 +241,48 @@ and engine-timing captures came back empty (the engine does not log acceptance
 at this verbosity), so the acceptance rate behind that gap is inferred from
 throughput, not measured here.
 
-Behavioural quality is checked with the same project's `quality-test.sh --quick`
-(ToolCall-15 + InstructFollow-15): **27/30**, with `pass@k=3` reporting zero
-flaky failures.
+### Behavioural quality
+
+`quality-test.sh --quick` from the same project (ToolCall-15 +
+InstructFollow-15), sampled at `temperature=0.6` — so expect run-to-run spread:
+
+| run | stack | score | failing scenarios |
+|---|---|---|---|
+| 2026-09-19 | before today's changes | **27/30** | IF-04, TC-05, TC-09 |
+| 2026-09-19 | same | **27/30** | IF-04, IF-10, TC-05 |
+| 2026-09-20 | int8 + PN126 | **25/30** | IF-04, IF-10, TC-05, TC-09, **TC-11** |
+
+Read the scenarios, not the total. **IF-04 and TC-05 fail in all three runs** —
+those are stable failures, not noise. IF-10 and TC-09 each fail in one of the
+two older runs, so they are the flaky ones, and today they simply happened to
+fail together. Only **TC-11** is new.
+
+That is one run against the current stack, and the 27/30 baseline predates
+today's changes, so the two-point difference is **not** attributable to any
+single patch yet. A clean A/B — PN126 on and off, several runs each, nothing
+else moved — is pending.
+
+### KV format: capacity and throughput
+
+Same harness, same depths, one full run per format, everything else at the
+production configuration:
+
+| | `auto` (fp16) | `int8_per_token_head` |
+|---|---|---|
+| **KV capacity** | 328 160 tok · 1.25× | **566 314 tok · 2.16×** |
+| prefill @ 10K | 2681 (CV 5.1%) | 2648 (CV 13.3%) |
+| prefill @ 90K | 1690 (CV 1.3%) | **1838** (CV 0.7%) |
+| decode, narrative | 151 (CV **23.3%**) | 134 (CV 3.3%) |
+| decode, code | 250 (CV **16.2%**) | 247 (CV 9.4%) |
+
+**int8 gives +73% more KV capacity than fp16** — 1.25× concurrency becomes
+2.16× at full context. On throughput it wins clearly at 90K prefill (+8.8%);
+everywhere else the means are close but the *stability* is not. fp16 runs the
+generic kernel and swings 16–23% between runs; the integer kernel stays at
+3–9%. Compare means with the CV beside them, not alone.
+
+`fp8_e4m3` is absent because it does not boot — see
+[Status](#status-and-open-problems).
 
 ### Where a decode step actually goes
 
@@ -338,25 +377,83 @@ kernel anyway. Only a one-time notice inside the kernel's `forward` revealed it.
 
 ### Tiered KV cache (RAM + NVMe)
 
-The most involved subsystem, and the most honest about its limits. Full write-up
-in **[docs/KV-OFFLOADING.md](docs/KV-OFFLOADING.md)**.
+When VRAM fills, vLLM **discards** old prefix blocks and recomputes them later.
+This subsystem sinks them to RAM (L2) and NVMe (L3) instead, and brings them
+back over PCIe. Full write-up in
+**[docs/KV-OFFLOADING.md](docs/KV-OFFLOADING.md)**.
 
-Three of this project's own patches had it deadlocked: it wrote 50 GB per run
-and had never returned a single hit. `PN97` refused every L3→L2 promotion once
-L2 was permanently full; `PN91`'s 0.2 s deferral budget expired before the
-asynchronous promotions resolved, and in strict mode an in-flight block scores
-as a miss, vetoing the whole lookup; `PN81`'s quota made L3 **smaller than L1**
-while pruning by write age.
+Measured, rescuing a 20K prompt that had been evicted from the GPU:
 
-With all three fixed, rescuing an evicted 20K prompt costs **1.21 s instead of
-6.88 s (−82.5%)**, reproducible across three runs from a clean disk.
+| | |
+|---|---|
+| recompute from scratch | 6.88 s |
+| **rescued from L2/L3** | **1.21 s (−82.5%)** |
+| returned over `CPU_to_GPU` | 612 MiB |
+| reproducibility | 3 runs, clean disk and restart each time |
 
-**But** — under live traffic it still returns **0 external hits**, because
-`_lookup_complete_chunks` requires all nine KV-cache groups to hit and real
-traffic produces partial matches that get discarded wholesale. L1 carries the
-load at 76.4%. Do not enable this expecting a win yet.
+Getting there required fixing three of this project's own patches, which had
+the read path deadlocked: `PN97` refused every L3→L2 promotion once L2 was
+full; `PN91`'s 0.2 s deferral budget expired before the asynchronous promotions
+resolved, and in strict mode an in-flight block scores as a miss, vetoing the
+whole lookup; and `PN81`'s quota had made L3 smaller than L1.
 
----
+#### Size L2 relative to L1 — this is the whole game
+
+**L2 is not a cache in front of L3. It is the gateway to it.** Secondary tiers
+cannot touch GPU memory: every L3→L2→GPU promotion has to land in L2 first. So
+L2's size sets three things at once — how much can leave L1 without falling
+straight through to disk, how much of a prefix can be reassembled at once, and
+therefore whether a lookup can hit at all.
+
+The lookup needs a **complete** chunk-aligned prefix across every KV group. A
+partial prefix is not a partial win, it is no win. And you cannot assemble a
+prefix larger than L2.
+
+That gives a direct sizing rule, in tokens rather than bytes:
+
+| L2 vs L1 | tokens | RAM needed | |
+|---|---|---|---|
+| **0.21×** | 118 926 | 2.0 GiB | what this rig runs today |
+| **1.00×** | 566 314 | 9.4 GiB | minimum for the tier to do its job |
+| 1.50× | 849 471 | 14.1 GiB | comfortable |
+| 2.00× | 1 132 628 | 18.9 GiB | headroom for concurrency |
+
+At **17.5 KiB per token** of L2, the conversion is simple: take your `GPU KV
+cache size` from the boot log, multiply by 17.5 KiB, and that is the floor for
+`cpu_bytes_to_use`.
+
+The rule is not theoretical — hit rate tracks L2 size directly. Chunks of the
+attention prefix that hit, out of 20:
+
+```
+L2 = 2 GiB (0.21× L1)   →   0, 8, 12 or 16 of 20, varying run to run
+L2 = 6 GiB (0.64× L1)   →   16 of 20
+complete prefix         →   the 1.21 s rescue above
+```
+
+On this machine L1 is 566 314 tokens, so L2 wants 9.4 GiB. The host has 30 GB
+total with the container already at 16.4 GB, so that is not reachable here —
+which is why this rig runs at 0.21× and why the tier is provisioned to exist
+rather than to pay. **On a machine with RAM to spare, size L2 at or above L1 and
+this becomes a straight win.** On this one it is correctly configured for the
+memory available, and the ceiling is RAM, not the mechanism.
+
+#### When it engages at all
+
+It only pays when the working set **exceeds** L1 — that is the entire premise.
+Under the traffic observed on this rig it does not:
+
+```
+num_preemptions_total     0          ← nothing was ever evicted from L1
+kv_cache_usage_perc       0.0
+prefix tokens seen        395 636    ← against an L1 of 566 314
+```
+
+With no eviction there is nothing to bring back, and the stores you see
+(2.78 GiB written) are the *proactive* copies the design makes while blocks are
+being computed — working exactly as intended. Before concluding anything about
+hit rate, check `num_preemptions_total` first: if it is zero, the tier was never
+asked to do its job.
 
 ## Getting started
 
@@ -425,10 +522,14 @@ hard way:
   the hardware path and a working compose all exist; what is missing is a
   quantization process built around per-group scales along the head dimension.
   See [Next: int4 in the KV cache](#next-int4-in-the-kv-cache).
-- **KV offload returns 0 external hits under real traffic.** The mechanism works
-  and the synthetic rescue is reproducible, but the all-groups-must-hit
-  constraint means partial matches are wasted. See
-  [docs/KV-OFFLOADING.md](docs/KV-OFFLOADING.md) §4.
+- **L2 is at 0.21× L1 and wants 9.4 GiB to do its job.** The tiered KV cache
+  works and the rescue is reproducible; what limits it here is host RAM, not the
+  mechanism. See [Size L2 relative to L1](#size-l2-relative-to-l1--this-is-the-whole-game).
+- **`fp8_e4m3` does not boot** on the current configuration — 4 attempts out of
+  4, deterministic, with automatic retry on each. Cause not yet diagnosed. That
+  also means the long-standing claim that fp8 degrades quality on this hybrid
+  remains unverified against the current stack: there is nothing to compare
+  against.
 - **The decode profile is a configuration behind.** Re-profile against int8 KV +
   DFlash2 K=8 before acting on the percentages above.
 - **The drafter still runs in fp16** — 7.6% of every decode step. PN133 is
