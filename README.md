@@ -281,9 +281,6 @@ everywhere else the means are close but the *stability* is not. fp16 runs the
 generic kernel and swings 16–23% between runs; the integer kernel stays at
 3–9%. Compare means with the CV beside them, not alone.
 
-`fp8_e4m3` is absent because it does not boot — see
-[Status](#status-and-open-problems).
-
 ### Where a decode step actually goes
 
 Kernel-by-kernel profile of one decode step, so the table above has a shape
@@ -409,18 +406,25 @@ The lookup needs a **complete** chunk-aligned prefix across every KV group. A
 partial prefix is not a partial win, it is no win. And you cannot assemble a
 prefix larger than L2.
 
-That gives a direct sizing rule, in tokens rather than bytes:
+So the sizing rule is in **tokens**, not bytes, and it is anchored to L1:
 
-| L2 vs L1 | tokens | RAM needed | |
+```
+cpu_bytes_to_use  ≥  (your GPU KV cache size in tokens)  ×  17.5 KiB
+```
+
+Take the `GPU KV cache size` your engine prints at boot and read across:
+
+| your L1 (GPU KV) | L2 at **1×** — minimum | at 1.5× — comfortable | at 2× — room for concurrency |
 |---|---|---|---|
-| **0.21×** | 118 926 | 2.0 GiB | what this rig runs today |
-| **1.00×** | 566 314 | 9.4 GiB | minimum for the tier to do its job |
-| 1.50× | 849 471 | 14.1 GiB | comfortable |
-| 2.00× | 1 132 628 | 18.9 GiB | headroom for concurrency |
+| 100 000 tok | 1.7 GiB | 2.5 GiB | 3.3 GiB |
+| 250 000 tok | 4.2 GiB | 6.3 GiB | 8.3 GiB |
+| **566 314 tok** ← this rig | **9.5 GiB** | 14.2 GiB | 18.9 GiB |
+| 1 000 000 tok | 16.7 GiB | 25.0 GiB | 33.4 GiB |
+| 2 000 000 tok | 33.4 GiB | 50.1 GiB | 66.8 GiB |
 
-At **17.5 KiB per token** of L2, the conversion is simple: take your `GPU KV
-cache size` from the boot log, multiply by 17.5 KiB, and that is the floor for
-`cpu_bytes_to_use`.
+Below 1× the tier still works, it just cannot hold a whole prefix, so hits
+become partial and partial hits are discarded. This rig runs **2.0 GiB = 0.21×**,
+because the host has 30 GB total and the container already sits at 16.4 GB.
 
 The rule is not theoretical — hit rate tracks L2 size directly. Chunks of the
 attention prefix that hit, out of 20:
@@ -525,11 +529,6 @@ hard way:
 - **L2 is at 0.21× L1 and wants 9.4 GiB to do its job.** The tiered KV cache
   works and the rescue is reproducible; what limits it here is host RAM, not the
   mechanism. See [Size L2 relative to L1](#size-l2-relative-to-l1--this-is-the-whole-game).
-- **`fp8_e4m3` does not boot** on the current configuration — 4 attempts out of
-  4, deterministic, with automatic retry on each. Cause not yet diagnosed. That
-  also means the long-standing claim that fp8 degrades quality on this hybrid
-  remains unverified against the current stack: there is nothing to compare
-  against.
 - **The decode profile is a configuration behind.** Re-profile against int8 KV +
   DFlash2 K=8 before acting on the percentages above.
 - **The drafter still runs in fp16** — 7.6% of every decode step. PN133 is
