@@ -10,9 +10,9 @@
 [![GPU](https://img.shields.io/badge/GPU-2%C3%97%20RTX%203090%20(sm__86)-purple.svg)](docs/HARDWARE.md)
 
 **A personal, work-in-progress fork of runtime patches for
-[vLLM](https://github.com/vllm-project/vllm), built around one idea: push
-`int8` through *every* stage of the pipeline on hardware that has no `fp8`
-tensor cores.**
+[vLLM](https://github.com/vllm-project/vllm), built around one idea: make
+`int8` the *compute* standard through every stage of the pipeline — on hardware
+that has no `fp8` tensor cores. Next target: `int4` in the KV cache.**
 
 ## Read this first
 
@@ -64,20 +64,55 @@ them means a tensor never has to leave the integer domain between the RMSNorm
 that produces it and the attention that consumes it — which is also why the
 KV cache can be int8 without a dequant step in front of the attention kernel.
 
-### Where int8 turns out to be the floor, not a waypoint
+### Next: int4 in the KV cache
 
-The same measurement discipline says where to stop. These are all negative
-results from this rig, and they are the reason the table above says int8 and not
-int4:
+int8 is the standard the pipeline runs on today. **int4 in the KV cache is the
+target**, and the reason it is not in production yet is worth stating precisely,
+because it is not what you would guess.
 
-- **KV in int4** gives 2× the cache but costs **−27% prefill and −21% long
-  decode**, and degrades long generations. int8 per token-head has 4× less error
-  than fp8 at the same width.
+The kernel is not the problem. Ampere has a native `int4` tensor path
+(`mma.m16n8k64.s4`, measured at **2.0×** the int8 TOPS, same register layout as
+`s8`), the integer attention kernel has an int4 variant, and a full working
+compose exists in this repo's history (`9305c90`). **Quality is the problem**,
+and it fails in a way that a numeric error metric does not catch:
+
+| | int8 per token-head | int4 + Hadamard |
+|---|---|---|
+| attention output error, layers 3 / 35 | 0.5% / 0.6% | 6.0% / 8.0% |
+| top-8 agreement | 99% | 87–90% |
+| prefill / long decode | baseline | **−27% / −21%** |
+
+But the blocking symptom is behavioural: **the model runs on and never closes.**
+On a long coding task (a Tetris with SRS, 7-bag, hold and T-spin), three runs
+each: fp8 produced 6 111 / 6 594 / 7 780 tokens and passed 6/6 execution checks;
+int4 produced 11 153 / 32 000 / 32 000 — the last two hitting the `max_tokens`
+ceiling — and passed 4/6, 2/6, or emitted no code at all.
+
+**The lead.** Everything measured above used **per-token-head** scales. The
+numerical study concluded that int4 needs **per-group scales along the head
+dimension**, and that has not been tried. Pieces already in hand: group
+smoothing folds exactly into the group scales and the RMSNorm (2–4.8× more
+precise than dynamic, at no cost); per-layer decisions about whether rotating
+helps; and the prototypes under `tests/proto/sk18_a0*`.
+
+So the open work is **an advanced quantization process aimed at int4 quality**,
+not another kernel. And its oracle cannot be per-layer numeric error or a short
+answer — it has to be a long generation task where you check whether the model
+*terminates*, because that is the failure mode.
+
+### Where int8 really is the floor
+
+Not everything below 8 bits is worth chasing. These are negative results from
+this rig, and they are settled:
+
 - **All-reduce in int4** is **7× worse than int8** at equal traffic. The path
-  forward there is overlapping the transfer, not compressing it harder.
+  there is overlapping the transfer, not compressing it harder.
 - **W4A4 in the MLP** composes its errors: `gate_up` alone ≈ fp16, but both
   projections together lose 0.1 logprob.
-- **The decode GEMMs are already at the DRAM roof** — 98–103% of the achievable
+- **Dictionary / VQ methods on the KV** (PQ, RVQ, Lexico-style sparse coding)
+  all lose to plain int4 at the same width. Post-RoPE vectors with qk-norm are
+  nearly isotropic — there is no structure left for a codebook to exploit.
+- **The decode GEMMs are already at the DRAM roof** — 98–103% of achievable
   bandwidth. No amount of PTX buys anything there; the remaining 2× is in
   unpacking nibbles, not in arithmetic.
 
@@ -313,6 +348,10 @@ reports which patches would break *and actually run in this configuration*.
 Kept deliberately honest — these are the things you would otherwise discover the
 hard way:
 
+- **int4 KV is the open goal, and quality is the only blocker.** The kernel,
+  the hardware path and a working compose all exist; what is missing is a
+  quantization process built around per-group scales along the head dimension.
+  See [Next: int4 in the KV cache](#next-int4-in-the-kv-cache).
 - **KV offload returns 0 external hits under real traffic.** The mechanism works
   and the synthetic rescue is reproducible, but the all-groups-must-hit
   constraint means partial matches are wasted. See
