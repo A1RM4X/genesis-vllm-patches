@@ -64,48 +64,77 @@ them means a tensor never has to leave the integer domain between the RMSNorm
 that produces it and the attention that consumes it — which is also why the
 KV cache can be int8 without a dequant step in front of the attention kernel.
 
-### Why int8 beats fp8 in the KV cache, at the same width
+### What each KV format actually costs, measured
 
-This is the least intuitive claim here, so the numbers first. Attention **output**
-error against float, measured on real dumps (PN123, layers 3 and 35, 22 464
-tokens of code, 192 queries in the 16K–22K span):
+The least intuitive claims here are about the KV cache, so: numbers first. This
+is the error of the attention **output** against float — what reaches the next
+layer, not the error of the stored tensor. Measured on real dumps from this
+model (`PN123`, layers 3 and 35, 8 204 tokens of code, 192 queries seeing
+almost the whole context). Reproduce with
+[`tests/proto/kv_escalas_grupo_eval.py`](tests/proto/kv_escalas_grupo_eval.py).
 
-| KV format | bits/value | output error, layer 3 / 35 | top-8 agreement |
+| KV scheme | bits/value | layer 3 | layer 35 |
 |---|---|---|---|
-| `fp8_e4m3`, static scale | 8.0 | 2.1% / 2.6% | 95–96% |
-| **`int8` per token-head** | 8.1 | **0.5% / 0.6%** | **99%** |
+| `fp8_e4m3`, per-tensor scale | 8.00 | 1.27% | 2.30% |
+| `int8` per token-head | 8.10 | 0.31% | 0.79% |
+| **`int8` per token-head + Hadamard** ← in production | 8.10 | **0.22%** | **0.39%** |
+| `int4` per token-head | 4.10 | 6.49% | 12.61% |
+| `int4` per token-head + Hadamard | 4.10 | 4.08% | 6.68% |
+| `int4` group 64 + Hadamard | 4.25 | 3.54% | 5.46% |
+| `int4` group 32 + Hadamard | 4.50 | 3.15% | 4.96% |
+| `int4` group 16 + Hadamard | 5.00 | 2.71% | 4.33% |
 
-**~4× less error for 0.1 extra bits.** The reason is where the bits go. `e4m3`
-spends 4 of its 8 bits on an exponent, buying a dynamic range this tensor does
-not use: post-RoPE vectors with qk-norm are nearly isotropic and each
-(token, head) slice occupies a narrow, well-behaved range. int8 with a scale
-fitted *per token-head* spends all 8 bits on mantissa inside exactly that range.
-The 0.1 bit is that scale, amortized over the head.
+Three things fall out of that table.
 
-And on Ampere it is also **faster**, which was not the goal — the switch was made
-looking for quality:
+**int8 beats fp8 by ~4× at the same width.** The reason is where the bits go.
+`e4m3` spends 4 of its 8 bits on an exponent, buying dynamic range this tensor
+does not use: post-RoPE vectors with qk-norm are nearly isotropic and each
+(token, head) slice occupies a narrow range. int8 with a scale fitted *per
+token-head* spends all 8 bits on mantissa inside exactly that range. The 0.1 bit
+is that scale, amortized over the head.
+
+**Hadamard rotation helps int8 — roughly halving the error at layer 35** (0.79%
+→ 0.39%). This corrected an earlier claim in this README that said rotation did
+nothing for int8; that claim came from misreading a study which had compared
+Hadamard against WUSH, *both* rotated, never against no rotation at all.
+`PN126` is now **on** in production.
+
+**Per-group scales rescue a lot of int4, but not enough.** Going from
+per-token-head to group-32 with rotation takes layer 35 from 12.61% to 4.96%.
+That is a 2.5× improvement for 0.4 extra bits — real, and the direction the
+quantization work should take. It is still an order of magnitude worse than
+int8, which is why int4 is not in production.
+
+### What that costs in throughput
+
+`bench.sh`, same harness and depths as above, one full run per arm:
+
+| | PN126 off | PN126 on | |
+|---|---|---|---|
+| prefill @ 10K | 2829 ±5 | 2791 ±38 | **−1.4%** |
+| prefill @ 90K | 1850 ±11 | 1859 ±5 | +0.5% |
+| decode, narrative | 131 ±6 | 135 ±6 | +3.2% |
+| decode, code | 235 ±22 | 258 ±12 | +9.5% |
+
+Read that honestly: only the 10K prefill difference is outside the noise (that
+arm's CV was 0.2%). The decode numbers move in the right direction but sit
+inside a 4–9% run-to-run spread, and this is **one run per arm** — not enough to
+claim a decode gain. The defensible statement is that rotation costs at most
+~1.4% of prefill and buys a measurable accuracy improvement.
+
+And on Ampere, int8 KV is also simply **faster than fp8**, which was not the
+goal — the switch was made looking for quality:
 
 | | fp8 | int8 |
 |---|---|---|
 | decode @1K | 114.7 | **157.8** tok/s |
 | decode @50K | 91.8 | **119.7** tok/s (+30%) |
 | prefill @50K | 2251 | 2206 tok/s |
-| 12 concurrent | 751.9 | 764.4 tok/s |
 
-Two reasons it ends up faster: Triton **does not accept fp8 on SM86** at all, so
-the fp8 path pays conversions the hardware cannot do natively; and the integer
-kernel consumes the int8 KV directly, with no dequant step in front of it.
-
-The honest cost: KV capacity drops ~7% (636 635 → 589 824 tokens at the time of
-that measurement) because the integer kernel reserves its own accumulators.
-
-⚠️ **Hadamard rotation is not part of this.** It is easy to assume the int8 win
-comes from rotating first; it does not. Measured on the same dumps, rotation
-changes int8 by nothing at all — **0.38% → 0.39%** and **0.55% → 0.54%**, which
-is noise. `PN126` exists and is **off** in production for exactly that reason.
-Rotation only starts to matter at int4, where it is the difference between
-usable and not (6.0% / 8.6% output error *with* it). Do not carry the
-assumption backwards from int4 to int8.
+Two reasons: Triton **does not accept fp8 on SM86** at all, so that path pays
+conversions the hardware cannot do natively; and the integer kernel consumes the
+int8 KV directly, with no dequant in front of it. The honest cost is ~7% of KV
+capacity, because the integer kernel reserves its own accumulators.
 
 ### Next: int4 in the KV cache
 
@@ -116,27 +145,27 @@ because it is not what you would guess.
 The kernel is not the problem. Ampere has a native `int4` tensor path
 (`mma.m16n8k64.s4`, measured at **2.0×** the int8 TOPS, same register layout as
 `s8`), the integer attention kernel has an int4 variant, and a full working
-compose exists in this repo's history (`9305c90`). **Quality is the problem**,
-and it fails in a way that a numeric error metric does not catch:
+compose exists in this repo's history (`9305c90`). **Quality is the problem.**
 
-| | int8 per token-head | int4 + Hadamard |
-|---|---|---|
-| attention output error, layers 3 / 35 | 0.5% / 0.6% | 6.0% / 8.0% |
-| top-8 agreement | 99% | 87–90% |
-| prefill / long decode | baseline | **−27% / −21%** |
+The numeric side is in the table above: the best int4 scheme measured so far
+(group-32 + Hadamard, 4.5 bits) sits at 3.15% / 4.96%, against 0.22% / 0.39%
+for the int8 that runs in production. An order of magnitude. It also costs
+**−27% prefill and −21% long decode** against int8.
 
-But the blocking symptom is behavioural: **the model runs on and never closes.**
+But the blocking symptom is not numeric at all — it is behavioural: **the model
+runs on and never closes.**
 On a long coding task (a Tetris with SRS, 7-bag, hold and T-spin), three runs
 each: fp8 produced 6 111 / 6 594 / 7 780 tokens and passed 6/6 execution checks;
 int4 produced 11 153 / 32 000 / 32 000 — the last two hitting the `max_tokens`
 ceiling — and passed 4/6, 2/6, or emitted no code at all.
 
-**The lead.** Everything measured above used **per-token-head** scales. The
-numerical study concluded that int4 needs **per-group scales along the head
-dimension**, and that has not been tried. Pieces already in hand: group
-smoothing folds exactly into the group scales and the RMSNorm (2–4.8× more
-precise than dynamic, at no cost); per-layer decisions about whether rotating
-helps; and the prototypes under `tests/proto/sk18_a0*`.
+**Where it stands.** Per-group scales along the head dimension were the
+outstanding lead, and they have now been measured (the table above): they take
+layer 35 from 12.61% to 4.96%, a 2.5× improvement for 0.4 extra bits. Real, and
+the right direction — but not enough on its own. What is still untried: group
+smoothing folded into the group scales and the RMSNorm (2–4.8× more precise than
+dynamic, at no cost), per-layer decisions about whether rotating helps, and
+learned rather than fixed rotations. Prototypes under `tests/proto/sk18_a0*`.
 
 So the open work is **an advanced quantization process aimed at int4 quality**,
 not another kernel. And its oracle cannot be per-layer numeric error or a short
@@ -265,6 +294,7 @@ from the code defaults.
 | ✅ | **PN131** | **SK-18h**: attention decode in hand-written PTX, integer throughout, reading `int8_per_token_head` KV with no dequant |
 | ✅ | **PN120** | TP all-reduce compressed to int8 during prefill |
 | ✅ | **PN124** | Fast TRITON_ATTN on Ampere for head dim 256 |
+| ✅ | **PN126** | Hadamard rotation of q/k after RoPE — halves the int8 KV error at layer 35, costs ~1.4% prefill |
 | | PN134-137 | int8 activation quantization fused into the RMSNorm; group smoothing folded into the weights (exact SmoothQuant) |
 | | PN133 | Draft-model linears in W8A8 — the 7.6% above |
 | | PN139 | `lm_head` in per-group int4 — the 12.6% above |

@@ -14,7 +14,10 @@ from vllm._genesis.wiring.text_patch import (
 )
 
 MARKER = "[Genesis PN123: volcado qkv]"
-IMPORT_OLD = "from vllm.logger import init_logger\n"
+# 2026-09-20: en v0.29.0 qwen3_next.py ya no importa init_logger, asi que el anclaje
+# viejo no existia y PN123 salia DRIFT. `from torch import nn` es unico en el archivo
+# y no va a desaparecer mientras el modulo defina capas.
+IMPORT_OLD = "from torch import nn\n"
 IMPORT_NEW = IMPORT_OLD + "from vllm._genesis import volcado_qkv as _g123  # " + MARKER + "\n"
 FWD_OLD = "        attn_output = self.attn(q, k, v)\n"
 FWD_NEW = (

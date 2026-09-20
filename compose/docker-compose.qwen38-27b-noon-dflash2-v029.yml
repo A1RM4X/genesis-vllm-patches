@@ -144,6 +144,11 @@ services:
       # apagandolo, 73 consultas y 42 aciertos. Mientras L2 no entre al menos un par de
       # requests, PN97 es un interbloqueo.
       - GENESIS_DISABLE_PN97=1
+      # PN126: rotacion Hadamard de q/k despues de RoPE. Medido 2026-09-20 sobre
+      # volcados propios: baja el error de salida del KV int8 de 0,31%/0,79% a
+      # 0,22%/0,39% (capas 3/35) — a la mitad en la 35. Antes lo teniamos apagado
+      # por una lectura mal hecha de una medicion vieja.
+      - GENESIS_ENABLE_PN126_ROT_QK=1
       # 2026-09-19: ERA EL BUG QUE HACIA QUE EL OFFLOAD ESCRIBIERA Y NUNCA LEYERA, y el
       # presupuesto hay que darlo con holgura. PN91 pasa a modo estricto al agotarse, y en
       # estricto un bloque EN VUELO cuenta como MISS: corta la racha de la ventana

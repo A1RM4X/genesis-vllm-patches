@@ -15,7 +15,9 @@ from vllm._genesis.wiring.text_patch import (
 )
 
 MARKER = "[Genesis PN126: rotacion qk]"
-IMPORT_OLD = "from vllm.logger import init_logger\n"
+# 2026-09-20: mismo drift que PN123 — en v0.29.0 qwen3_next.py ya no importa
+# init_logger. `from torch import nn` es unico en el archivo.
+IMPORT_OLD = "from torch import nn\n"
 IMPORT_NEW = IMPORT_OLD + "from vllm._genesis import rot_qk as _g126  # " + MARKER + "\n"
 FWD_OLD = "        attn_output = self.attn(q, k, v)\n"
 FWD_NEW = (
