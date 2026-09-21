@@ -30,7 +30,8 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def _k_salidas(x, stride_xt, out, stride_ot, cs, stride_cs_seq, stride_cs_dim, stride_cs_tok,
                w, stride_wd, stride_ww, cu, sidx, nacc, anc3, s_a3, DIM,
-               BN: tl.constexpr, SILU: tl.constexpr):
+               BN: tl.constexpr, SILU: tl.constexpr, ESCRIBIR: tl.constexpr,
+               SL: tl.constexpr, T: tl.constexpr):
     i_n, i_f = tl.program_id(0), tl.program_id(1)
     bos = tl.load(cu + i_n).to(tl.int64)
     T = tl.load(cu + i_n + 1).to(tl.int64) - bos
@@ -74,13 +75,27 @@ def _k_salidas(x, stride_xt, out, stride_ot, cs, stride_cs_seq, stride_cs_dim, s
         if SILU:
             acc = acc / (1 + tl.exp(-acc))
         tl.store(out + (bos + t) * stride_ot + f, acc.to(out.dtype.element_ty), mask=mf)
+    if ESCRIBIR:
+        # El estado conv que deja upstream es un desplazamiento: [h[off+1], h[off+2], x_0..x_{T-1}]
+        # (state_len = 3 + K y seqlen = T = K+1, asi que sobreviven dos columnas de historia).
+        # Escribirlo aca evita volver a llamar al kernel de upstream SOLO por el estado, que es lo
+        # que hacia correr la conv DOS veces (6,7 -> 13,6 us por capa, medido).
+        # Se hace al final: hB/hC ya estan en registros y no se lee mas del estado.
+        dst = cs + s * stride_cs_seq + f * stride_cs_dim
+        tl.store(dst + 0 * stride_cs_tok, hB.to(cs.dtype.element_ty), mask=mf)
+        tl.store(dst + 1 * stride_cs_tok, hC.to(cs.dtype.element_ty), mask=mf)
+        for c in range(0, T):
+            tl.store(dst + (c + 2) * stride_cs_tok,
+                     tl.load(x + (bos + c) * stride_xt + f, mask=mf, other=0.0), mask=mf)
 
 
 def salidas(x, conv_state, weight, activation, conv_state_indices, num_accepted_tokens,
-            query_start_loc, anc3, out=None):
+            query_start_loc, anc3, out=None, escribir_estado=False):
     """Mismos argumentos que ``causal_conv1d_update`` en el camino spec (``x`` [tokens, dim],
     ``conv_state`` [bloques, dim, state_len], ``weight`` [dim, 4], sin bias) mas ``anc3`` (ver ``arbol_borrador.preparar_paso_kernel``).
-    Devuelve las salidas por camino en ``out`` (no toca ``x`` ni el estado)."""
+    Devuelve las salidas por camino en ``out`` (no toca ``x``). Con ``escribir_estado`` deja ademas
+    el estado conv desplazado, igual que upstream, y entonces NO hay que llamar al kernel de
+    upstream: la conv corre una sola vez."""
     assert weight.shape[1] == 4 and x.stride(1) == 1
     if out is None:
         out = torch.empty_like(x)
@@ -88,11 +103,13 @@ def salidas(x, conv_state, weight, activation, conv_state_indices, num_accepted_
     dim = x.shape[1]
     BN = 1024
     conv_state_indices = conv_state_indices.contiguous()      # en vLLM llega como columna de un 2D
+    T = anc3.shape[0] // N
     _k_salidas[(N, triton.cdiv(dim, BN))](
         x, x.stride(0), out, out.stride(0), conv_state, conv_state.stride(0),
         conv_state.stride(1), conv_state.stride(2), weight, weight.stride(0), weight.stride(1),
         query_start_loc, conv_state_indices, num_accepted_tokens, anc3, anc3.stride(0), dim,
-        BN=BN, SILU=activation in ("silu", "swish", True), num_warps=4)
+        BN=BN, SILU=activation in ("silu", "swish", True), ESCRIBIR=escribir_estado,
+        SL=conv_state.shape[-1], T=T, num_warps=4)
     return out
 
 

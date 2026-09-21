@@ -512,11 +512,10 @@ def _envolver_conv() -> None:
         if nacc is None or qsl is None or anc3 is None or bias is not None \
                 or not gdn_cinta.paso_arbol_activo():
             return conv0(x, conv_state, weight, bias, activation, **kw)
-        o = arbol_conv.salidas(x, conv_state, weight, activation, kw["conv_state_indices"],
-                               nacc, qsl, anc3)
-        res = conv0(x, conv_state, weight, bias, activation, **kw)      # escribe el estado
-        res.copy_(o)
-        return res
+        # Un solo kernel: calcula las salidas por camino Y deja el estado desplazado. Antes se
+        # llamaba ademas al de upstream solo por el estado, o sea que la conv corria dos veces.
+        return arbol_conv.salidas(x, conv_state, weight, activation, kw["conv_state_indices"],
+                                  nacc, qsl, anc3, escribir_estado=True)
 
     m.causal_conv1d_update = causal_conv1d_update
     m._genesis_arbol = True

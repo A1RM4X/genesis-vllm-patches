@@ -58,11 +58,16 @@ for paso in range(PASOS):
             sec = hist[n] + cam[::-1]
             z = sum(wf[:, i] * sec[-4 + i] for i in range(4))
             ref[n * T + t] = z * torch.sigmoid(z)
+    cs_fus = cs_raw.clone().transpose(-1, -2)          # copia para el kernel FUSIONADO
+    o_fus = ac.salidas(x, cs_fus, w, "silu", sidx, acc, cu, anc3, escribir_estado=True)
     o = ac.salidas(x, cs, w, "silu", sidx, acc, cu, anc3)
     x_up = x.clone()
     causal_conv1d_update(x_up, cs, w, None, "silu", conv_state_indices=sidx,
                          num_accepted_tokens=acc, query_start_loc=cu, max_query_len=T,
                          validate_data=False)
+    # el estado que deja el kernel fusionado tiene que ser EL MISMO que el de upstream
+    ok_est = all(torch.equal(cs_fus[int(sidx[n])], cs[int(sidx[n])]) for n in range(N))
+    ok_sal = torch.equal(o_fus, o)
     err = ((o.float() - ref).norm(dim=1) / ref.norm(dim=1)).view(N, T).max(1).values
     peor = max(peor, float(err.max()))
     cadena_igual = torch.equal(o[:T], x_up[:T])
@@ -84,5 +89,5 @@ for paso in range(PASOS):
     torch.cuda.synchronize()
     intacto = torch.equal(antes[int(sidx[0])], cs_raw[int(sidx[0])])
     print(f"paso {paso:2d} err rel por pedido {[f'{e:.1e}' for e in err.tolist()]}  "
-          f"cadena==upstream: {cadena_igual}  compactar no toco la cadena: {intacto}  acc->{nuevo}")
+          f"fusionado==upstream: estado {ok_est} salidas {ok_sal}  cadena==upstream: {cadena_igual}  compactar no toco la cadena: {intacto}  acc->{nuevo}")
 print(f"PEOR error relativo: {peor:.2e}")

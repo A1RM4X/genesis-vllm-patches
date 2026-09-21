@@ -28,13 +28,22 @@ FORMAS = {   # padres de [ancla]+8 nodos, en preorden
     "peor (2 cadenas)":  [-1, 0, 1, 2, 3, 0, 5, 6, 7],
 }
 def medir():
+    """Con GRAFO CUDA: sin el, se mide el lanzamiento desde Python (la CPU es el cuello) y un
+    kernel de mas parece costar 40 us que en produccion no existen, porque el paso de decode
+    corre capturado."""
     for _ in range(20):
         g.spec_update(layer, A_log, a, b, dt_bias, q, k, v, h, cu, cols, acc, slots)
+    torch.cuda.synchronize()
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        g.spec_update(layer, A_log, a, b, dt_bias, q, k, v, h, cu, cols, acc, slots)
+    for _ in range(10):
+        gr.replay()
     torch.cuda.synchronize()
     e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     e0.record()
     for _ in range(300):
-        g.spec_update(layer, A_log, a, b, dt_bias, q, k, v, h, cu, cols, acc, slots)
+        gr.replay()
     e1.record(); torch.cuda.synchronize()
     return e0.elapsed_time(e1) / 300
 g.fijar_ancestros(None)

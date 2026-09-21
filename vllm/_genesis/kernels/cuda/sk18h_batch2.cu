@@ -310,11 +310,28 @@ sk18h_batch2(
 
 // Visibilidad por ancestros (ARBOL): sin ramas, y sin desplazamientos fuera de rango.
 #if ARBOL
-#define SK18H_ANC(KEY, E)                                                      \
-    && (((KEY) <= lb[E]) | ((int)((unsigned)((KEY) - lb[E] - 1) < 31u) &       \
-                            ((am[E] >> (((KEY) - lb[E] - 1) & 31)) & 1)))
+#define SK18H_ANCEXP(KEY, E)                                                   \
+    (((KEY) <= lb[E]) | ((int)((unsigned)((KEY) - lb[E] - 1) < 31u) &          \
+                         ((am[E] >> (((KEY) - lb[E] - 1) & 31)) & 1)))
+// El chequeo NO va en el lazo de keys: ahi se evalua una vez por cada key del contexto, cuando
+// solo puede cambiar algo en las ultimas L (los tokens del paso). Medido: tenerlo adentro cuesta
+// 10-12% del kernel ENTERO, haya arbol o no (contexto 4k: 370,8 us sin el, 415,3 con el). Se
+// aplica DESPUES, sobre zq, y solo en la pagina que alcanza a `lb`: es un lazo sobre registros,
+// sin mma, asi que no duplica el cuerpo desenrollado (eso hacia que ptxas no terminara).
+#define SK18H_POSANC(K0)                                                       \
+    do {                                                                       \
+        const int _lbmin = lb[0] < lb[1] ? lb[0] : lb[1];                      \
+        if ((K0) + BK > _lbmin) {                                              \
+            for (int f = 0; f < BK / 16; ++f)                                  \
+                for (int hr = 0; hr < 2; ++hr)                                 \
+                    for (int e = 0; e < 2; ++e) {                              \
+                        const int key = (K0) + f * 16 + gid + hr * 8;          \
+                        if (!SK18H_ANCEXP(key, e)) zq[f * 2 + hr][e] = PADZ;   \
+                    }                                                          \
+        }                                                                      \
+    } while (0)
 #else
-#define SK18H_ANC(KEY, E)
+#define SK18H_POSANC(K0)
 #endif
 
 // Q.K de una unidad (buf 0) -> zq[BK/8][2] con PAD donde la key no es visible.
@@ -336,7 +353,7 @@ sk18h_batch2(
             for (int hr = 0; hr < 2; ++hr)                                     \
                 for (int e = 0; e < 2; ++e) {                                  \
                     const int key = (K0) + f * 16 + gid + hr * 8;              \
-                    const int vis = key < kfin && key <= lm[e] SK18H_ANC(key, e);  \
+                    const int vis = key < kfin && key <= lm[e];                 \
                     const int sk = vis ? (int)((short*)&sE[ET][((key - (K0)) * NH + hh) * 4])[0] : 0; \
                     const int zz = (int)(((long long)acc[hr * 2 + e] * sk) >> ZSH); \
                     zq[f * 2 + hr][e] = vis ? zz : PADZ;                       \
@@ -386,6 +403,7 @@ sk18h_batch2(
         __pipeline_wait_prior(1);
         __syncthreads();
         SK18H_QK(buf, k0);
+        SK18H_POSANC(k0);
 #pragma unroll
         for (int e = 0; e < 2; ++e)
 #pragma unroll
@@ -411,6 +429,7 @@ sk18h_batch2(
         __pipeline_wait_prior(1);
         __syncthreads();
         SK18H_QK(buf, k0);
+        SK18H_POSANC(k0);
         // pesos -> W (fila = query del bloque, columna = key de la unidad)
 #pragma unroll
         for (int j = 0; j < BK / 8; ++j)

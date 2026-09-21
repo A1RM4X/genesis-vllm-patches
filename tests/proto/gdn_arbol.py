@@ -122,7 +122,8 @@ for paso in range(PASOS):
           f"{[f'{x:.1e}' for x in err.max(1).values.tolist()]}")
     acc = torch.tensor(nuevo_acc, device=dev, dtype=torch.int32)
     pendiente = nuevo_pend
-print(f"PEOR error relativo contra la referencia fp32: {peor:.2e}   (saltos de rama: {saltos_tot})")
+print(f"PEOR error relativo contra la referencia fp32: {peor:.2e}   (saltos de rama: {saltos_tot})"
+      f"   [{'FORMA CERRADA' if os.environ.get('GENESIS_ARBOL_CERRADA','1') in ('1','true') else 'secuencial'}]")
 
 # ---- control: mascara de cadena == kernel de produccion, bit a bit ----
 hA, hB = h.clone(), h.clone()
