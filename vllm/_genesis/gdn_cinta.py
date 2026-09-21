@@ -53,6 +53,88 @@ def activo() -> bool:
 
 
 _DEBUG = os.environ.get("GENESIS_PN122_DEBUG", "0").strip().lower() in _TRUTHY
+
+# Arbol de borrador (apagado por defecto). Con el arbol, los tokens 1..K del paso no son una
+# cadena: cada uno cuelga de un ancestro. Cambian dos cosas y nada mas:
+#   * el forward spec arma el estado de cada token desde el de SU padre (``_k_spec_arbol``);
+#   * lo que se reproduce al paso siguiente no son las filas 0..r-1 de la cinta sino las del
+#     camino aceptado: ``camino[slot, j]`` = fila de cinta del j-esimo token aceptado.
+# La cinta se escribe igual que siempre (fila t-1 = token t del paso).
+_ARBOL = os.environ.get("GENESIS_ENABLE_ARBOL", "0").strip().lower() in _TRUTHY
+# Forma cerrada del arbol (Bole arXiv 2608.01651 / TreeWY arXiv 2608.20961): un sistema triangular
+# en vez de rehacer los ancestros con actualizaciones de rango 1. APAGADA: es correcta (2,2e-4
+# contra fp32, igual que el secuencial) y su costo NO depende de la topologia del arbol, que era
+# el objetivo, pero medida con grafos CUDA sale 37% mas cara (48 capas, 6 pedidos):
+#
+#   secuencial  cadena 77,0 us | tipico 84,6 | estrella 79,4 | peor 77,1
+#   cerrada     116 us para TODAS las topologias  (prep 11,3 + main 68,3 + escribir ~36)
+#
+# El main es lo caro: 68,3 us contra ~48,6 del secuencial. La teoria dice que deberia hacer la
+# MITAD del trabajo (no toca el estado: solo S_0 k_t y S_0 q_t por token, contra decay + S k +
+# rango 1 + S q del secuencial), pero Triton no indexa registros dinamicamente y el sistema
+# triangular termina simulado con `tl.sum(tl.where(at == t, ...))`, que son reducciones completas
+# sobre [BT, BV] — y hay tres lazos sobre T en vez de uno.
+#
+# Para que gane hay que hacerlo como Bole: serie de Neumann con `tl.dot` sobre matrices [BT, BT]
+# (Gb es nilpotente, asi que la serie es finita) y todo en layout traspuesto [BV, BT], con k y q
+# ya normalizados en un buffer del prep. El riesgo es el derrame de registros: b_h [BV, BK] ya son
+# 4096 floats por programa. Ver [[arbol-gdn-forma-cerrada-bole-treewy]].
+_CERRADA = os.environ.get("GENESIS_ARBOL_CERRADA", "0").strip().lower() in _TRUTHY
+# Los productos pesados (S_0 k y S_0 q) en int8 sobre tensor cores. Solo con la forma cerrada:
+# es la unica que deja S_0 FIJO durante el arbol, asi que se cuantiza una vez y se usa 2T veces.
+_INT8 = os.environ.get("GENESIS_ARBOL_INT8", "1").strip().lower() in _TRUTHY
+_camino_gpu: torch.Tensor | None = None     # [slots, TM] int32; la cadena es arange(TM)
+_cerr: dict = {}                            # buffers del sistema triangular, por device
+_anc_gpu: torch.Tensor | None = None        # [tokens del lote] int32, bits de ancestros por token
+_anc3_gpu: torch.Tensor | None = None       # [tokens del lote, 3] int32, los 3 ancestros mas cercanos
+
+
+def arbol() -> bool:
+    return _ARBOL
+
+
+def camino_gpu() -> torch.Tensor | None:
+    """``[slots, TM]``: el runner escribe aca, despues de aceptar, las filas de cinta del
+    camino aceptado (nodo - 1). Persistente: lo leen el forward y las copias align."""
+    return _camino_gpu
+
+
+def fijar_ancestros(anc: torch.Tensor | None) -> None:
+    """Bits de ancestros por token del lote (formato de ``arbol_borrador.bits_ancestros``),
+    en un buffer ESTATICO (grafos CUDA). ``None`` = todos los pedidos van en cadena."""
+    global _anc_gpu
+    _anc_gpu = anc
+
+
+def ancestros_gpu() -> torch.Tensor | None:
+    """El buffer estatico de ancestros (lo crea ``enlazar``; en reposo, mascara de cadena)."""
+    return _anc_gpu
+
+
+def ancestros3_gpu() -> torch.Tensor | None:
+    """Los 3 ancestros mas cercanos por token, que es lo unico que mira la conv causal."""
+    return _anc3_gpu
+
+
+# Por paso. Los grafos FULL (decode uniforme) hornean el kernel de arbol, y ahi lo unico que
+# decide es el CONTENIDO del buffer (con la mascara de cadena da bit a bit lo de siempre). En
+# eager/piecewise (lotes mezclados) Python corre cada vez y esta bandera elige el kernel. Por
+# eso arranca prendida: es lo que tiene que ver la captura.
+_paso_arbol = True
+
+
+def paso_en_arbol(si: bool) -> None:
+    global _paso_arbol
+    _paso_arbol = bool(si)
+
+
+def paso_arbol_activo() -> bool:
+    if not _ARBOL or _anc_gpu is None:
+        return False
+    # Capturando un grafo se hornea SIEMPRE el kernel de arbol, valga lo que valga la bandera
+    # (una corrida dummy anterior la puede haber dejado apagada, y el grafo quedaba con la conv
+    # y el GDN de cadena para siempre: medido, el nodo tras un salto de rama fallaba el 75%).
+    return _paso_arbol or torch.cuda.is_current_stream_capturing()
 _debug_n = 0
 
 
@@ -231,6 +313,17 @@ def enlazar(layer, device) -> None:
                 _n_slots, layer.num_spec, fila(layer))
     layer._g122_cinta = torch.zeros(
         (_n_slots, layer.num_spec, fila(layer)), dtype=torch.float32, device=device)
+    global _camino_gpu, _anc_gpu, _anc3_gpu
+    if _ARBOL and _camino_gpu is None:
+        _camino_gpu = torch.arange(layer.num_spec, dtype=torch.int32, device=device)[None] \
+            .repeat(_n_slots, 1).contiguous()
+    if _ARBOL and _anc_gpu is None:
+        T = layer.num_spec + 1
+        _anc_gpu = ((1 << torch.arange(T, device=device, dtype=torch.int32)) - 1) \
+            .repeat(_n_slots).contiguous()
+        ar = torch.arange(T, device=device, dtype=torch.int32)
+        # [slots*T, 3]: en reposo, la cadena (t-1, t-2, t-3 con el convenio -1/-2/-3)
+        _anc3_gpu = torch.stack([ar - 1, ar - 2, ar - 3], dim=1).repeat(_n_slots, 1).contiguous()
 
 
 # ─────────────────────────────── kernels ────────────────────────────────
@@ -311,6 +404,393 @@ def _k_spec(A_log, a, b, dt_bias, beta_sp, threshold, q, k, v, o, h, stride_h, c
         p_o += HV * V
 
 
+@triton.jit
+def _regla_delta(b_h, b_k, b_v, b_g, b_beta):
+    b_h = b_h * tl.exp(b_g)
+    b_d = (b_v - tl.sum(b_h * b_k[None, :], 1)) * b_beta
+    return b_h + b_d[:, None] * b_k[None, :]
+
+
+@triton.jit(do_not_specialize=["N"])
+def _k_spec_arbol(A_log, a, b, dt_bias, beta_sp, threshold, q, k, v, o, h, stride_h, cu, sidx,
+                  nacc, slots, cinta, camino, anc, scale, N,
+                  H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                  BK: tl.constexpr, BV: tl.constexpr, TM: tl.constexpr, ROW: tl.constexpr,
+                  IS_L2: tl.constexpr):
+    """``_k_spec`` para un paso en ARBOL. Aparte a proposito: el kernel de produccion no se toca.
+
+    Los tokens vienen en orden topologico, y mejor en preorden (``arbol_borrador.orden_dfs``):
+    mientras el padre de un token sea el token anterior se sigue con el estado corriente, igual
+    que la cadena; en un salto de rama se vuelve al estado tras el token 0 y se rehacen los
+    ancestros (actualizaciones de rango 1 sobre un bloque que ya esta en registros: no hay
+    trafico de estado, que es lo que cuesta aca). Guardar un estado por nodo seria peor: el
+    estado local pasaria de 4k a 64k elementos por programa.
+
+    ``anc[bos + t]``: bit j-1 = el token j es ancestro de t, o es t. Con la mascara de cadena,
+    ``(1 << t) - 1``, nunca hay salto y la salida es identica bit a bit a la de ``_k_spec``.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu + i_n).to(tl.int64)
+    eos = tl.load(cu + i_n + 1).to(tl.int64)
+    T = eos - bos
+    if T == 0:
+        return
+    s = tl.load(sidx + i_n).to(tl.int64)
+    if s <= 0:
+        return
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mk = o_k < K
+    mv = o_v < V
+    mh = mv[:, None] & mk[None, :]
+    # invariantes del lazo, calculadas UNA vez: exp(A_log) se re-evaluaba por token y por cada
+    # ancestro rehecho, y beta_sp/threshold son constantes de la llamada (1.0 y 20.0).
+    nexpAl = -tl.exp(tl.load(A_log + i_hv).to(tl.float32))
+    db = tl.load(dt_bias + i_hv).to(tl.float32)
+    inv_b = 1.0 / beta_sp
+    p_h = h + s * stride_h + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h = tl.load(p_h, mask=mh, other=0).to(tl.float32)
+
+    # 1) reproducir el CAMINO aceptado del paso anterior
+    r = tl.load(nacc + i_n).to(tl.int64) - 1
+    slot = tl.load(slots + i_n).to(tl.int64)
+    for j in range(0, r):
+        jj = tl.load(camino + slot * TM + j).to(tl.int64)
+        row = cinta + (slot * TM + jj) * ROW
+        rk = tl.load(row + i_h * K + o_k, mask=mk, other=0).to(tl.float32)
+        rv = tl.load(row + H * K + i_hv * V + o_v, mask=mv, other=0).to(tl.float32)
+        rg = tl.load(row + H * K + HV * V + i_hv).to(tl.float32)
+        rb = tl.load(row + H * K + HV * V + HV + i_hv).to(tl.float32)
+        b_h = _regla_delta(b_h, rk, rv, rg, rb)
+
+    # 2) tokens del paso actual, cada uno sobre el estado de su padre
+    b_raiz = b_h
+    m_prev = tl.zeros((), tl.int32)
+    for t in range(0, T):
+        m_t = tl.load(anc + bos + t).to(tl.int32)
+        if t >= 2:
+            if m_t != (m_prev | (1 << (t - 1))):
+                b_h = b_raiz                       # salto de rama: rehacer los ancestros
+                for j in range(1, t):
+                    if ((m_t >> (j - 1)) & 1) != 0:
+                        src = bos + j
+                        jk = tl.load(k + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+                        jv = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
+                        jx = tl.load(a + src * HV + i_hv).to(tl.float32) + db
+                        jsp = tl.where(beta_sp * jx <= threshold,
+                                       inv_b * tl.log(1 + tl.exp(beta_sp * jx)), jx)
+                        jb = tl.sigmoid(tl.load(b + src * HV + i_hv).to(tl.float32))
+                        if IS_L2:
+                            jk = jk * tl.rsqrt(tl.sum(jk * jk) + 1e-6)
+                        b_h = _regla_delta(b_h, jk, jv, nexpAl * jsp, jb)
+        m_prev = m_t
+        src = bos + t
+        b_q = tl.load(q + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+        b_k = tl.load(k + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+        b_v = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
+        x = tl.load(a + src * HV + i_hv).to(tl.float32) + db
+        sp = tl.where(beta_sp * x <= threshold, inv_b * tl.log(1 + tl.exp(beta_sp * x)), x)
+        b_beta = tl.sigmoid(tl.load(b + src * HV + i_hv).to(tl.float32))
+        if IS_L2:
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+        b_h = _regla_delta(b_h, b_k, b_v, nexpAl * sp, b_beta)
+        p_o = o + (src * HV + i_hv) * V + o_v
+        tl.store(p_o, tl.sum(b_h * b_q[None, :], 1).to(p_o.dtype.element_ty), mask=mv)
+        if t == 0:  # la unica escritura del estado completo
+            tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mh)
+            b_raiz = b_h
+
+
+@triton.jit
+def _redondear(x):
+    """Al entero mas cercano (empate al par), que es lo que hace torch.round."""
+    return tl.extra.cuda.libdevice.rint(x)
+
+
+@triton.jit
+def _k_prep_cerrada(A_log, a, b, dt_bias, beta_sp, threshold, k, q, cu, sidx, anc,
+                    Gb_out, C_out, aux_out, k8_out, q8_out, esc_out, scale, s_g, s_a, s_k8, s_e,
+                    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
+                    BK: tl.constexpr, BT: tl.constexpr, T: tl.constexpr, IS_L2: tl.constexpr,
+                    INT8: tl.constexpr):
+    """Prepara, UNA vez por (pedido, cabeza v), las matrices del sistema triangular del arbol.
+
+    Sale de la forma cerrada del gated delta rule (Bole arXiv 2608.01651, TreeWY arXiv 2608.20961;
+    derivacion y validacion en tests/proto/gdn_forma_cerrada.py). Con P_t = suma de g sobre el
+    camino raiz->t, e "i < t" = i es ancestro ESTRICTO de t:
+
+        (I + diag(beta) G) D = R,   G[t,i] = (P_t/P_i) (k_i . k_t)
+        o_t = P_t (S_0 q_t) + sum_{i <= t} C[t,i] D_i,   C[t,i] = (P_t/P_i) (k_i . q_t)
+
+    Es decir: la salida de TODOS los nodos sale de un sistema de T x T, sin tocar el estado ni
+    rehacer ancestros. Aca se calculan ``Gb = diag(beta) G``, ``C`` y ``(P, beta)``; el estado
+    S_0 no entra, asi que esto no depende del bloque de V y se hace una sola vez por cabeza.
+    """
+    i_n, i_hv = tl.program_id(0), tl.program_id(1)
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu + i_n).to(tl.int64)
+    if tl.load(cu + i_n + 1).to(tl.int64) - bos != T:
+        return
+    if tl.load(sidx + i_n).to(tl.int64) <= 0:
+        return
+    at = tl.arange(0, BT)
+    mt = at < T
+    ok = tl.arange(0, BK)
+    mk = ok < K
+    Al = tl.load(A_log + i_hv).to(tl.float32)
+    db = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = tl.load(a + (bos + at) * HV + i_hv, mask=mt, other=0.0).to(tl.float32) + db
+    sp = tl.where(beta_sp * x <= threshold, (1 / beta_sp) * tl.log(1 + tl.exp(beta_sp * x)), x)
+    g = -tl.exp(Al) * sp
+    bet = tl.sigmoid(tl.load(b + (bos + at) * HV + i_hv, mask=mt, other=0.0).to(tl.float32))
+    # mascara de ancestros desde los bits: el nodo 0 (el ancla) es ancestro de todos
+    m = tl.load(anc + bos + at, mask=mt, other=0).to(tl.int32)
+    j = at[None, :]
+    bit = (m[:, None] >> tl.maximum(j - 1, 0)) & 1     # j = 0 lo cubre la rama de abajo
+    inc = ((j == 0) | ((j >= 1) & (bit != 0))) & (j <= at[:, None]) & mt[:, None] & mt[None, :]
+    est = inc & (j != at[:, None])
+    P = tl.sum(tl.where(inc, g[None, :], 0.0), 1)                      # log del decay acumulado
+    rel = tl.exp(P[:, None] - P[None, :])
+    idx = (bos + at)[:, None] * (H * K) + i_h * K + ok[None, :]
+    mkk = mt[:, None] & mk[None, :]
+    k_all = tl.load(k + idx, mask=mkk, other=0.0).to(tl.float32)
+    q_all = tl.load(q + idx, mask=mkk, other=0.0).to(tl.float32)
+    if IS_L2:
+        k_all = k_all * tl.rsqrt(tl.sum(k_all * k_all, 1) + 1e-6)[:, None]
+        q_all = q_all * tl.rsqrt(tl.sum(q_all * q_all, 1) + 1e-6)[:, None]
+    q_all = q_all * scale
+    # ieee y no tf32: tf32 deja 10 bits de mantisa y el error entra en el sistema triangular
+    KK = tl.dot(k_all, tl.trans(k_all), input_precision="ieee")
+    QK = tl.dot(q_all, tl.trans(k_all), input_precision="ieee")
+    # (I + diag(beta) G) es triangular inferior UNITARIA: su inversa sale de una serie de Neumann
+    # FINITA (Gb es nilpotente, orden = profundidad del arbol). Se calcula aca, sobre matrices de
+    # T x T, y se fusiona con C: asi el kernel pesado hace UN solo dot para el sistema y la salida
+    # juntos, sin lazos ni indexado de registros (que en Triton se simula con reducciones caras).
+    Gb = tl.where(est, bet[:, None] * rel * KK, 0.0)
+    C = tl.where(inc, rel * QK, 0.0)
+    eye = tl.where(at[:, None] == at[None, :], 1.0, 0.0)
+    M = eye
+    term = eye
+    for _ in tl.static_range(1, BT):
+        term = -tl.dot(term, Gb, input_precision="ieee")
+        M += term
+    base = (i_n * HV + i_hv) * s_g
+    tl.store(Gb_out + base + at[:, None] * BT + at[None, :], M, mask=mt[:, None] & mt[None, :])
+    tl.store(C_out + base + at[:, None] * BT + at[None, :],
+             tl.dot(C, M, input_precision="ieee"), mask=mt[:, None] & mt[None, :])
+    ab = (i_n * HV + i_hv) * s_a
+    tl.store(aux_out + ab + at * 2, P, mask=mt)
+    tl.store(aux_out + ab + at * 2 + 1, bet, mask=mt)
+    if INT8:
+        # k y q ya normalizados, a int8 por token: es el formato que el main necesita para el
+        # mma.s8. Lo hace el primer programa de cada cabeza k (los demas escribirian lo mismo).
+        if (i_hv % (HV // H)) == 0:
+            ek = tl.max(tl.abs(k_all), 1) / 127.0
+            eq = tl.max(tl.abs(q_all), 1) / 127.0
+            bk8 = (i_n * H + i_h) * s_k8
+            tl.store(k8_out + bk8 + at[:, None] * K + ok[None, :],
+                     _redondear(k_all / ek[:, None]).to(tl.int8), mask=mkk)
+            tl.store(q8_out + bk8 + at[:, None] * K + ok[None, :],
+                     _redondear(q_all / eq[:, None]).to(tl.int8), mask=mkk)
+            be = (i_n * H + i_h) * s_e
+            tl.store(esc_out + be + at * 2, ek, mask=mt)
+            tl.store(esc_out + be + at * 2 + 1, eq, mask=mt)
+
+
+@triton.jit(do_not_specialize=["N"])
+def _k_spec_cerrada(q, k, v, o, h, stride_h, cu, sidx, nacc, slots, cinta, camino,
+                    Gb, C, aux, s_g, s_a, scale, N,
+                    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                    BK: tl.constexpr, BV: tl.constexpr, BT: tl.constexpr, T: tl.constexpr,
+                    TM: tl.constexpr, ROW: tl.constexpr, IS_L2: tl.constexpr):
+    """Forma cerrada: resuelve el sistema triangular y NO toca el estado durante el arbol.
+
+    El secuencial (``_k_spec_arbol``) toca S (V x K) cuatro veces por token — decay, S k, rango 1,
+    S q — y otra vez entera por cada ancestro que rehace en un salto de rama. Aca S_0 queda fijo en
+    registros: solo dos productos ``S_0 k_t`` y ``S_0 q_t`` por token, mas un sistema de T x T.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu + i_n).to(tl.int64)
+    if tl.load(cu + i_n + 1).to(tl.int64) - bos != T:
+        return
+    s = tl.load(sidx + i_n).to(tl.int64)
+    if s <= 0:
+        return
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    at = tl.arange(0, BT)
+    mk = o_k < K
+    mv = o_v < V
+    mt = at < T
+    mh = mv[:, None] & mk[None, :]
+    p_h = h + s * stride_h + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h = tl.load(p_h, mask=mh, other=0).to(tl.float32)
+
+    # 1) reproducir el CAMINO aceptado del paso anterior (rango 1, como siempre: es corto y no
+    #    tiene saltos, y sus entradas ya estan preparadas en la cinta)
+    r = tl.load(nacc + i_n).to(tl.int64) - 1
+    slot = tl.load(slots + i_n).to(tl.int64)
+    for jj in range(0, r):
+        row = cinta + (slot * TM + tl.load(camino + slot * TM + jj).to(tl.int64)) * ROW
+        rk = tl.load(row + i_h * K + o_k, mask=mk, other=0).to(tl.float32)
+        rv = tl.load(row + H * K + i_hv * V + o_v, mask=mv, other=0).to(tl.float32)
+        rg = tl.load(row + H * K + HV * V + i_hv).to(tl.float32)
+        rb = tl.load(row + H * K + HV * V + HV + i_hv).to(tl.float32)
+        b_h = _regla_delta(b_h, rk, rv, rg, rb)
+
+    # 2) el arbol, de una: R[t] = beta_t (v_t - P_t S_0 k_t) y Sq[t] = S_0 q_t
+    ab = (i_n * HV + i_hv) * s_a
+    P = tl.load(aux + ab + at * 2, mask=mt, other=0.0)
+    bet = tl.load(aux + ab + at * 2 + 1, mask=mt, other=0.0)
+    expP = tl.exp(P)
+    D = tl.zeros((BT, BV), tl.float32)      # R, y despues la solucion in situ
+    Sq = tl.zeros((BT, BV), tl.float32)
+    for t in range(0, T):
+        src = bos + t
+        b_k = tl.load(k + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+        b_q = tl.load(q + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+        b_v = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
+        if IS_L2:
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_q = b_q * scale          # el prep ya lo aplica a su copia de q; aca tambien hace falta
+        sel = at == t
+        ep = tl.sum(tl.where(sel, expP, 0.0), 0)
+        bt_ = tl.sum(tl.where(sel, bet, 0.0), 0)
+        rt = bt_ * (b_v - ep * tl.sum(b_h * b_k[None, :], 1))
+        D = tl.where(sel[:, None], rt[None, :], D)
+        Sq = tl.where(sel[:, None], tl.sum(b_h * b_q[None, :], 1)[None, :], Sq)
+
+    # 3) sustitucion hacia adelante: D[t] -= sum_{i<t} Gb[t,i] D[i]. En preorden el padre siempre
+    #    viene antes, asi que Gb es estrictamente triangular inferior y una pasada alcanza.
+    gb = tl.load(Gb + (i_n * HV + i_hv) * s_g + at[:, None] * BT + at[None, :],
+                 mask=mt[:, None] & mt[None, :], other=0.0)
+    cc = tl.load(C + (i_n * HV + i_hv) * s_g + at[:, None] * BT + at[None, :],
+                 mask=mt[:, None] & mt[None, :], other=0.0)
+    for t in range(1, T):
+        sel = at == t
+        gt = tl.sum(tl.where(sel[:, None], gb, 0.0), 0)             # fila t de Gb
+        corr = tl.sum(gt[:, None] * D, 0)                           # [BV]
+        D = tl.where(sel[:, None], (tl.sum(tl.where(sel[:, None], D, 0.0), 0) - corr)[None, :], D)
+
+    # 4) salida: o_t = P_t (S_0 q_t) + sum_{i<=t} C[t,i] D_i
+    for t in range(0, T):
+        sel = at == t
+        ct = tl.sum(tl.where(sel[:, None], cc, 0.0), 0)
+        ot = tl.sum(tl.where(sel[:, None], Sq, 0.0), 0) * tl.sum(tl.where(sel, expP, 0.0), 0) \
+            + tl.sum(ct[:, None] * D, 0)
+        p_o = o + ((bos + t) * HV + i_hv) * V + o_v
+        tl.store(p_o, ot.to(p_o.dtype.element_ty), mask=mv)
+
+    # 5) el estado tras el token 0 (el ancla, siempre aceptado), que es lo que el paso siguiente
+    #    toma como punto de partida:  S_0' = P_0 S_0 + D_0 k_0^T
+    b_k0 = tl.load(k + (bos * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+    if IS_L2:
+        b_k0 = b_k0 * tl.rsqrt(tl.sum(b_k0 * b_k0) + 1e-6)
+    sel0 = at == 0
+    d0 = tl.sum(tl.where(sel0[:, None], D, 0.0), 0)
+    b_h = b_h * tl.sum(tl.where(sel0, expP, 0.0), 0) + d0[:, None] * b_k0[None, :]
+    tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mh)
+
+
+@triton.jit(do_not_specialize=["N"])
+def _k_spec_cerrada8(q, k, v, o, h, stride_h, cu, sidx, nacc, slots, cinta, camino,
+                     CM, aux, k8_p, q8_p, esc_p, s_g, s_a, s_k8, s_e, scale, N,
+                     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                     BK: tl.constexpr, BV: tl.constexpr, BT: tl.constexpr, T: tl.constexpr,
+                     TM: tl.constexpr, ROW: tl.constexpr, IS_L2: tl.constexpr):
+    """Forma cerrada con los productos pesados en INT8, sobre tensor cores.
+
+    El estado S_0 queda FIJO durante todo el arbol (esa es la gracia de la forma cerrada), asi que
+    se cuantiza UNA vez y se usa en 2T productos -> ``mma.s8``. Y como el estado que se escribe al
+    slot se reconstruye desde el S_0 original, el error no se acumula entre pasos.
+
+    Tres dots y ningun lazo sobre los nodos:
+        Sk = S8 · k8^T      Sq = S8 · q8^T      (int8, tensor cores)
+        O  = P (S_0 q) + R · (C M)^T            (M = (I + diag(beta) G)^-1, ya fusionada en el prep)
+
+    El token 0 (el ancla) va en fp: es el UNICO cuyo d_t entra en el estado que queda escrito, y
+    ademas la fila 0 de M es e_0, o sea d_0 = R_0 sin resolver nada. Asi el estado propagado queda
+    EXACTO (3e-17 medido en tests/proto/gdn_forma_cerrada.py) y el int8 solo toca las salidas de
+    los nodos de draft, que es donde ya se vive con 0,5-0,65% (SK-18).
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu + i_n).to(tl.int64)
+    if tl.load(cu + i_n + 1).to(tl.int64) - bos != T:
+        return
+    s = tl.load(sidx + i_n).to(tl.int64)
+    if s <= 0:
+        return
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    at = tl.arange(0, BT)
+    mk = o_k < K
+    mv = o_v < V
+    mt = at < T
+    mh = mv[:, None] & mk[None, :]
+    p_h = h + s * stride_h + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h = tl.load(p_h, mask=mh, other=0).to(tl.float32)
+    r = tl.load(nacc + i_n).to(tl.int64) - 1
+    slot = tl.load(slots + i_n).to(tl.int64)
+    for jj in range(0, r):
+        row = cinta + (slot * TM + tl.load(camino + slot * TM + jj).to(tl.int64)) * ROW
+        rk = tl.load(row + i_h * K + o_k, mask=mk, other=0).to(tl.float32)
+        rv = tl.load(row + H * K + i_hv * V + o_v, mask=mv, other=0).to(tl.float32)
+        rg = tl.load(row + H * K + HV * V + i_hv).to(tl.float32)
+        rb = tl.load(row + H * K + HV * V + HV + i_hv).to(tl.float32)
+        b_h = _regla_delta(b_h, rk, rv, rg, rb)
+
+    ab = (i_n * HV + i_hv) * s_a
+    P = tl.load(aux + ab + at * 2, mask=mt, other=0.0)
+    bet = tl.load(aux + ab + at * 2 + 1, mask=mt, other=0.0)
+    expP = tl.exp(P)
+    # S_0 a int8 por fila: una sola vez, para 2T productos
+    ss = tl.max(tl.abs(b_h), 1) / 127.0
+    S8 = _redondear(b_h / ss[:, None]).to(tl.int8)
+    bk8 = (i_n * H + i_h) * s_k8
+    idx8 = at[:, None] * K + o_k[None, :]
+    m8 = mt[:, None] & mk[None, :]
+    k8 = tl.load(k8_p + bk8 + idx8, mask=m8, other=0)
+    q8 = tl.load(q8_p + bk8 + idx8, mask=m8, other=0)
+    be = (i_n * H + i_h) * s_e
+    ek = tl.load(esc_p + be + at * 2, mask=mt, other=0.0)
+    eq = tl.load(esc_p + be + at * 2 + 1, mask=mt, other=0.0)
+    Sk = tl.dot(S8, tl.trans(k8), out_dtype=tl.int32).to(tl.float32) * ss[:, None] * ek[None, :]
+    Sq = tl.dot(S8, tl.trans(q8), out_dtype=tl.int32).to(tl.float32) * ss[:, None] * eq[None, :]
+    # el ancla, en fp
+    b_k0 = tl.load(k + (bos * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+    b_q0 = tl.load(q + (bos * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+    if IS_L2:
+        b_k0 = b_k0 * tl.rsqrt(tl.sum(b_k0 * b_k0) + 1e-6)
+        b_q0 = b_q0 * tl.rsqrt(tl.sum(b_q0 * b_q0) + 1e-6)
+    b_q0 = b_q0 * scale
+    es0 = at[None, :] == 0
+    Sk = tl.where(es0, tl.sum(b_h * b_k0[None, :], 1)[:, None], Sk)
+    Sq = tl.where(es0, tl.sum(b_h * b_q0[None, :], 1)[:, None], Sq)
+
+    p_v = v + ((bos + at[None, :]) * HV + i_hv) * V + o_v[:, None]
+    mvt = mv[:, None] & mt[None, :]
+    vT = tl.load(p_v, mask=mvt, other=0).to(tl.float32)
+    R = bet[None, :] * (vT - expP[None, :] * Sk)                         # [BV, BT]
+    cm = tl.load(CM + (i_n * HV + i_hv) * s_g + at[:, None] * BT + at[None, :],
+                 mask=mt[:, None] & mt[None, :], other=0.0)
+    O = expP[None, :] * Sq + tl.dot(R, tl.trans(cm), input_precision="ieee")
+    p_o = o + ((bos + at[None, :]) * HV + i_hv) * V + o_v[:, None]
+    tl.store(p_o, O.to(p_o.dtype.element_ty), mask=mvt)
+    # estado tras el ancla: la fila 0 de M es e_0, asi que d_0 = R_0 y no hay que resolver nada
+    d0 = tl.sum(tl.where(es0, R, 0.0), 1)
+    b_h = b_h * tl.sum(tl.where(at == 0, expP, 0.0), 0) + d0[:, None] * b_k0[None, :]
+    tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mh)
+
+
 @triton.jit(do_not_specialize=["N"])
 def _k_escribir(A_log, a, b, dt_bias, beta_sp, threshold, k, v, cu, sidx, slots, cinta, N,
                 H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
@@ -352,12 +832,50 @@ def _k_escribir(A_log, a, b, dt_bias, beta_sp, threshold, k, v, cu, sidx, slots,
         tl.store(row + H * K + HV * V + HV + oh, bb.to(tl.float32), mask=mh)
 
 
+_DIAG_CRESTA = os.environ.get("GENESIS_DIAG_GDN_CRESTA", "0").strip().lower() in _TRUTHY
+_cresta_n = 0
+
+
+def _diag_cresta(layer, ssm_state, sidx) -> None:
+    """Cresta (max/mediana de |x|) del estado GDN REAL, que es lo que decide si rotar antes de
+    cuantizar a int8 sirve o no (ver [[estrategia-cuantizacion-por-capa]]). Mide por FILA (eje K,
+    que es como se cuantiza para el dot) y por COLUMNA (un canal con outliers estira todas las
+    filas), y ademas la cresta del estado ROTADO con Hadamard, que es la alternativa.
+
+    Sincroniza con la GPU: solo con GENESIS_DIAG_GDN_CRESTA=1 y cada 200 pasos.
+    """
+    global _cresta_n
+    _cresta_n += 1
+    if _cresta_n % 200 != 0 or _cresta_n > 1400:
+        return
+    idx = sidx[sidx > 0].long()
+    if idx.numel() == 0:
+        return
+    S = ssm_state[idx[:2]].float()                      # [n, HV, V, K]
+    K = S.shape[-1]
+    H = torch.ones(1, 1, device=S.device)
+    while H.shape[0] < K:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    H = H / K ** 0.5
+    def cr(X, eje):
+        A = X.abs().transpose(-1, -2) if eje == "col" else X.abs()
+        return (A.amax(-1) / A.median(-1).values.clamp(min=1e-30)).median().item()
+    SR = S @ H
+    log.warning("[GDN cresta] %s paso~%d  fila %.1f  columna %.1f  | rotado: fila %.1f columna %.1f"
+                "  | max|S| %.3g  mediana|S| %.3g",
+                getattr(layer, "prefix", "?"), _cresta_n, cr(S, "fila"), cr(S, "col"),
+                cr(SR, "fila"), cr(SR, "col"), S.abs().max().item(), S.abs().median().item())
+
+
 def spec_update(layer, A_log, a, b, dt_bias, q, k, v, ssm_state, cu_seqlens,
                 spec_state_indices, num_accepted_tokens, slots):
     """Reemplazo de ``fused_sigmoid_gating_delta_rule_update`` en el camino spec.
 
     Devuelve lo mismo que upstream: ``(o [1, T, HV, V], ssm_state)``.
     """
+    if _DIAG_CRESTA:
+        _diag_cresta(layer, ssm_state, spec_state_indices[:, 0]
+                     if spec_state_indices.ndim == 2 else spec_state_indices)
     _, Ttot, H, K = k.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.shape[0] - 1
@@ -378,11 +896,53 @@ def spec_update(layer, A_log, a, b, dt_bias, q, k, v, ssm_state, cu_seqlens,
     if sombra:
         _sombra_antes(layer, ssm_state, sidx, nacc, slots, N)
     o = q.new_empty(1, Ttot, HV, V)
-    _k_spec[(triton.cdiv(V, BV), N * HV)](
-        A_log, a, b, dt_bias, 1.0, 20.0, q, k, v, o, ssm_state, ssm_state.stride(0),
-        cu_seqlens, sidx, nacc, slots, cinta, K ** -0.5, N,
-        H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, TM=TM, ROW=ROW, IS_L2=True,
-        num_warps=4, num_stages=3)
+    if paso_arbol_activo() and _camino_gpu is not None and _CERRADA:
+        # Contrato: solo se llega aca si el runner ya verifico que el lote es UNIFORME de T = K+1
+        # tokens (lo exige la mascara de arbol de PN131). El kernel igual lo comprueba y se saltea
+        # el pedido que no cumpla, antes que escribir basura.
+        T1 = layer.num_spec + 1
+        BT = triton.next_power_of_2(T1)
+        c = _cerr.get(q.device.index)
+        if c is None or c[0].shape[0] < N or c[0].shape[1] != HV or c[0].shape[2] != BT * BT:
+            nmax = max(N, _n_slots or N)
+            c = (torch.empty(nmax, HV, BT * BT, dtype=torch.float32, device=q.device),
+                 torch.empty(nmax, HV, BT * BT, dtype=torch.float32, device=q.device),
+                 torch.empty(nmax, HV, BT * 2, dtype=torch.float32, device=q.device),
+                 torch.empty(nmax, H, BT * K, dtype=torch.int8, device=q.device),
+                 torch.empty(nmax, H, BT * K, dtype=torch.int8, device=q.device),
+                 torch.empty(nmax, H, BT * 2, dtype=torch.float32, device=q.device))
+            _cerr[q.device.index] = c
+        Gb, Cm, aux, k8, q8, esc = c
+        _k_prep_cerrada[(N, HV)](
+            A_log, a, b, dt_bias, 1.0, 20.0, k, q, cu_seqlens, sidx, _anc_gpu,
+            Gb, Cm, aux, k8, q8, esc, K ** -0.5, Gb.stride(1), aux.stride(1), k8.stride(1),
+            esc.stride(1), H=H, HV=HV, K=K, BK=BK, BT=BT, T=T1, IS_L2=True, INT8=_INT8,
+            num_warps=4, num_stages=2)
+        if _INT8:
+            _k_spec_cerrada8[(triton.cdiv(V, BV), N * HV)](
+                q, k, v, o, ssm_state, ssm_state.stride(0), cu_seqlens, sidx, nacc, slots, cinta,
+                _camino_gpu, Cm, aux, k8, q8, esc, Gb.stride(1), aux.stride(1), k8.stride(1),
+                esc.stride(1), K ** -0.5, N,
+                H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, BT=BT, T=T1, TM=TM, ROW=ROW, IS_L2=True,
+                num_warps=4, num_stages=3)
+        else:
+            _k_spec_cerrada[(triton.cdiv(V, BV), N * HV)](
+                q, k, v, o, ssm_state, ssm_state.stride(0), cu_seqlens, sidx, nacc, slots, cinta,
+                _camino_gpu, Gb, Cm, aux, Gb.stride(1), aux.stride(1), K ** -0.5, N,
+                H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, BT=BT, T=T1, TM=TM, ROW=ROW, IS_L2=True,
+                num_warps=4, num_stages=3)
+    elif paso_arbol_activo() and _camino_gpu is not None:
+        _k_spec_arbol[(triton.cdiv(V, BV), N * HV)](
+            A_log, a, b, dt_bias, 1.0, 20.0, q, k, v, o, ssm_state, ssm_state.stride(0),
+            cu_seqlens, sidx, nacc, slots, cinta, _camino_gpu, _anc_gpu, K ** -0.5, N,
+            H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, TM=TM, ROW=ROW, IS_L2=True,
+            num_warps=4, num_stages=3)
+    else:
+        _k_spec[(triton.cdiv(V, BV), N * HV)](
+            A_log, a, b, dt_bias, 1.0, 20.0, q, k, v, o, ssm_state, ssm_state.stride(0),
+            cu_seqlens, sidx, nacc, slots, cinta, K ** -0.5, N,
+            H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, TM=TM, ROW=ROW, IS_L2=True,
+            num_warps=4, num_stages=3)
     if _bits & 128:
         torch.cuda.synchronize()
     _k_escribir[(N,)](
@@ -482,8 +1042,8 @@ def _sombra_despues(layer, A_log, a, b, dt_bias, q, k, v, cu, sidx, nacc, slots,
 @triton.jit(do_not_specialize=["num_reqs"])
 def _k_materializar(MODO_POST: tl.constexpr, nacc, state_idx, nsched, ncomp, ndraft,
                     src_col_p, bias_p, bt_ptrs, bt_stride: tl.int64, ssm_addrs, ssm_strides,
-                    grupos, cinta_addrs, slots, idx_map, num_reqs, block_size: tl.constexpr,
-                    IDX: tl.constexpr, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                    grupos, cinta_addrs, slots, idx_map, camino, num_reqs,
+                    block_size: tl.constexpr, IDX: tl.constexpr, ARBOL: tl.constexpr, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
                     BK: tl.constexpr, BV: tl.constexpr, TM: tl.constexpr, ROW: tl.constexpr):
     """Escribe en ``dst`` el estado que upstream leeria de ``columna src + bias``:
     ``estado[src]`` + ``bias`` filas de cinta. Solo casos con bias > 0; el resto
@@ -551,7 +1111,10 @@ def _k_materializar(MODO_POST: tl.constexpr, nacc, state_idx, nsched, ncomp, ndr
             b_h = tl.load(src + hv * V * K + o_v[:, None] * K + o_k[None, :], mask=mh,
                           other=0).to(tl.float32)
             for j in range(0, bias):
-                row = tape + j * ROW
+                if ARBOL:   # la j-esima fila aceptada, no la fila j
+                    row = tape + tl.load(camino + slot * TM + j).to(tl.int64) * ROW
+                else:
+                    row = tape + j * ROW
                 rk = tl.load(row + ih * K + o_k, mask=mk, other=0).to(tl.float32)
                 rv = tl.load(row + H * K + hv * V + o_v, mask=mv, other=0).to(tl.float32)
                 rg = tl.load(row + H * K + HV * V + hv).to(tl.float32)
@@ -603,6 +1166,15 @@ def _init_meta(ctx, kv_cache_config, forward_context) -> bool:
     return True
 
 
+def capas_gdn() -> list:
+    """Capas GDN en el orden de ``_meta.grupos`` (vacio hasta la primera migracion de estado)."""
+    return _meta.capas if _meta.ssm_addrs is not None else []
+
+
+def grupos_gdn():
+    return _meta.grupos
+
+
 def _lanzar(modo_post, ctx, num_reqs, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias,
             idx_map=None):
     H, HV, K, V, TM, ROW = _meta.dims
@@ -610,8 +1182,10 @@ def _lanzar(modo_post, ctx, num_reqs, nacc, state_idx, nsched, ncomp, ndraft, sr
         modo_post, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias,
         ctx.block_table_ptrs, ctx.block_table_stride_req, _meta.ssm_addrs,
         _meta.ssm_strides, _meta.grupos, _meta.cinta_addrs, slots_gpu(),
-        idx_map if idx_map is not None else slots_gpu(), num_reqs,
-        block_size=ctx.block_size, IDX=idx_map is not None, H=H, HV=HV, K=K, V=V,
+        idx_map if idx_map is not None else slots_gpu(),
+        _camino_gpu if _camino_gpu is not None else slots_gpu(), num_reqs,
+        block_size=ctx.block_size, IDX=idx_map is not None,
+        ARBOL=_ARBOL and _camino_gpu is not None, H=H, HV=HV, K=K, V=V,
         BK=triton.next_power_of_2(K), BV=min(triton.next_power_of_2(V), 32),
         TM=TM, ROW=ROW, num_warps=4, num_stages=3)
 
@@ -695,4 +1269,5 @@ def v2_post(ctx, num_reqs, nacc, state_idx, ncomp_nuevo, idx_mapping) -> None:
 
 
 __all__ = ["v2_pre", "v2_post", "activo", "num_speculative_blocks", "actualizar_slots", "enlazar",
-           "spec_update", "materializar_post", "materializar_pre", "slots_gpu"]
+           "spec_update", "materializar_post", "materializar_pre", "slots_gpu", "arbol", "camino_gpu",
+           "fijar_ancestros", "ancestros_gpu", "ancestros3_gpu", "paso_en_arbol", "paso_arbol_activo", "capas_gdn"]

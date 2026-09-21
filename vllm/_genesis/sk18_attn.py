@@ -122,6 +122,10 @@ _QA_QB = None
 _k = {}
 # Rotacion Hadamard de q/k: "ptx" = entera dentro de prep/escribir (reemplaza PN126 en capas PN131)
 ROT_PTX = os.environ.get("GENESIS_PN131_ROT", "ptx") == "ptx"
+# Verificacion de un ARBOL de borrador (ver vllm._genesis.arbol_borrador): la query ve el contexto
+# y, entre los tokens nuevos, solo a sus ancestros. Solo el camino int8 con rotacion PTX. Apagado
+# el texto de los kernels queda identico al de siempre.
+ARBOL = os.environ.get("GENESIS_ENABLE_ARBOL", "0") == "1"
 _signos = {}
 
 
@@ -235,11 +239,12 @@ def _kernels(md="int8"):
                 x.cargar()
             _k[dev] = ks
             return ks
-        ks = dict(main=Kernel("sk18h_batch2.cu", "sk18h_batch2", defs=defs, warps=4),
+        arb = ["-DARBOL=1"] if (ARBOL and ROT_PTX) else []
+        ks = dict(main=Kernel("sk18h_batch2.cu", "sk18h_batch2", defs=defs + arb, warps=4),
                   escribir=Kernel("sk18h_escribir2.cu" if ROT_PTX else "sk18h_escribir.cu",
                                   "sk18h_escribir2" if ROT_PTX else "sk18h_escribir", warps=1),
                   prep=Kernel("sk18h_prep2.cu" if ROT_PTX else "sk18h_prep.cu",
-                              "sk18h_prep2" if ROT_PTX else "sk18h_prep", warps=1),
+                              "sk18h_prep2" if ROT_PTX else "sk18h_prep", defs=arb, warps=1),
                   union=Kernel("sk18h_union4.cu", "sk18h_union4", defs=defs, warps=1),
                   decuant=Kernel("sk18h_decuant.cu", "sk18h_decuant", warps=1),
                   salida=Kernel("sk18h_salida.cu", "sk18h_salida", warps=1))
@@ -306,6 +311,11 @@ class _Bufs:
             self.dcap8 = z(R, dt=torch.int32)
             self.lim8 = z(R, dt=torch.int32)
         self.lim = z(R, dt=torch.int32)
+        if ARBOL:
+            self.abase = z(R, dt=torch.int32)
+            self.amask = z(R, dt=torch.int32)
+            # mascara de la CADENA de siempre, por L: el token j ve a los j-1 anteriores y a si mismo
+            self.anc_cadena = {}
         self.mqb = z(R, dt=torch.int32)
         self.dcap = z(R, dt=torch.int32)
         self.nx = VENT * SCH if VENT > 0 else 0       # ranuras extra para los trozos del espejo
@@ -346,7 +356,47 @@ def _get_bufs(dev, nh, bs, G=6):
         bmax = int(os.environ.get("GENESIS_PN131_BMAX", bmax))
         nchmax = (maxlen + bs - 1) // bs
         b = _bufs[dev.index] = _Bufs(dev, bmax, nchmax, nh, bs, G)
+        if ARBOL:
+            # La mascara tiene que existir ANTES de capturar (un arange adentro del grafo la
+            # repondria a cadena en cada replay): se crea ya, para el largo del decode spec.
+            try:
+                from vllm._genesis import arbol_runner
+                if arbol_runner.E.listo:          # lo fija el borrador al construirse, antes del KV
+                    mascara_arbol(dev, arbol_runner.E.T, b)
+                else:
+                    log.warning("PN131/ARBOL: el borrador todavia no fijo K; la mascara se crea "
+                                "en el primer decode (tiene que ser antes de capturar)")
+            except Exception as e:
+                log.warning("PN131/ARBOL: no pude precrear la mascara (%s)", type(e).__name__)
     return b
+
+
+def mascara_arbol(dev, L, bf=None, capturando=False):
+    """Bits de ancestros por fila del decode uniforme, ``[bmax * L]`` int32, UN buffer estatico
+    por largo de query (los grafos CUDA hornean la direccion: por eso no viaja en el metadata).
+
+    En reposo tiene la mascara de cadena, ``(1 << t) - 1``: la causalidad de siempre, bit a
+    bit. ``arbol_runner`` escribe el arbol de cada pedido antes del forward del target y la
+    repone despues, porque el borrador comparte estos buffers y el no verifica ningun arbol."""
+    if bf is None:
+        bf = _bufs.get(dev.index)
+        if bf is None:
+            return None
+    anc = bf.anc_cadena.get(L)
+    if anc is None:
+        if capturando:
+            raise RuntimeError("PN131/ARBOL: la mascara tiene que existir antes de capturar")
+        anc = ((1 << torch.arange(L, device=dev, dtype=torch.int32)) - 1).repeat(bf.bmax).contiguous()
+        bf.anc_cadena[L] = anc
+    return anc
+
+
+def geom_bloque(kv_cache):
+    """(NH, BS, BLK) del KV de PN131, para los kernels que mueven tokens entre slots. El bloque es
+    ``K [BS][NH][256] | V [NH][256][BS] | escalas int16 [BS][NH][2]``: V esta TRASPUESTA, asi que
+    un token no es contiguo y copiar ``kv[bloque, :, token]`` moveria bytes de otros tokens."""
+    _nb, nh, bs, blk, _raw = _geom(kv_cache)
+    return nh, bs, blk
 
 
 _geom_avisado = False
@@ -562,6 +612,10 @@ def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
             ks["prep8"].lanzar((nt, nh * G), [q16, seq, c.refs8, _signos_dev(dev), bf.Q8[: R * QD],
                                               bf.lim8[:R], bf.mqb8[:R], bf.dcap8[:R],
                                               L, nh, G, MB, ZSH, q16.stride(0)])
+    elif ROT_PTX and ARBOL:
+        anc = mascara_arbol(dev, L, bf, capturando)
+        ks["prep"].lanzar((nt, nh * G), [q16, seq, c.refs, _signos_dev(dev), Qb, lim, mqb, dcap, anc,
+                                         bf.abase[:R], bf.amask[:R], L, nh, G, MB, ZSH, q16.stride(0)])
     elif ROT_PTX:
         ks["prep"].lanzar((nt, nh * G), [q16, seq, c.refs, _signos_dev(dev), Qb, lim, mqb, dcap, L, nh, G, MB, ZSH, q16.stride(0)])
     else:
@@ -583,6 +637,10 @@ def _decode_uniforme(impl, query, kv_cache, md, output, B, L, capturando):
                                                 bf.mqb8[:R], bf.dcap8[:R], oh, ol, om, os_,
                                                 blk8, bt.stride(0), bs, NCH, nh, MB // 32, ZSH, VSH,
                                                 bf.dueno, mqb, oc, VENT], shared=SH_H)
+    elif ARBOL and ROT_PTX:
+        ks["main"].lanzar((NCH, B * nh * (MB // 32)), [Qb, raw, bt, seq, lim, mqb, dcap, bf.abase[:R], bf.amask[:R],
+                                          oh, ol, om, os_,
+                                          blk, bt.stride(0), bs, NCH, nh, MB // 32, ZSH, VSH], shared=SH_H)
     else:
         ks["main"].lanzar((NCH, B * nh * (MB // 32)), [Qb, raw, bt, seq, lim, mqb, dcap, oh, ol, om, os_,
                                           blk, bt.stride(0), bs, NCH, nh, MB // 32, ZSH, VSH], shared=SH_H)
