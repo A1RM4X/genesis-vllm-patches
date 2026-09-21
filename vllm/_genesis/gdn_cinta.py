@@ -63,6 +63,7 @@ _DEBUG = os.environ.get("GENESIS_PN122_DEBUG", "0").strip().lower() in _TRUTHY
 _ARBOL = os.environ.get("GENESIS_ENABLE_ARBOL", "0").strip().lower() in _TRUTHY
 _camino_gpu: torch.Tensor | None = None     # [slots, TM] int32; la cadena es arange(TM)
 _anc_gpu: torch.Tensor | None = None        # [tokens del lote] int32, bits de ancestros por token
+_anc3_gpu: torch.Tensor | None = None       # [tokens del lote, 3] int32, los 3 ancestros mas cercanos
 
 
 def arbol() -> bool:
@@ -85,6 +86,11 @@ def fijar_ancestros(anc: torch.Tensor | None) -> None:
 def ancestros_gpu() -> torch.Tensor | None:
     """El buffer estatico de ancestros (lo crea ``enlazar``; en reposo, mascara de cadena)."""
     return _anc_gpu
+
+
+def ancestros3_gpu() -> torch.Tensor | None:
+    """Los 3 ancestros mas cercanos por token, que es lo unico que mira la conv causal."""
+    return _anc3_gpu
 
 
 # Por paso. Los grafos FULL (decode uniforme) hornean el kernel de arbol, y ahi lo unico que
@@ -284,7 +290,7 @@ def enlazar(layer, device) -> None:
                 _n_slots, layer.num_spec, fila(layer))
     layer._g122_cinta = torch.zeros(
         (_n_slots, layer.num_spec, fila(layer)), dtype=torch.float32, device=device)
-    global _camino_gpu, _anc_gpu
+    global _camino_gpu, _anc_gpu, _anc3_gpu
     if _ARBOL and _camino_gpu is None:
         _camino_gpu = torch.arange(layer.num_spec, dtype=torch.int32, device=device)[None] \
             .repeat(_n_slots, 1).contiguous()
@@ -292,6 +298,9 @@ def enlazar(layer, device) -> None:
         T = layer.num_spec + 1
         _anc_gpu = ((1 << torch.arange(T, device=device, dtype=torch.int32)) - 1) \
             .repeat(_n_slots).contiguous()
+        ar = torch.arange(T, device=device, dtype=torch.int32)
+        # [slots*T, 3]: en reposo, la cadena (t-1, t-2, t-3 con el convenio -1/-2/-3)
+        _anc3_gpu = torch.stack([ar - 1, ar - 2, ar - 3], dim=1).repeat(_n_slots, 1).contiguous()
 
 
 # ─────────────────────────────── kernels ────────────────────────────────
@@ -413,8 +422,11 @@ def _k_spec_arbol(A_log, a, b, dt_bias, beta_sp, threshold, q, k, v, o, h, strid
     mk = o_k < K
     mv = o_v < V
     mh = mv[:, None] & mk[None, :]
-    Al = tl.load(A_log + i_hv).to(tl.float32)
+    # invariantes del lazo, calculadas UNA vez: exp(A_log) se re-evaluaba por token y por cada
+    # ancestro rehecho, y beta_sp/threshold son constantes de la llamada (1.0 y 20.0).
+    nexpAl = -tl.exp(tl.load(A_log + i_hv).to(tl.float32))
     db = tl.load(dt_bias + i_hv).to(tl.float32)
+    inv_b = 1.0 / beta_sp
     p_h = h + s * stride_h + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     b_h = tl.load(p_h, mask=mh, other=0).to(tl.float32)
 
@@ -445,24 +457,24 @@ def _k_spec_arbol(A_log, a, b, dt_bias, beta_sp, threshold, q, k, v, o, h, strid
                         jv = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
                         jx = tl.load(a + src * HV + i_hv).to(tl.float32) + db
                         jsp = tl.where(beta_sp * jx <= threshold,
-                                       (1 / beta_sp) * tl.log(1 + tl.exp(beta_sp * jx)), jx)
+                                       inv_b * tl.log(1 + tl.exp(beta_sp * jx)), jx)
                         jb = tl.sigmoid(tl.load(b + src * HV + i_hv).to(tl.float32))
                         if IS_L2:
                             jk = jk * tl.rsqrt(tl.sum(jk * jk) + 1e-6)
-                        b_h = _regla_delta(b_h, jk, jv, -tl.exp(Al) * jsp, jb)
+                        b_h = _regla_delta(b_h, jk, jv, nexpAl * jsp, jb)
         m_prev = m_t
         src = bos + t
         b_q = tl.load(q + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
         b_k = tl.load(k + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
         b_v = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
         x = tl.load(a + src * HV + i_hv).to(tl.float32) + db
-        sp = tl.where(beta_sp * x <= threshold, (1 / beta_sp) * tl.log(1 + tl.exp(beta_sp * x)), x)
+        sp = tl.where(beta_sp * x <= threshold, inv_b * tl.log(1 + tl.exp(beta_sp * x)), x)
         b_beta = tl.sigmoid(tl.load(b + src * HV + i_hv).to(tl.float32))
         if IS_L2:
             b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
             b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q = b_q * scale
-        b_h = _regla_delta(b_h, b_k, b_v, -tl.exp(Al) * sp, b_beta)
+        b_h = _regla_delta(b_h, b_k, b_v, nexpAl * sp, b_beta)
         p_o = o + (src * HV + i_hv) * V + o_v
         tl.store(p_o, tl.sum(b_h * b_q[None, :], 1).to(p_o.dtype.element_ty), mask=mv)
         if t == 0:  # la unica escritura del estado completo
@@ -876,4 +888,4 @@ def v2_post(ctx, num_reqs, nacc, state_idx, ncomp_nuevo, idx_mapping) -> None:
 
 __all__ = ["v2_pre", "v2_post", "activo", "num_speculative_blocks", "actualizar_slots", "enlazar",
            "spec_update", "materializar_post", "materializar_pre", "slots_gpu", "arbol", "camino_gpu",
-           "fijar_ancestros", "ancestros_gpu", "paso_en_arbol", "paso_arbol_activo", "capas_gdn"]
+           "fijar_ancestros", "ancestros_gpu", "ancestros3_gpu", "paso_en_arbol", "paso_arbol_activo", "capas_gdn"]

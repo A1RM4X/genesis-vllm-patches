@@ -391,52 +391,12 @@ def mascara_arbol(dev, L, bf=None, capturando=False):
     return anc
 
 
-_k_compactar_kv = None
-
-
-def compactar_slots(capas_kv, addrs, src, dst, impl):
-    """Arbol de borrador: mueve tokens de la KV del slot ``src[r, j]`` al ``dst[r, j]`` (``src ==
-    dst`` no hace nada; ambos ``[pedidos, copias]`` int64 contiguos) en TODAS las capas, con un solo lanzamiento. El layout fisico del bloque NO es
-    la forma logica del tensor (ver sk18h_escribir2.cu):
-
-        K [BS][NH][256]  |  V [NH][256][BS]  |  escalas int16 [BS][NH][2]
-
-    asi que K y las escalas de un token son contiguas pero V esta traspuesta: un byte por
-    (cabeza, dimension). Copiar ``kv[bloque, :, token]`` mueve bytes que no son de ese token.
-    Solo int8 (en int4 dos tokens vecinos comparten byte en V)."""
-    global _k_compactar_kv
-    if modo(impl) == "int4":
-        raise RuntimeError("PN131/ARBOL: la compactacion de KV no soporta int4")
-    from vllm.triton_utils import tl, triton
-    if _k_compactar_kv is None:
-        @triton.jit
-        def _k(addrs, src, dst, NJ, NH: tl.constexpr, BS: tl.constexpr, BLK: tl.constexpr,
-               QD: tl.constexpr, BK: tl.constexpr, BE: tl.constexpr):
-            # Un programa por (pedido, capa) y las copias del pedido EN ORDEN: el slot que lee la
-            # copia j puede ser el destino de la j+1 (camino 1,3,4: 2<-3 y 3<-4). En orden
-            # creciente nunca se lee algo ya pisado (src_j > dst_j' para todo j' <= j).
-            r, lay = tl.program_id(0), tl.program_id(1)
-            raw = tl.load(addrs + lay).to(tl.pointer_type(tl.int8))
-            KOFF = BS * NH * QD
-            ok = tl.arange(0, BK)
-            mk = ok < NH * QD
-            oe = tl.arange(0, BE)
-            me = oe < NH * 4
-            for j in range(0, NJ):
-                s = tl.load(src + r * NJ + j).to(tl.int64)
-                d = tl.load(dst + r * NJ + j).to(tl.int64)
-                if s != d and s >= 0 and d >= 0:
-                    bs_, os_ = raw + (s // BS) * BLK, s % BS
-                    bd_, od_ = raw + (d // BS) * BLK, d % BS
-                    tl.store(bd_ + od_ * NH * QD + ok, tl.load(bs_ + os_ * NH * QD + ok, mask=mk), mask=mk)
-                    tl.store(bd_ + KOFF + ok * BS + od_, tl.load(bs_ + KOFF + ok * BS + os_, mask=mk), mask=mk)
-                    tl.store(bd_ + 2 * KOFF + od_ * NH * 4 + oe,
-                             tl.load(bs_ + 2 * KOFF + os_ * NH * 4 + oe, mask=me), mask=me)
-        _k_compactar_kv = _k
-    nb, nh, bs, blk, _raw = _geom(capas_kv[0])
-    _k_compactar_kv[(src.shape[0], addrs.shape[0])](
-        addrs, src, dst, src.shape[1], NH=nh, BS=bs, BLK=blk, QD=QD,
-        BK=triton.next_power_of_2(nh * QD), BE=triton.next_power_of_2(nh * 4), num_warps=1)
+def geom_bloque(kv_cache):
+    """(NH, BS, BLK) del KV de PN131, para los kernels que mueven tokens entre slots. El bloque es
+    ``K [BS][NH][256] | V [NH][256][BS] | escalas int16 [BS][NH][2]``: V esta TRASPUESTA, asi que
+    un token no es contiguo y copiar ``kv[bloque, :, token]`` moveria bytes de otros tokens."""
+    _nb, nh, bs, blk, _raw = _geom(kv_cache)
+    return nh, bs, blk
 
 
 _geom_avisado = False

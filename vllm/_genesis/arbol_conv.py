@@ -29,7 +29,7 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _k_salidas(x, stride_xt, out, stride_ot, cs, stride_cs_seq, stride_cs_dim, stride_cs_tok,
-               w, stride_wd, stride_ww, cu, sidx, nacc, anc, DIM,
+               w, stride_wd, stride_ww, cu, sidx, nacc, anc3, s_a3, DIM,
                BN: tl.constexpr, SILU: tl.constexpr):
     i_n, i_f = tl.program_id(0), tl.program_id(1)
     bos = tl.load(cu + i_n).to(tl.int64)
@@ -48,36 +48,22 @@ def _k_salidas(x, stride_xt, out, stride_ot, cs, stride_cs_seq, stride_cs_dim, s
     w1 = tl.load(w + f * stride_wd + stride_ww, mask=mf, other=0.0)
     w2 = tl.load(w + f * stride_wd + 2 * stride_ww, mask=mf, other=0.0)
     w3 = tl.load(w + f * stride_wd + 3 * stride_ww, mask=mf, other=0.0)
-    x0 = tl.load(x + bos * stride_xt + f, mask=mf, other=0.0)
+    # Los TRES ancestros mas cercanos de cada token vienen precalculados (``anc3``, una vez por
+    # paso en vez de 48 veces): indice local, o -1/-2/-3 para las columnas de historia. Antes se
+    # buscaban aca con un lazo O(T^2) sobre los bits de ancestros, con una carga de BN elementos
+    # por iteracion y ramas anidadas para contarlos.
     for t in range(0, T):
         xt = tl.load(x + (bos + t) * stride_xt + f, mask=mf, other=0.0)
-        t1 = hC                                   # t1 = el anterior inmediato ... t3 = el mas lejano
-        t2 = hB
-        t3 = hA
-        if t > 0:
-            m = tl.load(anc + bos + t).to(tl.int32)
-            cnt = 0
-            for i in range(0, t - 1):             # ancestros de t, del mas cercano al mas lejano
-                j = t - 1 - i
-                if cnt < 3:
-                    if ((m >> (j - 1)) & 1) != 0:
-                        xj = tl.load(x + (bos + j) * stride_xt + f, mask=mf, other=0.0)
-                        if cnt == 0:
-                            t1 = xj
-                        elif cnt == 1:
-                            t2 = xj
-                        else:
-                            t3 = xj
-                        cnt += 1
-            if cnt == 0:                          # lo que falta sale de [x0, hC, hB]
-                t1 = x0
-                t2 = hC
-                t3 = hB
-            elif cnt == 1:
-                t2 = x0
-                t3 = hC
-            elif cnt == 2:
-                t3 = x0
+        p3 = anc3 + (bos + t) * s_a3
+        i1 = tl.load(p3 + 0).to(tl.int64)
+        i2 = tl.load(p3 + 1).to(tl.int64)
+        i3 = tl.load(p3 + 2).to(tl.int64)
+        t1 = tl.load(x + (bos + tl.maximum(i1, 0)) * stride_xt + f, mask=mf & (i1 >= 0), other=0.0)
+        t2 = tl.load(x + (bos + tl.maximum(i2, 0)) * stride_xt + f, mask=mf & (i2 >= 0), other=0.0)
+        t3 = tl.load(x + (bos + tl.maximum(i3, 0)) * stride_xt + f, mask=mf & (i3 >= 0), other=0.0)
+        t1 = tl.where(i1 >= 0, t1, tl.where(i1 == -1, hC, tl.where(i1 == -2, hB, hA)))
+        t2 = tl.where(i2 >= 0, t2, tl.where(i2 == -1, hC, tl.where(i2 == -2, hB, hA)))
+        t3 = tl.where(i3 >= 0, t3, tl.where(i3 == -1, hC, tl.where(i3 == -2, hB, hA)))
         # Igual que upstream, para que la cadena de bit a bit lo mismo: cada producto en el
         # dtype de x (fp16) y la suma en fp32, de la columna mas vieja a la mas nueva.
         acc = tl.zeros((BN,), dtype=tl.float32)
@@ -91,9 +77,9 @@ def _k_salidas(x, stride_xt, out, stride_ot, cs, stride_cs_seq, stride_cs_dim, s
 
 
 def salidas(x, conv_state, weight, activation, conv_state_indices, num_accepted_tokens,
-            query_start_loc, anc, out=None):
+            query_start_loc, anc3, out=None):
     """Mismos argumentos que ``causal_conv1d_update`` en el camino spec (``x`` [tokens, dim],
-    ``conv_state`` [bloques, dim, state_len], ``weight`` [dim, 4], sin bias) mas ``anc``.
+    ``conv_state`` [bloques, dim, state_len], ``weight`` [dim, 4], sin bias) mas ``anc3`` (ver ``arbol_borrador.preparar_paso_kernel``).
     Devuelve las salidas por camino en ``out`` (no toca ``x`` ni el estado)."""
     assert weight.shape[1] == 4 and x.stride(1) == 1
     if out is None:
@@ -105,7 +91,7 @@ def salidas(x, conv_state, weight, activation, conv_state_indices, num_accepted_
     _k_salidas[(N, triton.cdiv(dim, BN))](
         x, x.stride(0), out, out.stride(0), conv_state, conv_state.stride(0),
         conv_state.stride(1), conv_state.stride(2), weight, weight.stride(0), weight.stride(1),
-        query_start_loc, conv_state_indices, num_accepted_tokens, anc, dim,
+        query_start_loc, conv_state_indices, num_accepted_tokens, anc3, anc3.stride(0), dim,
         BN=BN, SILU=activation in ("silu", "swish", True), num_warps=4)
     return out
 

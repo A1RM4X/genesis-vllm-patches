@@ -72,7 +72,7 @@ class _Estado:
     slots_por_capa = None
     capas_kv = None          # [(nombre, tensor KV)] de las capas de atencion del target
     kv_addrs = None
-    kv_impl = None
+    kv_geom = None
     pasos = 0
     pasos_arbol = 0
     dup_padre = None
@@ -84,13 +84,38 @@ class _Estado:
     corrida_v = None
     todos = None
     filas = None
+    bits_cadena_v = None
+    delta_cero = None
+    KC = 0                   # candidatos por posicion del selector
+    rheo_b = None            # (qres, cand, hijo_s, qs) por fila del lote: salidas del kernel
+    rheo_v = None            # idem por slot de req-state
+    hay_temp = True
 
 
 E = _Estado()
 
+# Por que un paso no va en arbol. Se vuelca a /dev/shm/arbol_stats_<pid> (una linea JSON) cada 100
+# pasos: sale de arreglos numpy que el runner ya tiene, no sincroniza nada.
+_stats = {"pasos": 0, "arbol": 0, "sin_borradores": 0, "con_prefill": 0, "truncado": 0,
+          "penalidades": 0, "otro": 0, "ped_arbol": 0, "ped_decode_fuera": 0}
+
+
+def _contar(motivo: str, pedidos_decode: int) -> None:
+    _stats["pasos"] += 1
+    _stats[motivo] += 1
+    _stats["ped_arbol" if motivo == "arbol" else "ped_decode_fuera"] += pedidos_decode
+    if _stats["pasos"] % 100 == 0:
+        try:
+            import json
+            with open(f"/dev/shm/arbol_stats_{os.getpid()}", "w") as f:
+                f.write(json.dumps(_stats))
+        except OSError:
+            pass
+
 # Bisectar sin reiniciar (solo con GENESIS_ARBOL_DEBUG=1): bits leidos de /dev/shm/arbol_modo.
 #   1 aceptar solo por la primera corrida   2 sin delta de RoPE        4 sin compactar KV
 #   8 sin compactar estados ocultos         16 sin compactar la conv   32 volcar el paso al log
+#  64 mascara de cadena en un paso que POR LO DEMAS va en arbol (aisla la mascara)
 # Cambiarlo SOLO con el servidor ocioso: los dos ranks de TP tienen que leer lo mismo.
 _DEBUG = os.environ.get("GENESIS_ARBOL_DEBUG", "0") == "1"
 _modo_cache = [0, 0.0]
@@ -111,9 +136,10 @@ def _modo() -> int:
     return _modo_cache[0]
 
 
-def _init(K: int, max_reqs: int, slots: int, dev) -> None:
+def _init(K: int, max_reqs: int, slots: int, dev, KC: int = 16) -> None:
     if E.listo:
         return
+    E.KC = KC
     E.K, E.T = K, K + 1
     cad = torch.arange(-1, K, dtype=torch.int32, device=dev)
     prof = torch.arange(0, K + 1, dtype=torch.int64, device=dev)
@@ -128,6 +154,14 @@ def _init(K: int, max_reqs: int, slots: int, dev) -> None:
     E.delta_v = torch.zeros((slots + 1, K + 1), dtype=torch.int64, device=dev)
     E.corrida_v = torch.ones((slots + 1, K + 1), dtype=torch.bool, device=dev)
     E.todos = torch.ones((max_reqs, K + 1), dtype=torch.bool, device=dev)
+    def _rh(n):
+        return (torch.zeros((n, K + 1, KC), dtype=torch.float32, device=dev),
+                torch.zeros((n, K + 1, KC), dtype=torch.int64, device=dev),
+                torch.full((n, K + 1), -1, dtype=torch.int32, device=dev),
+                torch.zeros((n, K + 1), dtype=torch.float32, device=dev))
+    E.rheo_b, E.rheo_v = _rh(max_reqs), _rh(slots + 1)
+    E.bits_cadena_v = E.cadena_bits[None].repeat(slots + 1, 1).contiguous()
+    E.delta_cero = torch.zeros((slots + 1, K + 1), dtype=torch.int64, device=dev)
     if K == 8:
         E.dup_padre = torch.tensor([-1, 0, 1, 2, 3, 0, 5, 6, 7], dtype=torch.int32, device=dev)
         E.dup_prof = torch.tensor([0, 1, 2, 3, 4, 1, 2, 3, 4], dtype=torch.int64, device=dev)
@@ -137,6 +171,15 @@ def _init(K: int, max_reqs: int, slots: int, dev) -> None:
 
 
 # ───────────────────────────── 1 y 2: el borrador ─────────────────────────────
+
+# RheoSampling (arXiv 2609.21827): con temperatura, en cada grupo de hermanos entra un candidato
+# MUESTREADO que se verifica con p/q. APAGADO por defecto: es exacto (tests/proto/rheo_exactitud.py)
+# pero con 8 nodos RESTA. Medido a T=0,6 (2026-09-21, tok/s con 1 y 6 pedidos):
+#   prosa   cadena 113/361   arbol determinista 126/411 (+12%)   arbol + Rheo 116/389
+#   codigo  cadena 292/914   arbol determinista 282/912          arbol + Rheo 269/858
+# El muestreado entra con prioridad inflada (la proxy) y ocupa 1-4 de los 8 lugares; el paper usa
+# arboles de decenas de nodos. Reintentar solo si el arbol crece. GENESIS_ARBOL_RHEO=1 lo prende.
+_RHEO = os.environ.get("GENESIS_ARBOL_RHEO", "0") == "1"
 
 _DUPLICADO = os.environ.get("GENESIS_ARBOL_PRUEBA_DUPLICADO", "0") == "1"
 _path0 = None
@@ -154,9 +197,17 @@ def _sample_path(self, candidate_ids, scores, num_reqs):
         E.bits_b[:R] = E.dup_bits
         return
     S, Kc = self.num_speculative_steps, self.selector_top_k
+    rheo = None
+    if _RHEO:
+        # temperatura, semilla y posicion de cada pedido, como las lee el kernel de upstream
+        sl = self.sample_idx_mapping.view(-1, S)[:R, 0].long().clamp(min=0)
+        rheo = (self.temperature[sl].float().contiguous(), self.seeds[sl].long().contiguous(),
+                self.sample_pos.view(-1, S)[:R, 0].long().contiguous(),
+                E.rheo_b[0][:R], E.rheo_b[1][:R], E.rheo_b[2][:R], E.rheo_b[3][:R])
     ab.construir_dfs_kernel(candidate_ids.view(R, S, Kc).contiguous(),
                             scores.view(R, S, Kc, Kc).contiguous(),
-                            self.draft_tokens[:R], E.padre_b[:R], E.prof_b[:R], S, E.bits_b[:R])
+                            self.draft_tokens[:R], E.padre_b[:R], E.prof_b[:R], S, E.bits_b[:R],
+                            rheo=rheo)
     # Los puntajes realizados (los lee la verificacion adaptativa y el cache de logits del
     # borrador, que la aceptacion en arbol no usa): se dejan definidos, con la fila del ancla.
     self._selector_scores[:R] = scores.view(R, S, Kc, Kc)[:, :, 0, :].to(self._selector_scores.dtype)
@@ -174,7 +225,7 @@ def _envolver_borrador() -> None:
         init0(self, vllm_config, device)
         slots = int(getattr(vllm_config.scheduler_config, "max_num_seqs", self.max_num_reqs))
         _init(int(self.num_speculative_steps), int(self.max_num_reqs),
-              max(slots, int(self.max_num_reqs)) * 4, device)
+              max(slots, int(self.max_num_reqs)) * 4, device, int(self.selector_top_k))
 
     def propose(self, input_batch, *a, **kw):
         out = propose0(self, input_batch, *a, **kw)
@@ -186,6 +237,9 @@ def _envolver_borrador() -> None:
         E.bits_v[idx] = E.bits_b[:R]
         E.delta_v[idx] = E.prof_b[:R] - E.ar_T[None]
         E.corrida_v[idx] = (pb.long() == (E.ar_T[None] - 1)).long().cumprod(dim=1).bool()
+        if _RHEO and not _DUPLICADO:
+            for v, b in zip(E.rheo_v, E.rheo_b):
+                v[idx] = b[:R]
         return out
 
     cls.__init__, cls.propose, cls._sample_path = __init__, propose, _sample_path
@@ -219,22 +273,40 @@ def _antes_del_forward(runner, ms, input_batch) -> None:
     dev = input_batch.idx_mapping.device
     anc131 = sk18_attn.mascara_arbol(dev, T)
     rope = getattr(ms, "rope_state", None)
-    uniforme = bool((nst == T).all()) and anc131 is not None and R * T <= anc131.shape[0] \
-        and rope is not None and not _hay_penalidades(runner, input_batch.idx_mapping_np[:R])
+    try:
+        tnp = runner.sampler.sampling_states.temperature.np[input_batch.idx_mapping_np[:R]]
+        E.hay_temp = bool((tnp > 0).any())
+    except Exception:
+        E.hay_temp = True
+    forma = bool((nst == T).all())
+    pen = forma and _hay_penalidades(runner, input_batch.idx_mapping_np[:R])
+    uniforme = forma and not pen and anc131 is not None and R * T <= anc131.shape[0] \
+        and rope is not None
     gdn_cinta.paso_en_arbol(uniforme)
     E.pasos += 1
+    n_dec = int((nst == T).sum())          # pedidos que traen el arbol entero en este paso
+    if uniforme:
+        _contar("arbol", n_dec)
+    elif pen:
+        _contar("penalidades", n_dec)
+    elif bool((nst > T).any()):
+        _contar("con_prefill", n_dec)
+    elif bool((nst <= 1).all()):
+        _contar("sin_borradores", 0)
+    elif not forma:
+        _contar("truncado", n_dec)
+    else:
+        _contar("otro", n_dec)
     if not uniforme:
         return
     E.pasos_arbol += 1
-    idx = input_batch.idx_mapping[:R].long()
-    bits = E.bits_v[idx].flatten()
-    anc131[: R * T] = bits
-    gdn_cinta.ancestros_gpu()[: R * T] = bits
-    # RoPE: el nodo t va en la posicion base + profundidad(t), no base + t.
-    delta = E.delta_v[idx].flatten()
-    if _modo() & 2:
-        delta = torch.zeros_like(delta)
-    rope.positions[:, : R * T] += delta[None].to(rope.positions.dtype)
+    # UN kernel: bits de ancestros a los dos buffers, RoPE (el nodo t va en base + PROFUNDIDAD,
+    # no base + t) y los 3 ancestros mas cercanos que consume la conv causal.
+    ab.preparar_paso_kernel(input_batch.idx_mapping[:R], E.padre_v,
+                            E.bits_v if not (_modo() & 64) else E.bits_cadena_v,
+                            E.delta_v if not (_modo() & 2) else E.delta_cero,
+                            anc131, gdn_cinta.ancestros_gpu(), gdn_cinta.ancestros3_gpu(),
+                            rope.positions, R, T)
     E.uniforme = True
 
 
@@ -253,28 +325,41 @@ def _rejection_sample(target_logits, draft_logits, draft_sampled, cu_num_logits,
                            use_fp64=use_fp64, use_block_verification=use_block_verification)
     from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
     R, T = cu_num_logits.shape[0] - 1, E.T
-    idx = idx_mapping.long()
     en_arbol = E.uniforme and not (_modo() & 1)
+    idx = idx_mapping.long() if (_RHEO and E.hay_temp) or en_arbol else idx_mapping
     if en_arbol:
         # La semilla del ruido se indexa por posicion REAL (base + profundidad): asi el token j
         # del camino aceptado consume la misma clave que consumiria en una cadena. El lote es
         # uniforme, o sea que las filas de logits son R x T densas.
         pos = pos + E.delta_v[idx].flatten().to(pos.dtype)
-        alcanzable = E.todos[:R]
+        alcanzable = None                     # el arbol entero es alcanzable
     else:
         # sin mascara de arbol solo vale la primera corrida del preorden (ver el docstring)
-        alcanzable = E.corrida_v[idx]
+        alcanzable = E.corrida_v
     muestra_f = gumbel_sample(target_logits, expanded_idx_mapping, temperature, seed, pos,
                               apply_temperature=False, is_drafting=False, use_fp64=use_fp64)
-    pv = E.padre_v[idx]
+    rheo = None
+    if _RHEO and E.hay_temp and not _DUPLICADO:
+        n = target_logits.shape[0]
+        ei, lp = expanded_idx_mapping.long(), expanded_local_pos.long().clamp(max=T - 1)
+        fila = torch.bucketize(torch.arange(n, device=target_logits.device),
+                               cu_num_logits[1:].long(), right=True).clamp(max=R - 1)
+        razon, y_r = ab.preparar_rheo(
+            target_logits, draft_sampled, cu_num_logits, fila, E.rheo_v[2][ei, lp],
+            E.rheo_v[3][ei, lp], E.rheo_v[1][ei, lp], E.rheo_v[0][ei, lp],
+            lambda lg: gumbel_sample(lg, expanded_idx_mapping, temperature, seed, pos,
+                                     apply_temperature=False, is_drafting=False, use_fp64=use_fp64))
+        rheo = (E.rheo_v[2][idx].contiguous(), razon.contiguous(), y_r.contiguous(),
+                seed[idx].long().contiguous(), pos.long().contiguous())
     sampled, nacc, camino, E.filas = ab.aceptar_kernel(
-        draft_sampled, muestra_f, cu_num_logits, pv, alcanzable, T, E.K)
+        draft_sampled, muestra_f, cu_num_logits, E.padre_v, alcanzable, T, E.K, rheo=rheo,
+        idx_map=idx_mapping)
     if _modo() & 32:
         token_v, muestra = draft_sampled[:T][None], muestra_f[:T][None]
     E.camino, E.nacc = camino, nacc
     if _modo() & 32:
         log.warning("[ARBOL dbg] unif=%s padre=%s tok=%s quiere=%s camino=%s nacc=%d",
-                    E.uniforme, pv[0].tolist(), token_v[0].tolist(), muestra[0].tolist(),
+                    E.uniforme, E.padre_v[idx_mapping[0].long()].tolist(), token_v[0].tolist(), muestra[0].tolist(),
                     camino[0].tolist(), int(nacc[0]))
     return sampled[:, : num_speculative_steps + 1].contiguous(), nacc
 
@@ -309,45 +394,34 @@ def _capas_kv(runner):
 
 
 def _compactar(runner, hidden_states, input_batch) -> None:
+    """Todo lo que el paso dejo indexado por NODO pasa a estar indexado por posicion aceptada, en
+    UN kernel: estados ocultos (los lee el borrador), KV de atencion y filas de cinta. Despues de
+    esto el resto de vLLM ve exactamente una cadena de ``nacc`` tokens."""
     from vllm._genesis import gdn_cinta
     R, T = int(input_batch.num_reqs), E.T
-    dev = hidden_states.device
-    cam, nacc = E.camino[:R], E.nacc[:R]
-    # filas de cinta del camino, para el GDN del paso que viene y para la conv (slot = req + 1)
     cgpu = gdn_cinta.camino_gpu()
-    if cgpu is not None:
-        cgpu[input_batch.idx_mapping[:R].long() + 1] = E.filas[:R]
-    if not E.uniforme:
-        return                        # se acepto por la primera corrida: ya es una cadena
-    bos = (torch.arange(R, device=dev) * T)[:, None]
-    j = torch.arange(T - 1, device=dev)[None]
-    vale = j < (nacc - 1)[:, None]
-    dst = (bos + 1 + j)
-    src = torch.where(vale, bos + cam.clamp(min=0), dst)             # lo invalido se copia a si mismo
-    dst, src = dst.flatten(), src.flatten()
-    # estados ocultos que consume el borrador (src >= dst y crecientes: index_copy lee antes)
-    if not (_modo() & 8):
-        hidden_states[dst] = hidden_states[src]
-        for h in (E.aux or ()):
-            h[dst] = h[src]
-    if _modo() & 4:
+    if cgpu is None or not E.uniforme or (_modo() & 4):
+        if cgpu is not None:                      # sin arbol ya es una cadena: solo la cinta
+            cgpu[input_batch.idx_mapping[:R].long() + 1] = E.filas[:R]
         return
-    # KV de atencion: el nodo p_j se escribio en el slot base + p_j y tiene que quedar en base + j.
-    # La clave ya lleva el RoPE de base + profundidad = base + j: la copia es exacta.
     capas = _capas_kv(runner)
-    if not capas:
-        return
-    # Todas las capas de atencion del target comparten grupo de KV: un solo slot mapping.
-    sm = E.slots_por_capa.get(capas[0][0]) if E.slots_por_capa else None
+    sm = E.slots_por_capa.get(capas[0][0]) if (capas and E.slots_por_capa) else None
     if sm is None:
         return
-    from vllm._genesis import sk18_attn
     if E.kv_addrs is None:
-        E.kv_addrs = torch.tensor([kv.data_ptr() for _, kv in capas], dtype=torch.int64, device=dev)
-        E.kv_impl = runner.vllm_config.compilation_config.static_forward_context[capas[0][0]].impl
-    sk18_attn.compactar_slots([kv for _, kv in capas], E.kv_addrs,
-                              sm[src].long().view(R, T - 1).contiguous(),
-                              sm[dst].long().view(R, T - 1).contiguous(), E.kv_impl)
+        # Todas las capas de atencion del target comparten grupo de KV: un solo slot mapping.
+        E.kv_addrs = torch.tensor([kv.data_ptr() for _, kv in capas], dtype=torch.int64,
+                                  device=hidden_states.device)
+        from vllm._genesis import sk18_attn
+        impl = runner.vllm_config.compilation_config.static_forward_context[capas[0][0]].impl
+        if sk18_attn.modo(impl) == "int4":
+            raise RuntimeError("PN131/ARBOL: la compactacion de KV no soporta int4")
+        E.kv_geom = sk18_attn.geom_bloque(capas[0][1])
+    ocultos = [hidden_states] + [h for h in (E.aux or ()) if h.shape[0] == hidden_states.shape[0]]
+    if _modo() & 8:
+        ocultos = ocultos[:0] or [hidden_states]
+    ab.compactar_kernel(input_batch.idx_mapping[:R], E.camino[:R], E.nacc[:R], E.filas[:R],
+                        cgpu, ocultos, E.kv_addrs, sm, R, T, E.kv_geom)
 
 
 def _envolver_runner() -> None:
@@ -383,9 +457,9 @@ def _envolver_runner() -> None:
             # el borrador comparte los buffers de PN131 y no verifica ningun arbol
             R = int(input_batch.num_reqs)
             if E.uniforme and R:
-                m = sk18_attn.mascara_arbol(hidden_states.device, E.T)
-                m[: R * E.T] = E.cadena_bits.repeat(R)
-                gdn_cinta.ancestros_gpu()[: R * E.T] = E.cadena_bits.repeat(R)
+                ab.reponer_cadena_kernel(sk18_attn.mascara_arbol(hidden_states.device, E.T),
+                                         gdn_cinta.ancestros_gpu(), gdn_cinta.ancestros3_gpu(),
+                                         R, E.T)
             if E.pasos and E.pasos % 2000 == 0:
                 log.warning("[ARBOL] %d pasos, %d en arbol", E.pasos, E.pasos_arbol)
         return out
@@ -434,12 +508,12 @@ def _envolver_conv() -> None:
 
     def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None, **kw):
         nacc, qsl = kw.get("num_accepted_tokens"), kw.get("query_start_loc")
-        anc = gdn_cinta.ancestros_gpu()
-        if nacc is None or qsl is None or anc is None or bias is not None \
+        anc3 = gdn_cinta.ancestros3_gpu()
+        if nacc is None or qsl is None or anc3 is None or bias is not None \
                 or not gdn_cinta.paso_arbol_activo():
             return conv0(x, conv_state, weight, bias, activation, **kw)
         o = arbol_conv.salidas(x, conv_state, weight, activation, kw["conv_state_indices"],
-                               nacc, qsl, anc)
+                               nacc, qsl, anc3)
         res = conv0(x, conv_state, weight, bias, activation, **kw)      # escribe el estado
         res.copy_(o)
         return res

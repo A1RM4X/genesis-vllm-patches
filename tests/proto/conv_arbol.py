@@ -17,7 +17,7 @@ cs = cs_raw.transpose(-1, -2)                                     # [bloques, di
 w = torch.randn(DIM, W, device=dev, dtype=dt) * 0.3
 sidx = torch.tensor([2, 5, 1, 4], device=dev, dtype=torch.int32)
 cu = torch.arange(0, (N + 1) * T, T, device=dev, dtype=torch.int32)
-anc = torch.zeros(N * T, dtype=torch.int32, device=dev)
+anc3 = torch.zeros(N * T, 3, dtype=torch.int32, device=dev)
 camino = torch.arange(SPEC, dtype=torch.int32, device=dev)[None].repeat(N, 1).contiguous()
 fila_camino = torch.arange(N, dtype=torch.int32, device=dev)
 addrs = torch.tensor([cs.data_ptr()], dtype=torch.int64, device=dev)
@@ -41,7 +41,13 @@ for paso in range(PASOS):
     x = torch.randn(N * T, DIM, device=dev, dtype=dt)
     padres = [torch.arange(-1, T - 1) if n == 0 else arbol_al_azar(SPEC) for n in range(N)]
     for n in range(N):
-        anc[n * T:(n + 1) * T] = ab.bits_ancestros(padres[n][None])[0].to(dev)
+        pv = padres[n]
+        for tt in range(T):      # ancestros 1..3 subiendo; pasado el ancla, historia -1/-2/-3
+            c, j = [], (int(pv[tt]) if tt > 0 else -1)
+            while len(c) < 3:
+                c.append(j)
+                j = int(pv[j]) if j > 0 else (j - 1 if j <= 0 else -1)
+            anc3[n * T + tt] = torch.tensor(c, dtype=torch.int32, device=dev)
     ref = torch.zeros(N * T, DIM, device=dev)
     wf = w.float()
     for n in range(N):
@@ -52,7 +58,7 @@ for paso in range(PASOS):
             sec = hist[n] + cam[::-1]
             z = sum(wf[:, i] * sec[-4 + i] for i in range(4))
             ref[n * T + t] = z * torch.sigmoid(z)
-    o = ac.salidas(x, cs, w, "silu", sidx, acc, cu, anc)
+    o = ac.salidas(x, cs, w, "silu", sidx, acc, cu, anc3)
     x_up = x.clone()
     causal_conv1d_update(x_up, cs, w, None, "silu", conv_state_indices=sidx,
                          num_accepted_tokens=acc, query_start_loc=cu, max_query_len=T,
