@@ -56,6 +56,12 @@
 // que estan espejadas en el pool int8 de la ventana reciente, convierte su maximo a las unidades
 // de z del camino int4 (factor mqb8/mqb4 por fila) y baja su O en ESC8 bits (la referencia 2^ev
 // del espejo es 2^ESC8 mas chica). WCAPW iguala la escala de los pesos con la del int4.
+// ARBOL=1: verificacion de un ARBOL de borrador. Las keys hasta el ancla (abase) se ven siempre;
+// entre los tokens nuevos, la query ve solo a sus ancestros y a si misma: bit (key-abase-1) de
+// amask. Con amask = (1<<j)-1 es exactamente la causalidad de siempre (prueba de regresion).
+#ifndef ARBOL
+#define ARBOL 0
+#endif
 #ifndef HIB
 #define HIB 0
 #endif
@@ -117,6 +123,10 @@ sk18h_batch2(
     const int* __restrict__ lim,            // [B, NH, 32] ultima key visible (-1 = fila vacia)
     const int* __restrict__ mqb,            // [B, NH, 32]
     const int* __restrict__ dcap,           // [B, NH, 32]
+#if ARBOL
+    const int* __restrict__ abase,          // [B, NH, 32] posicion del ancla (ultima key siempre visible)
+    const int* __restrict__ amask,          // [B, NH, 32] bits de ancestros entre los tokens nuevos
+#endif
     int* __restrict__ out_hi,               // [NCH, R, 256]  R = B*NH*32
     int* __restrict__ out_lo,
     int* __restrict__ out_m,                // [NCH, R]
@@ -233,12 +243,19 @@ sk18h_batch2(
 
     // Las 2 queries del hilo: columnas tig*2 + {0,1} del warp.
     int qr[2], lm[2], mq[2], dc[2];
+#if ARBOL
+    int lb[2], am[2];
+#endif
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
         const int r = bq + wq + tig * 2 + e;
         const int vale = r < hlim;
         qr[e] = r;
         lm[e] = vale ? lim[r] : -1;
+#if ARBOL
+        lb[e] = vale ? abase[r] : -1;
+        am[e] = vale ? amask[r] : 0;
+#endif
         mq[e] = vale ? mqb[r] : 1;
         dc[e] = vale ? dcap[r] : 0;
     }
@@ -291,6 +308,15 @@ sk18h_batch2(
         __pipeline_commit();                                                   \
     } while (0)
 
+// Visibilidad por ancestros (ARBOL): sin ramas, y sin desplazamientos fuera de rango.
+#if ARBOL
+#define SK18H_ANC(KEY, E)                                                      \
+    && (((KEY) <= lb[E]) | ((int)((unsigned)((KEY) - lb[E] - 1) < 31u) &       \
+                            ((am[E] >> (((KEY) - lb[E] - 1) & 31)) & 1)))
+#else
+#define SK18H_ANC(KEY, E)
+#endif
+
 // Q.K de una unidad (buf 0) -> zq[BK/8][2] con PAD donde la key no es visible.
 #define SK18H_QK(ET, K0)                                                       \
     do {                                                                       \
@@ -310,7 +336,7 @@ sk18h_batch2(
             for (int hr = 0; hr < 2; ++hr)                                     \
                 for (int e = 0; e < 2; ++e) {                                  \
                     const int key = (K0) + f * 16 + gid + hr * 8;              \
-                    const int vis = key < kfin && key <= lm[e];                \
+                    const int vis = key < kfin && key <= lm[e] SK18H_ANC(key, e);  \
                     const int sk = vis ? (int)((short*)&sE[ET][((key - (K0)) * NH + hh) * 4])[0] : 0; \
                     const int zz = (int)(((long long)acc[hr * 2 + e] * sk) >> ZSH); \
                     zq[f * 2 + hr][e] = vis ? zz : PADZ;                       \

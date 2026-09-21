@@ -72,6 +72,32 @@ def cargar() -> None:
             log.error("[DIAG] no se pudo enganchar la firma de lm_head (%s: %s)",
                       type(e).__name__, e)
 
+    if _prendido("GENESIS_ENABLE_ARBOL"):
+        # Arbol de borrador de DFlash2: monkeypatch del borrador, del runner v2 y de la conv de
+        # GDN. Tiene que correr aca (el proceso que sirve), no en apply_all.
+        try:
+            from vllm._genesis import arbol_runner
+            arbol_runner.instalar()
+        except Exception as e:  # noqa: BLE001
+            log.error("[ARBOL] no se pudo instalar: %s: %s", type(e).__name__, e)
+
+    if os.environ.get("GENESIS_DIAG_DDTREE_DUMP", "").strip():
+        try:
+            from vllm._genesis.diag_ddtree_dump import enganchar as _ddt
+
+            _ddt()
+        except Exception as e:                                   # noqa: BLE001
+            log.error("[DIAG] no se pudo enganchar el volcado ddtree (%s: %s)",
+                      type(e).__name__, e)
+
+    if _prendido("GENESIS_DIAG_DRAFTER_A16"):
+        try:
+            from vllm._genesis.diag_drafter_a16 import enganchar as _a16
+
+            _a16()
+        except Exception as e:                                   # noqa: BLE001
+            log.error("[DIAG] no se pudo enganchar drafter A16 (%s: %s)", type(e).__name__, e)
+
     # PN144 va ANTES del diagnostico: engancha load_weights, que corre despues igual, pero
     # asi el orden en el log cuenta la historia en el orden en que pasan las cosas.
     try:

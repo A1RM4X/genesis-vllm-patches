@@ -53,6 +53,59 @@ def activo() -> bool:
 
 
 _DEBUG = os.environ.get("GENESIS_PN122_DEBUG", "0").strip().lower() in _TRUTHY
+
+# Arbol de borrador (apagado por defecto). Con el arbol, los tokens 1..K del paso no son una
+# cadena: cada uno cuelga de un ancestro. Cambian dos cosas y nada mas:
+#   * el forward spec arma el estado de cada token desde el de SU padre (``_k_spec_arbol``);
+#   * lo que se reproduce al paso siguiente no son las filas 0..r-1 de la cinta sino las del
+#     camino aceptado: ``camino[slot, j]`` = fila de cinta del j-esimo token aceptado.
+# La cinta se escribe igual que siempre (fila t-1 = token t del paso).
+_ARBOL = os.environ.get("GENESIS_ENABLE_ARBOL", "0").strip().lower() in _TRUTHY
+_camino_gpu: torch.Tensor | None = None     # [slots, TM] int32; la cadena es arange(TM)
+_anc_gpu: torch.Tensor | None = None        # [tokens del lote] int32, bits de ancestros por token
+
+
+def arbol() -> bool:
+    return _ARBOL
+
+
+def camino_gpu() -> torch.Tensor | None:
+    """``[slots, TM]``: el runner escribe aca, despues de aceptar, las filas de cinta del
+    camino aceptado (nodo - 1). Persistente: lo leen el forward y las copias align."""
+    return _camino_gpu
+
+
+def fijar_ancestros(anc: torch.Tensor | None) -> None:
+    """Bits de ancestros por token del lote (formato de ``arbol_borrador.bits_ancestros``),
+    en un buffer ESTATICO (grafos CUDA). ``None`` = todos los pedidos van en cadena."""
+    global _anc_gpu
+    _anc_gpu = anc
+
+
+def ancestros_gpu() -> torch.Tensor | None:
+    """El buffer estatico de ancestros (lo crea ``enlazar``; en reposo, mascara de cadena)."""
+    return _anc_gpu
+
+
+# Por paso. Los grafos FULL (decode uniforme) hornean el kernel de arbol, y ahi lo unico que
+# decide es el CONTENIDO del buffer (con la mascara de cadena da bit a bit lo de siempre). En
+# eager/piecewise (lotes mezclados) Python corre cada vez y esta bandera elige el kernel. Por
+# eso arranca prendida: es lo que tiene que ver la captura.
+_paso_arbol = True
+
+
+def paso_en_arbol(si: bool) -> None:
+    global _paso_arbol
+    _paso_arbol = bool(si)
+
+
+def paso_arbol_activo() -> bool:
+    if not _ARBOL or _anc_gpu is None:
+        return False
+    # Capturando un grafo se hornea SIEMPRE el kernel de arbol, valga lo que valga la bandera
+    # (una corrida dummy anterior la puede haber dejado apagada, y el grafo quedaba con la conv
+    # y el GDN de cadena para siempre: medido, el nodo tras un salto de rama fallaba el 75%).
+    return _paso_arbol or torch.cuda.is_current_stream_capturing()
 _debug_n = 0
 
 
@@ -231,6 +284,14 @@ def enlazar(layer, device) -> None:
                 _n_slots, layer.num_spec, fila(layer))
     layer._g122_cinta = torch.zeros(
         (_n_slots, layer.num_spec, fila(layer)), dtype=torch.float32, device=device)
+    global _camino_gpu, _anc_gpu
+    if _ARBOL and _camino_gpu is None:
+        _camino_gpu = torch.arange(layer.num_spec, dtype=torch.int32, device=device)[None] \
+            .repeat(_n_slots, 1).contiguous()
+    if _ARBOL and _anc_gpu is None:
+        T = layer.num_spec + 1
+        _anc_gpu = ((1 << torch.arange(T, device=device, dtype=torch.int32)) - 1) \
+            .repeat(_n_slots).contiguous()
 
 
 # ─────────────────────────────── kernels ────────────────────────────────
@@ -311,6 +372,104 @@ def _k_spec(A_log, a, b, dt_bias, beta_sp, threshold, q, k, v, o, h, stride_h, c
         p_o += HV * V
 
 
+@triton.jit
+def _regla_delta(b_h, b_k, b_v, b_g, b_beta):
+    b_h = b_h * tl.exp(b_g)
+    b_d = (b_v - tl.sum(b_h * b_k[None, :], 1)) * b_beta
+    return b_h + b_d[:, None] * b_k[None, :]
+
+
+@triton.jit(do_not_specialize=["N"])
+def _k_spec_arbol(A_log, a, b, dt_bias, beta_sp, threshold, q, k, v, o, h, stride_h, cu, sidx,
+                  nacc, slots, cinta, camino, anc, scale, N,
+                  H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                  BK: tl.constexpr, BV: tl.constexpr, TM: tl.constexpr, ROW: tl.constexpr,
+                  IS_L2: tl.constexpr):
+    """``_k_spec`` para un paso en ARBOL. Aparte a proposito: el kernel de produccion no se toca.
+
+    Los tokens vienen en orden topologico, y mejor en preorden (``arbol_borrador.orden_dfs``):
+    mientras el padre de un token sea el token anterior se sigue con el estado corriente, igual
+    que la cadena; en un salto de rama se vuelve al estado tras el token 0 y se rehacen los
+    ancestros (actualizaciones de rango 1 sobre un bloque que ya esta en registros: no hay
+    trafico de estado, que es lo que cuesta aca). Guardar un estado por nodo seria peor: el
+    estado local pasaria de 4k a 64k elementos por programa.
+
+    ``anc[bos + t]``: bit j-1 = el token j es ancestro de t, o es t. Con la mascara de cadena,
+    ``(1 << t) - 1``, nunca hay salto y la salida es identica bit a bit a la de ``_k_spec``.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu + i_n).to(tl.int64)
+    eos = tl.load(cu + i_n + 1).to(tl.int64)
+    T = eos - bos
+    if T == 0:
+        return
+    s = tl.load(sidx + i_n).to(tl.int64)
+    if s <= 0:
+        return
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mk = o_k < K
+    mv = o_v < V
+    mh = mv[:, None] & mk[None, :]
+    Al = tl.load(A_log + i_hv).to(tl.float32)
+    db = tl.load(dt_bias + i_hv).to(tl.float32)
+    p_h = h + s * stride_h + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h = tl.load(p_h, mask=mh, other=0).to(tl.float32)
+
+    # 1) reproducir el CAMINO aceptado del paso anterior
+    r = tl.load(nacc + i_n).to(tl.int64) - 1
+    slot = tl.load(slots + i_n).to(tl.int64)
+    for j in range(0, r):
+        jj = tl.load(camino + slot * TM + j).to(tl.int64)
+        row = cinta + (slot * TM + jj) * ROW
+        rk = tl.load(row + i_h * K + o_k, mask=mk, other=0).to(tl.float32)
+        rv = tl.load(row + H * K + i_hv * V + o_v, mask=mv, other=0).to(tl.float32)
+        rg = tl.load(row + H * K + HV * V + i_hv).to(tl.float32)
+        rb = tl.load(row + H * K + HV * V + HV + i_hv).to(tl.float32)
+        b_h = _regla_delta(b_h, rk, rv, rg, rb)
+
+    # 2) tokens del paso actual, cada uno sobre el estado de su padre
+    b_raiz = b_h
+    m_prev = tl.zeros((), tl.int32)
+    for t in range(0, T):
+        m_t = tl.load(anc + bos + t).to(tl.int32)
+        if t >= 2:
+            if m_t != (m_prev | (1 << (t - 1))):
+                b_h = b_raiz                       # salto de rama: rehacer los ancestros
+                for j in range(1, t):
+                    if ((m_t >> (j - 1)) & 1) != 0:
+                        src = bos + j
+                        jk = tl.load(k + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+                        jv = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
+                        jx = tl.load(a + src * HV + i_hv).to(tl.float32) + db
+                        jsp = tl.where(beta_sp * jx <= threshold,
+                                       (1 / beta_sp) * tl.log(1 + tl.exp(beta_sp * jx)), jx)
+                        jb = tl.sigmoid(tl.load(b + src * HV + i_hv).to(tl.float32))
+                        if IS_L2:
+                            jk = jk * tl.rsqrt(tl.sum(jk * jk) + 1e-6)
+                        b_h = _regla_delta(b_h, jk, jv, -tl.exp(Al) * jsp, jb)
+        m_prev = m_t
+        src = bos + t
+        b_q = tl.load(q + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+        b_k = tl.load(k + (src * H + i_h) * K + o_k, mask=mk, other=0).to(tl.float32)
+        b_v = tl.load(v + (src * HV + i_hv) * V + o_v, mask=mv, other=0).to(tl.float32)
+        x = tl.load(a + src * HV + i_hv).to(tl.float32) + db
+        sp = tl.where(beta_sp * x <= threshold, (1 / beta_sp) * tl.log(1 + tl.exp(beta_sp * x)), x)
+        b_beta = tl.sigmoid(tl.load(b + src * HV + i_hv).to(tl.float32))
+        if IS_L2:
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+        b_h = _regla_delta(b_h, b_k, b_v, -tl.exp(Al) * sp, b_beta)
+        p_o = o + (src * HV + i_hv) * V + o_v
+        tl.store(p_o, tl.sum(b_h * b_q[None, :], 1).to(p_o.dtype.element_ty), mask=mv)
+        if t == 0:  # la unica escritura del estado completo
+            tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mh)
+            b_raiz = b_h
+
+
 @triton.jit(do_not_specialize=["N"])
 def _k_escribir(A_log, a, b, dt_bias, beta_sp, threshold, k, v, cu, sidx, slots, cinta, N,
                 H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
@@ -378,11 +537,18 @@ def spec_update(layer, A_log, a, b, dt_bias, q, k, v, ssm_state, cu_seqlens,
     if sombra:
         _sombra_antes(layer, ssm_state, sidx, nacc, slots, N)
     o = q.new_empty(1, Ttot, HV, V)
-    _k_spec[(triton.cdiv(V, BV), N * HV)](
-        A_log, a, b, dt_bias, 1.0, 20.0, q, k, v, o, ssm_state, ssm_state.stride(0),
-        cu_seqlens, sidx, nacc, slots, cinta, K ** -0.5, N,
-        H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, TM=TM, ROW=ROW, IS_L2=True,
-        num_warps=4, num_stages=3)
+    if paso_arbol_activo() and _camino_gpu is not None:
+        _k_spec_arbol[(triton.cdiv(V, BV), N * HV)](
+            A_log, a, b, dt_bias, 1.0, 20.0, q, k, v, o, ssm_state, ssm_state.stride(0),
+            cu_seqlens, sidx, nacc, slots, cinta, _camino_gpu, _anc_gpu, K ** -0.5, N,
+            H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, TM=TM, ROW=ROW, IS_L2=True,
+            num_warps=4, num_stages=3)
+    else:
+        _k_spec[(triton.cdiv(V, BV), N * HV)](
+            A_log, a, b, dt_bias, 1.0, 20.0, q, k, v, o, ssm_state, ssm_state.stride(0),
+            cu_seqlens, sidx, nacc, slots, cinta, K ** -0.5, N,
+            H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, TM=TM, ROW=ROW, IS_L2=True,
+            num_warps=4, num_stages=3)
     if _bits & 128:
         torch.cuda.synchronize()
     _k_escribir[(N,)](
@@ -482,8 +648,8 @@ def _sombra_despues(layer, A_log, a, b, dt_bias, q, k, v, cu, sidx, nacc, slots,
 @triton.jit(do_not_specialize=["num_reqs"])
 def _k_materializar(MODO_POST: tl.constexpr, nacc, state_idx, nsched, ncomp, ndraft,
                     src_col_p, bias_p, bt_ptrs, bt_stride: tl.int64, ssm_addrs, ssm_strides,
-                    grupos, cinta_addrs, slots, idx_map, num_reqs, block_size: tl.constexpr,
-                    IDX: tl.constexpr, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                    grupos, cinta_addrs, slots, idx_map, camino, num_reqs,
+                    block_size: tl.constexpr, IDX: tl.constexpr, ARBOL: tl.constexpr, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
                     BK: tl.constexpr, BV: tl.constexpr, TM: tl.constexpr, ROW: tl.constexpr):
     """Escribe en ``dst`` el estado que upstream leeria de ``columna src + bias``:
     ``estado[src]`` + ``bias`` filas de cinta. Solo casos con bias > 0; el resto
@@ -551,7 +717,10 @@ def _k_materializar(MODO_POST: tl.constexpr, nacc, state_idx, nsched, ncomp, ndr
             b_h = tl.load(src + hv * V * K + o_v[:, None] * K + o_k[None, :], mask=mh,
                           other=0).to(tl.float32)
             for j in range(0, bias):
-                row = tape + j * ROW
+                if ARBOL:   # la j-esima fila aceptada, no la fila j
+                    row = tape + tl.load(camino + slot * TM + j).to(tl.int64) * ROW
+                else:
+                    row = tape + j * ROW
                 rk = tl.load(row + ih * K + o_k, mask=mk, other=0).to(tl.float32)
                 rv = tl.load(row + H * K + hv * V + o_v, mask=mv, other=0).to(tl.float32)
                 rg = tl.load(row + H * K + HV * V + hv).to(tl.float32)
@@ -603,6 +772,15 @@ def _init_meta(ctx, kv_cache_config, forward_context) -> bool:
     return True
 
 
+def capas_gdn() -> list:
+    """Capas GDN en el orden de ``_meta.grupos`` (vacio hasta la primera migracion de estado)."""
+    return _meta.capas if _meta.ssm_addrs is not None else []
+
+
+def grupos_gdn():
+    return _meta.grupos
+
+
 def _lanzar(modo_post, ctx, num_reqs, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias,
             idx_map=None):
     H, HV, K, V, TM, ROW = _meta.dims
@@ -610,8 +788,10 @@ def _lanzar(modo_post, ctx, num_reqs, nacc, state_idx, nsched, ncomp, ndraft, sr
         modo_post, nacc, state_idx, nsched, ncomp, ndraft, src_col, bias,
         ctx.block_table_ptrs, ctx.block_table_stride_req, _meta.ssm_addrs,
         _meta.ssm_strides, _meta.grupos, _meta.cinta_addrs, slots_gpu(),
-        idx_map if idx_map is not None else slots_gpu(), num_reqs,
-        block_size=ctx.block_size, IDX=idx_map is not None, H=H, HV=HV, K=K, V=V,
+        idx_map if idx_map is not None else slots_gpu(),
+        _camino_gpu if _camino_gpu is not None else slots_gpu(), num_reqs,
+        block_size=ctx.block_size, IDX=idx_map is not None,
+        ARBOL=_ARBOL and _camino_gpu is not None, H=H, HV=HV, K=K, V=V,
         BK=triton.next_power_of_2(K), BV=min(triton.next_power_of_2(V), 32),
         TM=TM, ROW=ROW, num_warps=4, num_stages=3)
 
@@ -695,4 +875,5 @@ def v2_post(ctx, num_reqs, nacc, state_idx, ncomp_nuevo, idx_mapping) -> None:
 
 
 __all__ = ["v2_pre", "v2_post", "activo", "num_speculative_blocks", "actualizar_slots", "enlazar",
-           "spec_update", "materializar_post", "materializar_pre", "slots_gpu"]
+           "spec_update", "materializar_post", "materializar_pre", "slots_gpu", "arbol", "camino_gpu",
+           "fijar_ancestros", "ancestros_gpu", "paso_en_arbol", "paso_arbol_activo", "capas_gdn"]

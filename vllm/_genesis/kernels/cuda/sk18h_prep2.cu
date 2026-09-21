@@ -13,6 +13,9 @@
 #include "sk18h_comun.cuh"
 
 #define QD 256
+#ifndef ARBOL
+#define ARBOL 0
+#endif
 #ifndef MQ
 #define MQ 1561327149LL
 #endif
@@ -27,6 +30,11 @@ sk18h_prep2(
     int* __restrict__ lim,                  // [B, NH, MB]
     int* __restrict__ mqb,
     int* __restrict__ dcap,
+#if ARBOL
+    const int* __restrict__ anc,            // [B*L] bits de ancestros de cada token (0 para el ancla)
+    int* __restrict__ abase,                // [B, NH, MB]
+    int* __restrict__ amask,
+#endif
     int L, int NH, int G, int MB, int ZSH, int QS)   // QS = paso de fila de q (elementos)
 {
     const int t = blockIdx.x;
@@ -73,7 +81,16 @@ sk18h_prep2(
         lim[row] = seq[b] - L + j;
         mqb[row] = (int)m;
         dcap[row] = (int)dc;
+#if ARBOL
+        abase[row] = seq[b] - L;
+        amask[row] = anc[t];
+#endif
         if (j == L - 1 && g == G - 1)
-            for (int r = L * G; r < MB; ++r) { lim[base_bh + r] = -1; mqb[base_bh + r] = 1; dcap[base_bh + r] = 0; }
+            for (int r = L * G; r < MB; ++r) {
+                lim[base_bh + r] = -1; mqb[base_bh + r] = 1; dcap[base_bh + r] = 0;
+#if ARBOL
+                abase[base_bh + r] = -1; amask[base_bh + r] = 0;
+#endif
+            }
     }
 }
