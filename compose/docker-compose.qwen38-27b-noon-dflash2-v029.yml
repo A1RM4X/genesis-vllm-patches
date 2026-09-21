@@ -432,6 +432,19 @@ services:
       # tokens. Arreglado con gdn_cinta.v2_pre/v2_post + pn122_mh_*. OJO: el quality-test
       # --quick no lo ve (no cruza un borde); el oraculo es una generacion de >2000 tokens.
       - GENESIS_ENABLE_PN122_GDN_CINTA=1
+      # Arbol de borrador de 8 nodos para DFlash2. En vez de verificar UN camino goloso (donde el
+      # primer fallo tira el resto), verifica los 8 nodos de mayor probabilidad de camino, con el
+      # mismo costo de paso: mismos 8 slots, misma profundidad.
+      #   prosa/mixto  +10,3% (mi banco) y +11,0% (bench de club-3090), reproducible
+      #   codigo       -0,8% con 1 pedido, -8,4% con 6 (ahi el drafter ya acierta 6,6 de 9 y el
+      #                arbol no aporta aceptacion: 6,59 en los dos brazos)
+      # El prefill y el TTFT no se tocan. Necesita PN122 (la cinta) y el decode entero de PN131.
+      # Apagarlo: GENESIS_ENABLE_ARBOL=0.
+      - GENESIS_ENABLE_ARBOL=1
+      # Forma cerrada del GDN en int8: APAGADA. Es exacta en el estado que se propaga (3e-17) y
+      # mas rapida de kernel, pero aporta ~0 end-to-end y mete 0,6% de error en las salidas de
+      # draft. El camino secuencial es bit a bit identico a produccion cuando no hay arbol.
+      - GENESIS_ARBOL_CERRADA=0
       # 5824 = 7 x 832 (un bloque KV). Medido contra el camino REAL de produccion
       # (cutlass + SiLU fusionado por inductor, NO el SiLU suelto con el que lo
       # habia medido mal): el cruce esta entre 4992 (0,93x) y 5824 (1,04x).
