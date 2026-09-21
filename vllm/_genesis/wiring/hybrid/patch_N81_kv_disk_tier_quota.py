@@ -54,6 +54,27 @@ PN81 extiende ese hook con dos barridos independientes:
    Cadencia propia y más lenta que la de la cuota porque recorre TODOS los
    directorios de `root_dir`, no solo el del modelo actual.
 
+**C. Un directorio por FORMATO de KV** — el nombre del directorio
+   (`file_mapper.py`) sale del modelo, el paralelismo, `tokens_per_hash`, el
+   dtype DEL MODELO y los grupos, y nada de eso dice que significan los
+   bytes: `--kv-cache-dtype`, si k se guarda rotada (PN126/PN131), el kernel
+   que escribe (PN131 usa exponentes de referencia propios), PN122, la KV del
+   borrador. Cambiar cualquiera de esos dejaba el MISMO directorio, y como el
+   tier esta en disco los bloques sobreviven a recrear el contenedor: el
+   arranque siguiente los restauraba con el significado nuevo.
+
+   Medido el 2026-09-21: un prompt de 37k repetido entre brazos de un A/B
+   devolvia `"\n"` + EOS (2 tokens) en 1,8 s; uno nuevo del mismo largo, en
+   el MISMO arranque, 400 tokens correctos en 16,7 s. Es la cara de contexto
+   largo del "emite dos tokens y para": el healthcheck, con 6 palabras, nunca
+   llega a un bloque y no lo ve.
+
+   PN81 agrega `genesis_kv_format` (ver `vllm._genesis.kv_formato`) a los
+   campos que se hashean: otra config, otro directorio. Los directorios de la
+   config anterior quedan sin uso y los barre la purga B. Este sub-parche NO
+   es best-effort: si su ancla deriva, PN81 falla entero, porque un tier de
+   disco que mezcla formatos es peor que no tener tier.
+
 ⚠️ La cuota NO es por rank — el total en disco es `GENESIS_KV_DISK_MAX_GB`,
 no un múltiplo. `TieringOffloadingSpec.get_manager()` se llama desde un
 único sitio (`offloading/scheduler.py:457`, `OffloadingConnectorScheduler`),
@@ -389,6 +410,34 @@ def _shm_patcher() -> TextPatcher | None:
     )
 
 
+NS_ANCHOR_OLD = "        self.base_path: str = self._compute_base_path(root_dir, self.fields)\n"
+NS_ANCHOR_NEW = (
+    "        # " + GENESIS_PN81_MARKER + " un directorio por FORMATO de KV\n"
+    "        # Sin esto, cambiar --kv-cache-dtype, la rotacion de k, PN131 o PN122 dejaba el\n"
+    "        # mismo directorio y los bloques viejos se restauraban con el significado nuevo.\n"
+    "        from vllm._genesis import kv_formato as _g81fmt\n"
+    "        self.fields[\"genesis_kv_format\"] = _g81fmt.huella()\n"
+    + NS_ANCHOR_OLD
+)
+
+
+def _namespace_patcher() -> TextPatcher | None:
+    """Tercer target: la identidad del directorio vive en file_mapper.py."""
+    target = resolve_vllm_file("v1/kv_offload/file_mapper.py")
+    if target is None:
+        return None
+    return TextPatcher(
+        patch_name="PN81 KV disk tier namespace",
+        target_file=str(target),
+        marker=GENESIS_PN81_MARKER,
+        sub_patches=[
+            TextPatch(name="pn81_kv_format_namespace", anchor=NS_ANCHOR_OLD,
+                      replacement=NS_ANCHOR_NEW, required=True),
+        ],
+        upstream_drift_markers=["kv_cache_dtype", "cache_dtype"],
+    )
+
+
 def _patcher() -> TextPatcher | None:
     target = resolve_vllm_file("v1/kv_offload/tiering/fs/manager.py")
     if target is None:
@@ -435,6 +484,16 @@ def apply() -> tuple[str, str]:
     p = _patcher()
     if p is None:
         return "skipped", "v1/kv_offload/tiering/fs/manager.py not found"
+    # El namespace va PRIMERO y no es best-effort: con el tier de disco activo, mezclar
+    # formatos de KV da salidas corruptas en silencio.
+    ns = _namespace_patcher()
+    if ns is not None:
+        ns_result, ns_failure = ns.apply()
+        ns_status, ns_msg = result_to_wiring_status(
+            ns_result, ns_failure, applied_message="namespace por formato de KV",
+            patch_name="PN81 KV disk tier namespace")
+        if ns_status == "failed":
+            return "failed", f"namespace por formato de KV: {ns_msg}"
     result, failure = p.apply()
     # el purgador de /dev/shm es best-effort: si su ancla derivo, la cuota de
     # disco (lo principal) igual se aplica
@@ -450,7 +509,7 @@ def apply() -> tuple[str, str]:
         applied_message=(
             "PN81 applied: on_schedule_end() implementado en FileSystemTierManager "
             "con cuota de disco. Poda por mtime al superar GENESIS_KV_DISK_MAX_GB, "
-            "bajando hasta GENESIS_KV_DISK_TARGET_RATIO del limite. Ademas purga mmaps huerfanos de /dev/shm dejados por cierres abruptos."
+            "bajando hasta GENESIS_KV_DISK_TARGET_RATIO del limite. Ademas purga mmaps huerfanos de /dev/shm dejados por cierres abruptos, y el directorio del tier ahora depende del FORMATO de la KV (dtype, rotacion, PN131, PN122)."
         ),
         patch_name="PN81 KV disk tier quota",
     )

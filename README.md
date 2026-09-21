@@ -805,6 +805,25 @@ hard way:
 - **A second bug the same day:** the new integer FWHT reads 16-bit words, and PN131's
   reference-scale code handed it fp32. Signature: `ek=11` on *every* attention layer in the boot
   log, where a healthy boot shows `ek=0`. Identical values across layers are the tell.
+- **The disk KV tier used to mix blocks from different KV formats — fixed 2026-09-21, inside
+  PN81.** vLLM names the offload directory from the model, the parallelism, `tokens_per_hash`,
+  the *model* dtype and the KV groups. Nothing in that says what the bytes **mean**:
+  `--kv-cache-dtype`, whether `k` is stored rotated (PN126 / PN131), which kernel wrote it
+  (PN131 stores with its own reference exponents), PN122, the drafter's KV. Change any of them
+  and the directory stays the same — and because the tier is on disk, the blocks survive a
+  container recreate and the next boot restores them under the new meaning. Measured: a 37K
+  prompt repeated across the arms of an A/B came back as `"\n"` + EOS (2 tokens) in 1.8 s; a
+  fresh prompt of the same length, **in the same boot**, gave 400 correct tokens in 16.7 s.
+  It is the long-context face of "emits two tokens and stops", and the healthcheck never sees
+  it: its six-word prompt does not fill a block, so it never touches the tier.
+  PN81 now adds a fingerprint of the KV byte format (`vllm/_genesis/kv_formato.py`) to the
+  hashed fields: another config, another directory. `K` is deliberately *not* in it — it does
+  not change what is stored. The sub-patch is not best-effort: if its anchor drifts, PN81 fails
+  as a whole, because a disk tier that mixes formats is worse than no tier. Old directories
+  are left unused and PN81's orphan purge removes them after `GENESIS_KV_DISK_ORPHAN_DAYS`.
+  **If you A/B anything that changes the KV format, use a different prompt per arm and read
+  the output text, not just tok/s** — a whole afternoon of long-context results here had to be
+  thrown away for exactly this reason.
 - **The decode profile is a configuration behind.** Re-profile against int8 KV +
   DFlash2 K=8 before acting on the percentages above.
 - **The drafter still runs in fp16** — 7.6% of every decode step. PN133 is
