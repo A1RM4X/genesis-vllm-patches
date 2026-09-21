@@ -456,6 +456,13 @@ services:
       - GENESIS_ENABLE_P82=1
       - GENESIS_ENABLE_PN8_MTP_DRAFT_ONLINE_QUANT=0
       - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
+      # 2026-09-21: P66 GENERA las tallas de CUDA graph como (K+1)*n en vez de filtrar la lista
+      # de abajo, que son multiplos de 4 (de cuando el drafter era MTP K=3): con K=8 solo
+      # sobrevivian [9, 36], y con K=10/12 ninguna (K=10 a 37k: 133 -> 223 tok/s al generarlas).
+      # Hasta 4 pedidos y no mas: medido con K=8, las tallas ayudan con pocos pedidos y restan
+      # con muchos (a 6-8 pedidos el camino sin grafo es 5-7% mas rapido).
+      - GENESIS_P66_GENERAR_TALLAS=1
+      - GENESIS_P66_MAX_REQS=4
       - GENESIS_ENABLE_P5B=1
       - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
       - GENESIS_P68_P69_LONG_CTX_THRESHOLD_CHARS=1000
@@ -582,7 +589,7 @@ services:
       # inferencia del worker), asi que cae a 10 y el servidor se muere al llegar
       # el lote 11: "RuntimeError: PN131: lote 12 > GENESIS_PN131_BMAX 10".
       # Tiene que ACOMPAÑAR a --max-num-seqs de mas abajo.
-      - GENESIS_PN131_BMAX=10
+      - GENESIS_PN131_BMAX=6
       - VLLM_USE_FUSED_MOE_GROUPED_TOPK=1
       - VLLM_LOGGING_LEVEL=INFO
       - GENESIS_VERBOSE=0
@@ -710,8 +717,15 @@ services:
       # la carga real pasa a ser muchos streams cortos a la vez, hay que volver a medirlo
       # CON calentamiento antes de subirlo.
       # GENESIS_PN131_BMAX de arriba tiene que seguir a este numero.
+      # 6 y no 10 (2026-09-21): el agregado hace meseta en 6 pedidos (942 tok/s con 6, 943-951
+      # con 8, dos arranques por brazo): pasar de 6 solo reparte lo mismo entre mas pedidos
+      # (157 -> 118 tok/s cada uno). Y PN131 dimensiona sus acumuladores por pedido maximo:
+      # 785 -> 471 MiB, KV 583.790 -> 600.434 tokens. Con P66 generando tallas hasta 4, contra
+      # la config anterior (tok/s agregados, codigo, greedy):
+      #    1 pedido 274 -> 298 (+9%) | 2: 378 -> 450 (+19%) | 4: 677 -> 732 (+8%) | 6: 942 -> 937
+      # GENESIS_PN131_BMAX tiene que seguir a este numero.
       - --max-num-seqs
-      - "10"
+      - "6"
       - --tensor-parallel-size
       - "2"
       - --max-model-len

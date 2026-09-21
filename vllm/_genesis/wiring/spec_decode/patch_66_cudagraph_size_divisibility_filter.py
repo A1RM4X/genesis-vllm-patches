@@ -49,6 +49,23 @@ Benefits:
     "uniform decode" captures
   - Reduces blast radius for the bug class identified in #28015 / #40880
 
+GENERAR en vez de filtrar (2026-09-21)
+--------------------------------------
+Filtrar una lista escrita a mano tiene una trampa: la lista se escribe para UN valor de K. La
+del compose eran multiplos de 4 (MTP K=3); con DFlash2 K=8 sobrevivian solo [9, 36], y con
+K=10 o K=12 no sobrevivia ninguna — 11 y 13 no dividen a nada — y quedaba un unico grafo, el de
+K+1. Todo lote mayor que el decode de UN pedido (el del borrador lo es) corria sin grafo, por un
+camino que ademas no acepta igual. Medido a 37k de contexto, mismo K, solo cambia la lista:
+
+    K=10  lista a mano -> [11]              133,0 tok/s  aceptacion 3,77
+    K=10  generadas 11,22,...,110           222,6 tok/s  aceptacion 6,32
+
+y con K=8 en produccion, 5 o mas pedidos simultaneos (>= 45 tokens > 36) decodificaban sin
+grafo. Con `GENESIS_P66_GENERAR_TALLAS=1` la lista del usuario se IGNORA y las tallas pasan a ser
+`(K+1) * n` para n = 1..N, con N = `GENESIS_P66_MAX_REQS` o `max_num_seqs`. Cualquier K queda
+cubierto para cualquier concurrencia sin tocar el compose. Cuesta memoria de grafos: con K=8 y
+N=10, 1,25 -> 1,50 GiB y 583.790 -> 565.482 tokens de KV (-3,1%). `GENESIS_P66_MAX_REQS` lo acota.
+
 Status: opt-in via `GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1`.
 
 Compatibility
@@ -74,7 +91,7 @@ from vllm._genesis.wiring.text_patch import (
 
 log = logging.getLogger("genesis.wiring.p66_cudagraph_size_divisibility_filter")
 
-GENESIS_P66_MARKER = "Genesis P66 cudagraph_capture_sizes spec-decode divisibility filter v7.13"
+GENESIS_P66_MARKER = "Genesis P66 cudagraph_capture_sizes spec-decode divisibility filter v7.14"
 
 
 # ─── Sub-patch: inject divisibility filter into _set_cudagraph_sizes ────────
@@ -107,6 +124,22 @@ P66_NEW = (
     "                _p66_uniform_q_len = 1 + self.speculative_config.num_speculative_tokens\n"
     "                if _p66_uniform_q_len > 1:\n"
     "                    _p66_orig = list(cudagraph_capture_sizes)\n"
+    "                    _p66_env = __import__('os').environ\n"
+    "                    if _p66_env.get('GENESIS_P66_GENERAR_TALLAS', '0') == '1':\n"
+    "                        # Generar (K+1)*n en vez de filtrar una lista pensada para otro K.\n"
+    "                        _p66_n = int(_p66_env.get('GENESIS_P66_MAX_REQS', '0') or 0)\n"
+    "                        if _p66_n <= 0:\n"
+    "                            _p66_n = int(self.scheduler_config.max_num_seqs)\n"
+    "                        cudagraph_capture_sizes = [\n"
+    "                            _p66_uniform_q_len * _i for _i in range(1, _p66_n + 1)\n"
+    "                            if _p66_uniform_q_len * _i <= max_num_tokens\n"
+    "                        ]\n"
+    "                        logger.info(\n"
+    "                            '[Genesis P66] cudagraph_capture_sizes GENERADAS para '\n"
+    "                            'uniform_query_len=%d, hasta %d pedidos: %s (se ignora la lista '\n"
+    "                            'del usuario %s)', _p66_uniform_q_len, _p66_n,\n"
+    "                            cudagraph_capture_sizes, _p66_orig,\n"
+    "                        )\n"
     "                    cudagraph_capture_sizes = [\n"
     "                        _s for _s in cudagraph_capture_sizes\n"
     "                        if _s % _p66_uniform_q_len == 0\n"
